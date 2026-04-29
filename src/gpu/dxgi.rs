@@ -35,7 +35,7 @@ const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 /// Combined result of a single `DXGI` query for a given (NVIDIA-filtered) adapter index.
 ///
 /// Returned by [`query`].
-pub struct DxgiQueryResult {
+pub(super) struct DxgiQueryResult {
     /// Per-process VRAM usage in bytes (`CurrentUsage` from `DXGI_QUERY_VIDEO_MEMORY_INFO`).
     /// This is the calling process's own GPU memory consumption — DXGI is
     /// WDDM-aware, so this number is reliable under Windows.
@@ -55,7 +55,7 @@ pub struct DxgiQueryResult {
 /// `DXGI_MEMORY_SEGMENT_GROUP_LOCAL`. Returns `None` if `idx` is past
 /// the count of qualifying adapters, or if any DXGI call fails.
 #[allow(unsafe_code)]
-pub fn query(idx: u32) -> Option<DxgiQueryResult> {
+pub(super) fn query(idx: u32) -> Option<DxgiQueryResult> {
     // SAFETY: CreateDXGIFactory1 is a documented COM factory function.
     // It initializes COM internally if needed; the returned IDXGIFactory1
     // is reference-counted and released when `factory` is dropped.
@@ -133,7 +133,7 @@ pub fn query(idx: u32) -> Option<DxgiQueryResult> {
 /// `query`. Returns `None` if `idx` is past the NVIDIA-adapter count or
 /// any DXGI call fails.
 #[allow(unsafe_code)]
-pub fn adapter_name(idx: u32) -> Option<String> {
+pub(super) fn adapter_name(idx: u32) -> Option<String> {
     // SAFETY: same justification as in `query`.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
 
@@ -173,7 +173,7 @@ pub fn adapter_name(idx: u32) -> Option<String> {
 /// for bounds-checking `idx` on Windows in `device_info` /
 /// `process_gpu_info` when both `NVML` and `nvidia-smi` are absent.
 #[allow(unsafe_code)]
-pub fn device_count() -> Option<u32> {
+pub(super) fn device_count() -> Option<u32> {
     // SAFETY: same justification as in `query`.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
 

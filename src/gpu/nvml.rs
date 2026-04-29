@@ -130,7 +130,7 @@ type NvmlDeviceGetNameFn = unsafe extern "C" fn(NvmlDevice, *mut std::ffi::c_cha
 /// Combined result of a single `NVML` query for a given device index.
 ///
 /// Returned by [`query`].
-pub struct NvmlQueryResult {
+pub(super) struct NvmlQueryResult {
     /// Per-process GPU memory in bytes for the calling process.
     ///
     /// `None` when our PID is absent from `NVML`'s process list, when
@@ -159,7 +159,7 @@ pub struct NvmlQueryResult {
 /// useful. If the library load, init, handle, or device memory query
 /// fails, the function returns `None`.
 #[allow(unsafe_code)]
-pub fn query(idx: u32) -> Option<NvmlQueryResult> {
+pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
     // SAFETY: libloading::Library::new dynamically loads a shared library.
     // NVML is a stable NVIDIA driver component with a well-defined C ABI;
     // the library is reference-counted by the OS and unloaded when `lib`
@@ -361,7 +361,7 @@ fn read_process_used(
 /// fails. Used by the public `device_count()` dispatcher and (when
 /// available) for bounds-checking `idx` in `device_info`.
 #[allow(unsafe_code)]
-pub fn device_count() -> Option<u32> {
+pub(super) fn device_count() -> Option<u32> {
     // SAFETY: same justifications as in `query`.
     let lib = unsafe { libloading::Library::new(NVML_LIB_PATH) }.ok()?;
 

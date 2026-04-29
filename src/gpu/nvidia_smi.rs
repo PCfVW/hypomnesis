@@ -13,16 +13,31 @@
 
 use std::process::Command;
 
+/// Successful result of an `nvidia-smi` query for a single device.
+///
+/// Returning `Option<NvidiaSmiResult>` from [`query`] (rather than the
+/// previous `(Option<u64>, Option<u64>)` tuple) makes the all-or-nothing
+/// invariant explicit at the type level: a successful query always
+/// produces both `used_bytes` and `total_bytes`; any failure path
+/// returns `None`. Callers no longer need to handle logically-impossible
+/// mixed `(Some, None)` / `(None, Some)` states.
+pub(super) struct NvidiaSmiResult {
+    /// Device-wide used memory in bytes (sum across all processes).
+    pub used_bytes: u64,
+    /// Total dedicated memory on the device in bytes.
+    pub total_bytes: u64,
+}
+
 /// Query `nvidia-smi` for device-wide memory at adapter index `idx`.
 ///
-/// Returns `(used_bytes, total_bytes)`, with each component `None`
-/// if `nvidia-smi` could not be spawned, exited non-zero, or
-/// produced unparseable output.
+/// Returns `Some(NvidiaSmiResult)` on success; `None` if `nvidia-smi`
+/// could not be spawned, exited non-zero, or produced unparseable
+/// output.
 ///
 /// `nvidia-smi` reports in `MiB`; values are converted to bytes via
 /// saturating multiplication (overflow at the `u64` ceiling is
 /// physically unreachable but defended against anyway).
-pub fn query(idx: u32) -> (Option<u64>, Option<u64>) {
+pub(super) fn query(idx: u32) -> Option<NvidiaSmiResult> {
     let cmd_result = Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.used,memory.total",
@@ -44,17 +59,17 @@ pub fn query(idx: u32) -> (Option<u64>, Option<u64>) {
                 o.status,
                 stderr.trim(),
             );
-            return (None, None);
+            return None;
         }
         #[cfg(not(feature = "debug-output"))]
-        Ok(_) => return (None, None),
+        Ok(_) => return None,
         #[cfg(feature = "debug-output")]
         Err(e) => {
             eprintln!("[nvidia-smi debug] failed to spawn for idx={idx}: {e}");
-            return (None, None);
+            return None;
         }
         #[cfg(not(feature = "debug-output"))]
-        Err(_) => return (None, None),
+        Err(_) => return None,
     };
 
     // BORROW: explicit String::from_utf8_lossy — `nvidia-smi --format=csv,nounits`
@@ -63,37 +78,33 @@ pub fn query(idx: u32) -> (Option<u64>, Option<u64>) {
     let Some(line_raw) = stdout.lines().next() else {
         #[cfg(feature = "debug-output")]
         eprintln!("[nvidia-smi debug] empty stdout for idx={idx}");
-        return (None, None);
+        return None;
     };
     let line = line_raw.trim();
 
     let mut parts = line.split(',');
-    let Some(used_str) = parts.next().map(str::trim) else {
-        return (None, None);
-    };
-    let Some(total_str) = parts.next().map(str::trim) else {
-        return (None, None);
-    };
+    let used_str = parts.next().map(str::trim)?;
+    let total_str = parts.next().map(str::trim)?;
 
     let used_mb: u64 = match used_str.parse() {
         Ok(v) => v,
         #[cfg(feature = "debug-output")]
         Err(e) => {
             eprintln!("[nvidia-smi debug] failed to parse used '{used_str}' for idx={idx}: {e}");
-            return (None, None);
+            return None;
         }
         #[cfg(not(feature = "debug-output"))]
-        Err(_) => return (None, None),
+        Err(_) => return None,
     };
     let total_mb: u64 = match total_str.parse() {
         Ok(v) => v,
         #[cfg(feature = "debug-output")]
         Err(e) => {
             eprintln!("[nvidia-smi debug] failed to parse total '{total_str}' for idx={idx}: {e}");
-            return (None, None);
+            return None;
         }
         #[cfg(not(feature = "debug-output"))]
-        Err(_) => return (None, None),
+        Err(_) => return None,
     };
 
     // 1 MiB = 1_048_576 bytes; saturating in case of absurd inputs.
@@ -106,5 +117,8 @@ pub fn query(idx: u32) -> (Option<u64>, Option<u64>) {
          ({used_bytes} / {total_bytes} bytes)"
     );
 
-    (Some(used_bytes), Some(total_bytes))
+    Some(NvidiaSmiResult {
+        used_bytes,
+        total_bytes,
+    })
 }

@@ -33,9 +33,9 @@ mod nvidia_smi;
 ///
 /// # Errors
 ///
-/// Returns [`HypomnesisError::Nvml`] if no enumeration backend
-/// succeeds, or [`HypomnesisError::NoGpuSource`] if no measurement
-/// backend is enabled.
+/// Returns [`HypomnesisError::NoGpuSource`] if no enumeration backend
+/// is enabled, or if every enabled backend failed to report a count.
+#[allow(clippy::missing_const_for_fn)] // const only when no features are enabled (body collapses)
 pub fn device_count() -> Result<u32> {
     #[cfg(feature = "nvml")]
     if let Some(count) = nvml::device_count() {
@@ -51,9 +51,7 @@ pub fn device_count() -> Result<u32> {
     // counting via `nvidia-smi -L` is more brittle than NVML/DXGI and
     // adds a subprocess invocation for what's typically a metadata call.
 
-    Err(HypomnesisError::Nvml(
-        "device_count: no GPU enumeration backend succeeded".into(),
-    ))
+    Err(HypomnesisError::NoGpuSource)
 }
 
 /// Device-wide info for a specific GPU index (`NVML`-canonical ordering).
@@ -113,13 +111,13 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
 
     // nvidia-smi fallback (device-wide proper, no name).
     #[cfg(feature = "nvidia-smi-fallback")]
-    if let (Some(used_bytes), Some(total_bytes)) = nvidia_smi::query(index) {
+    if let Some(result) = nvidia_smi::query(index) {
         return Ok(GpuDeviceInfo {
             index,
             name: None,
-            total_bytes,
-            free_bytes: total_bytes.saturating_sub(used_bytes),
-            used_bytes,
+            total_bytes: result.total_bytes,
+            free_bytes: result.total_bytes.saturating_sub(result.used_bytes),
+            used_bytes: result.used_bytes,
         });
     }
 
@@ -167,9 +165,9 @@ pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
 
     // nvidia-smi fallback — device-wide reading (`is_per_process = false`).
     #[cfg(feature = "nvidia-smi-fallback")]
-    if let (Some(used_bytes), _) = nvidia_smi::query(device_index) {
+    if let Some(result) = nvidia_smi::query(device_index) {
         return Ok(ProcessGpuInfo {
-            used_bytes,
+            used_bytes: result.used_bytes,
             is_per_process: false,
             source: GpuQuerySource::NvidiaSmi,
         });

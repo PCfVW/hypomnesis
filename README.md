@@ -10,7 +10,7 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> ⚠️ **This crate is under active development.** `0.0.1` is an initial scaffold (placeholder bodies; not for production use). The first functional release will be `0.1.0`. See [docs/hypomnesis-brief.md](docs/hypomnesis-brief.md) for the design and roadmap, and [CHANGELOG.md](CHANGELOG.md) for current progress.
+> 🚀 **`0.1.0` is the first functional release.** Process `RSS`, `NVML`, `DXGI`, and `nvidia-smi` backends are fully implemented and verified on Windows + Ubuntu WSL2. The public API is `#[non_exhaustive]` so additive features (multi-vendor addressing, AMD ROCm, Apple Metal) can land in 0.1.x patches without breaking callers. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.1.0 entry and [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md) for the design and roadmap.
 
 ## Table of Contents
 
@@ -108,7 +108,7 @@ The crate handles two known driver bugs out of the box:
 
 ## Used by
 
-_None yet — `0.0.1` is a name-reservation placeholder. Phase 2 will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag; Phase 3 may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis` v0.1._
+_No consumers yet — `0.1.0` is the first functional release. **Phase 2** will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag (path-dep first, then `hypomnesis = "0.1"` from crates.io once the API has settled under real use). **Phase 3** may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis = "0.1"` with `features = ["report"]`._
 
 ## License
 

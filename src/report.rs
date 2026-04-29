@@ -44,9 +44,13 @@ impl MemoryReport {
     /// Returns `None` if either snapshot lacks per-process `VRAM` data.
     #[must_use]
     pub fn vram_delta_mb(&self) -> Option<f64> {
-        // Explicit listing of all four (Some/None × Some/None) cases avoids
-        // `_ => None` (which would trigger `wildcard_match_arm`) and
-        // documents that we only return `Some` when BOTH snapshots have data.
+        // The second arm reads as: "either the second element is None
+        // (covering both (Some, None) and (None, None) cases) OR the
+        // first element is None and the second is Some". This nested
+        // OR-pattern form is what `clippy::unnested_or_patterns` (a
+        // pedantic lint) prefers; the unnested equivalent
+        // `(Some(_), None) | (None, Some(_)) | (None, None)` is more
+        // verbose to read but fires the same lint.
         match (self.after.vram_mb(), self.before.vram_mb()) {
             (Some(after), Some(before)) => Some(after - before),
             (Some(_) | None, None) | (None, Some(_)) => None,

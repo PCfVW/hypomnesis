@@ -81,9 +81,9 @@ struct NvmlProcessInfo {
     /// GPU memory used by this process in bytes.
     /// `u64::MAX` (`0xFFFF_FFFF_FFFF_FFFF`) means "not available".
     used_gpu_memory: u64,
-    /// GPU instance ID (MIG); unused outside MIG mode.
+    /// GPU instance ID (`MIG`); unused outside `MIG` mode.
     gpu_instance_id: u32,
-    /// Compute instance ID (MIG); unused outside MIG mode.
+    /// Compute instance ID (`MIG`); unused outside `MIG` mode.
     compute_instance_id: u32,
 }
 

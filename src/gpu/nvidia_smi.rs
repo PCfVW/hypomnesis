@@ -75,6 +75,14 @@ pub(super) fn query(idx: u32) -> Option<NvidiaSmiResult> {
     // BORROW: explicit String::from_utf8_lossy — `nvidia-smi --format=csv,nounits`
     // output is ASCII numerals + commas, but be defensive against locale drift.
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // The else block carries a cfg-gated `eprintln!` for the `debug-output`
+    // feature; with that feature off, the body collapses to a bare
+    // `return None` and `clippy::question_mark` (under `-D warnings` on
+    // MSRV 1.88) wants `?` instead. We keep the let-else so the
+    // diagnostic-on path stays consistent with the surrounding error
+    // sites (spawn fail / non-zero exit / parse fail), all of which
+    // also use let-else with cfg-gated debug prints.
+    #[allow(clippy::question_mark)]
     let Some(line_raw) = stdout.lines().next() else {
         #[cfg(feature = "debug-output")]
         eprintln!("[nvidia-smi debug] empty stdout for idx={idx}");

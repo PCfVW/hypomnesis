@@ -10,7 +10,7 @@
 
 use crate::{GpuDeviceInfo, HypomnesisError, ProcessGpuInfo, Result};
 
-#[cfg(feature = "nvml")]
+#[cfg(any(feature = "nvml", all(windows, feature = "dxgi")))]
 use crate::GpuQuerySource;
 
 #[cfg(feature = "nvml")]
@@ -25,37 +25,54 @@ mod nvidia_smi;
 /// Number of NVIDIA GPUs visible to `NVML` (`NVML`-canonical ordering).
 ///
 /// On Windows the count uses `NVML`; if `NVML` is unavailable, the
-/// `DXGI` fallback (Phase B+1) counts NVIDIA adapters with non-zero
-/// dedicated `VRAM`.
+/// `DXGI` fallback counts NVIDIA adapters with non-zero dedicated `VRAM`.
 ///
 /// # Errors
 ///
-/// Returns [`HypomnesisError::Nvml`] if `NVML` fails to load or report a
-/// count and no fallback succeeds, or [`HypomnesisError::NoGpuSource`]
-/// if no measurement backend is enabled.
+/// Returns [`HypomnesisError::Nvml`] if no enumeration backend
+/// succeeds, or [`HypomnesisError::NoGpuSource`] if no measurement
+/// backend is enabled.
 pub fn device_count() -> Result<u32> {
     #[cfg(feature = "nvml")]
     if let Some(count) = nvml::device_count() {
         return Ok(count);
     }
 
-    // DXGI fallback wired in Phase B+1 (src/gpu/dxgi.rs port).
+    #[cfg(all(windows, feature = "dxgi"))]
+    if let Some(count) = dxgi::device_count() {
+        return Ok(count);
+    }
+
+    // nvidia-smi fallback for device_count is intentionally not wired —
+    // counting via `nvidia-smi -L` is more brittle than NVML/DXGI and
+    // adds a subprocess invocation for what's typically a metadata call.
 
     Err(HypomnesisError::Nvml(
-        "device_count: NVML unavailable and no fallback wired yet".into(),
+        "device_count: no GPU enumeration backend succeeded".into(),
     ))
 }
 
 /// Device-wide info for a specific GPU index (`NVML`-canonical ordering).
 ///
-/// On Windows: `NVML` for `total` / `free` / `used` numerics, `DXGI` for
-/// the adapter name (Phase B+1). `nvidia-smi` is the final fallback
-/// (Phase B+1). iGPUs and the Microsoft Basic Render Driver are skipped.
+/// Source priority:
+/// 1. `NVML` for `total` / `free` / `used` numerics, augmented with
+///    `DXGI`'s `Description`-derived `name` on Windows when available.
+/// 2. `DXGI` alone (Windows only): falls back when `NVML` is
+///    unavailable. **Imprecision note:** in this path `used_bytes`
+///    is set to DXGI's `CurrentUsage`, which is per-process — not the
+///    device-wide sum. Treat it as a lower bound. This path is rare
+///    (it requires `NVML` to fail while `DXGI` works, e.g. partial
+///    driver installs).
+/// 3. `nvidia-smi` subprocess fallback (Phase B+1) — device-wide proper.
+///
+/// iGPUs and the Microsoft Basic Render Driver are skipped during the
+/// `DXGI` adapter walk (filtered by NVIDIA vendor ID `0x10DE` and
+/// non-zero dedicated `VRAM`).
 ///
 /// # Errors
 ///
 /// Returns [`HypomnesisError::DeviceIndexOutOfRange`] if `index` is past
-/// the device count reported by `NVML`.
+/// the device count reported by `NVML` or `DXGI`.
 /// Returns [`HypomnesisError::NoGpuSource`] if no backend can satisfy
 /// the query.
 #[allow(unused_variables)] // `index` unused when no GPU backend feature is enabled
@@ -63,48 +80,65 @@ pub fn device_count() -> Result<u32> {
 pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
     #[cfg(feature = "nvml")]
     if let Some(snap) = nvml::query(index) {
+        #[cfg(all(windows, feature = "dxgi"))]
+        let name = dxgi::adapter_name(index).or(snap.device_name);
+        #[cfg(not(all(windows, feature = "dxgi")))]
+        let name = snap.device_name;
+
         return Ok(GpuDeviceInfo {
             index,
-            name: snap.device_name,
+            name,
             total_bytes: snap.device_total,
             free_bytes: snap.device_free,
             used_bytes: snap.device_used,
         });
     }
 
-    // DXGI and nvidia-smi fallbacks wired in Phase B+1.
-
-    // If NVML can give us the count, surface a precise
-    // DeviceIndexOutOfRange when `index` is past the count. Otherwise we
-    // can't tell range-error from no-source-available; default to
-    // NoGpuSource.
-    #[cfg(feature = "nvml")]
-    if let Some(count) = nvml::device_count()
-        && index >= count
-    {
-        return Err(HypomnesisError::DeviceIndexOutOfRange { index, count });
+    // DXGI-alone fallback (Windows only). Loose semantics: CurrentUsage
+    // is per-process; treated here as a lower bound on device-wide used.
+    #[cfg(all(windows, feature = "dxgi"))]
+    if let Some(d) = dxgi::query(index) {
+        return Ok(GpuDeviceInfo {
+            index,
+            name: d.adapter_name,
+            total_bytes: d.dedicated_video_memory,
+            free_bytes: d.dedicated_video_memory.saturating_sub(d.current_usage),
+            used_bytes: d.current_usage,
+        });
     }
 
+    // nvidia-smi fallback wired in Phase B+1.
+
+    bounds_check(index)?;
     Err(HypomnesisError::NoGpuSource)
 }
 
 /// Per-process GPU memory used by the calling process on the given device.
 ///
-/// Tries (in order): `DXGI` on Windows (Phase B+1), `NVML`, then
-/// `nvidia-smi` fallback (Phase B+1). The returned `ProcessGpuInfo`
-/// carries an `is_per_process` flag and a `source` discriminator so
-/// callers can distinguish a true per-process reading from a
-/// device-wide fallback.
+/// Source priority:
+/// 1. `DXGI` on Windows — the only WDDM-aware per-process source.
+/// 2. `NVML` (Linux primary; on Windows it returns `NVML_VALUE_NOT_AVAILABLE`
+///    for compute processes under WDDM, so this path is effectively Linux-only).
+/// 3. `nvidia-smi` device-wide fallback (Phase B+1) — sets
+///    `is_per_process = false` because `nvidia-smi` cannot break the
+///    figure down per process.
 ///
 /// # Errors
 ///
 /// Returns [`HypomnesisError::DeviceIndexOutOfRange`] if `device_index`
-/// is past the device count reported by `NVML`.
+/// is past the device count reported by `NVML` or `DXGI`.
 /// Returns [`HypomnesisError::NoGpuSource`] if every available backend fails.
 #[allow(unused_variables)] // `device_index` unused when no GPU backend feature is enabled
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled (body collapses)
 pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
-    // DXGI primary on Windows wired in Phase B+1.
+    #[cfg(all(windows, feature = "dxgi"))]
+    if let Some(d) = dxgi::query(device_index) {
+        return Ok(ProcessGpuInfo {
+            used_bytes: d.current_usage,
+            is_per_process: true,
+            source: GpuQuerySource::Dxgi,
+        });
+    }
 
     #[cfg(feature = "nvml")]
     if let Some(snap) = nvml::query(device_index)
@@ -119,15 +153,41 @@ pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
 
     // nvidia-smi fallback wired in Phase B+1.
 
+    bounds_check(device_index)?;
+    Err(HypomnesisError::NoGpuSource)
+}
+
+/// Bounds-check `index` against whatever count source is available.
+///
+/// Tries `NVML` first; on Windows, falls back to `DXGI` if `NVML` is
+/// unavailable. Returns `Ok(())` when no count source is available
+/// (caller will surface its own error, typically `NoGpuSource`).
+///
+/// # Errors
+///
+/// Returns [`HypomnesisError::DeviceIndexOutOfRange`] when a count
+/// source reports a count and `index >= count`.
+#[allow(unused_variables)] // unused when no backend feature is enabled
+#[allow(clippy::missing_const_for_fn)] // const only when no features are enabled
+#[allow(clippy::unnecessary_wraps)] // Result is necessary only when nvml or dxgi feature returns Err
+fn bounds_check(index: u32) -> Result<()> {
     #[cfg(feature = "nvml")]
-    if let Some(count) = nvml::device_count()
-        && device_index >= count
-    {
-        return Err(HypomnesisError::DeviceIndexOutOfRange {
-            index: device_index,
-            count,
-        });
+    if let Some(count) = nvml::device_count() {
+        return if index >= count {
+            Err(HypomnesisError::DeviceIndexOutOfRange { index, count })
+        } else {
+            Ok(())
+        };
     }
 
-    Err(HypomnesisError::NoGpuSource)
+    #[cfg(all(windows, feature = "dxgi"))]
+    if let Some(count) = dxgi::device_count() {
+        return if index >= count {
+            Err(HypomnesisError::DeviceIndexOutOfRange { index, count })
+        } else {
+            Ok(())
+        };
+    }
+
+    Ok(())
 }

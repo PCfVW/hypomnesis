@@ -1,0 +1,121 @@
+# hypomnesis
+
+[![CI](https://github.com/PCfVW/hypomnesis/actions/workflows/ci.yml/badge.svg)](https://github.com/PCfVW/hypomnesis/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/hypomnesis.svg)](https://crates.io/crates/hypomnesis)
+[![docs.rs](https://docs.rs/hypomnesis/badge.svg)](https://docs.rs/hypomnesis)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
+[![license](https://img.shields.io/crates/l/hypomnesis.svg)](https://github.com/PCfVW/hypomnesis#license)
+[![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(NVML_%2B_DXGI_%2B_K32_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
+[![NVIDIA](https://img.shields.io/badge/NVIDIA-NVML_%2B_DXGI-76B900.svg?logo=nvidia&logoColor=white)](#capabilities)
+
+**ὑπόμνησις** — *External RAM and VRAM, measured.*
+
+> ⚠️ **This crate is under active development.** `0.0.1` is an initial scaffold (placeholder bodies; not for production use). The first functional release will be `0.1.0`. See [docs/hypomnesis-brief.md](docs/hypomnesis-brief.md) for the design and roadmap, and [CHANGELOG.md](CHANGELOG.md) for current progress.
+
+## Table of Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [Capabilities](#capabilities)
+- [Feature Flags](#feature-flags)
+- [Used by](#used-by)
+- [License](#license)
+- [Development](#development)
+
+## Install
+
+```toml
+[dependencies]
+hypomnesis = "0.1"
+```
+
+The default feature set (`nvml`, `dxgi`, `nvidia-smi-fallback`) covers process RSS and per-process / device-wide GPU memory on both Windows (`IDXGIAdapter3` + `NVML`) and Linux (`NVML`), with a `nvidia-smi` subprocess fallback. The `dxgi` dependency on the `windows` crate is target-conditional — Linux users pay nothing for it.
+
+For candle-mi-compatible delta and printing helpers (`MemoryReport`, `print_delta`, `print_before_after`, `ram_mb`, `vram_mb`):
+
+```toml
+hypomnesis = { version = "0.1", features = ["report"] }
+```
+
+For a stripped-down build (process RSS only, no GPU backends):
+
+```toml
+hypomnesis = { version = "0.1", default-features = false }
+```
+
+## Usage
+
+```rust
+use hypomnesis::Snapshot;
+
+fn main() -> Result<(), hypomnesis::HypomnesisError> {
+    let snap = Snapshot::now(0)?;
+    println!("RAM: {} bytes", snap.ram_bytes);
+
+    if let Some(dev) = snap.gpu_device {
+        let total_gib = dev.total_bytes as f64 / (1u64 << 30) as f64;
+        let used_gib  = dev.used_bytes  as f64 / (1u64 << 30) as f64;
+        println!(
+            "GPU 0 [{}]: {:.1} / {:.1} GiB used",
+            dev.name.as_deref().unwrap_or("unknown"),
+            used_gib, total_gib,
+        );
+    }
+
+    if let Some(proc_gpu) = snap.gpu {
+        let kind = if proc_gpu.is_per_process { "per-process" } else { "device-wide" };
+        let mib  = proc_gpu.used_bytes as f64 / (1u64 << 20) as f64;
+        println!("This process: {:.0} MiB ({})", mib, kind);
+    }
+
+    Ok(())
+}
+```
+
+Expected output (RTX 5060 Ti, Windows, idle process):
+
+```
+RAM: 142475264 bytes
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 16.0 GiB used
+This process: 119 MiB (per-process)
+```
+
+## Capabilities
+
+| Metric | Windows | Linux |
+|--------|---------|-------|
+| Process RSS | `K32GetProcessMemoryInfo` | `/proc/self/status` (no `unsafe`) |
+| Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) |
+| Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) |
+| Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess |
+
+`hypomnesis` uses `IDXGIAdapter3` on Windows because `WDDM` means the kernel memory manager — not the NVIDIA driver — owns GPU allocations, so `NVML`'s per-process query returns `NOT_AVAILABLE` under Windows. `DXGI 1.4` is the only reliable per-process source. On Linux, `NVML`'s `nvmlDeviceGetComputeRunningProcesses_v3` returns true per-process figures.
+
+The crate handles two known driver bugs out of the box:
+
+1. **`NVML` `u64::MAX` sentinel** — some `R570`-series drivers report `0xFFFFFFFFFFFFFFFF` for every running process's memory (observed on `RTX 5060 Ti`). `hypomnesis` detects this and falls back to `nvidia-smi`.
+2. **`used > total` corruption** — sanity-checks each per-process reading against the device-wide total; falls back to `nvidia-smi` on detected corruption.
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `nvml` | yes | `NVML` dynamic load via `libloading` (Linux + Windows-`WDDM` device-wide) |
+| `dxgi` | yes | Windows per-process `VRAM` via `IDXGIAdapter3` (no-op on non-Windows) |
+| `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail or are disabled |
+| `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity, candidate for `candle-mi` v0.2 migration via Cargo flag flip) |
+| `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
+
+## Used by
+
+_None yet — `0.0.1` is a name-reservation placeholder. Phase 2 will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag; Phase 3 may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis` v0.1._
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
+
+## Development
+
+- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
+- Git workflow managed with [Fork](https://fork.dev/)
+- All code follows [CONVENTIONS.md](CONVENTIONS.md), derived from [Amphigraphic-Strict](https://github.com/PCfVW/Amphigraphic-Strict)'s [Grit](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit) — a strict Rust subset designed to improve AI coding accuracy.

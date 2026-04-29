@@ -1,0 +1,93 @@
+[package]
+name = "hypomnesis"
+version = "0.0.1"
+edition = "2024"
+authors = ["Eric Jacopin"]
+description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML, Linux NVML, with nvidia-smi fallback)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PCfVW/hypomnesis"
+homepage = "https://github.com/PCfVW/hypomnesis"
+documentation = "https://docs.rs/hypomnesis"
+keywords = ["memory", "vram", "nvml", "dxgi", "gpu"]
+categories = ["os", "memory-management", "hardware-support"]
+rust-version = "1.88"
+
+[dependencies]
+thiserror = "2"
+
+# Optional: NVML dynamic load (Linux + Windows-WDDM device-wide)
+libloading = { version = "0.9", optional = true }
+
+# Optional: per-process VRAM on Windows via DXGI (IDXGIAdapter3::QueryVideoMemoryInfo)
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[features]
+default = ["nvml", "nvidia-smi-fallback", "dxgi"]
+nvml = ["dep:libloading"]
+nvidia-smi-fallback = []
+dxgi = ["dep:windows"]
+report = []
+debug-output = []
+
+[lints.rust]
+elided_lifetimes_in_paths = "deny"
+missing_docs              = "warn"
+
+[lints.clippy]
+# Rule 3: No panics or indexing in library code
+unwrap_used               = "deny"
+expect_used               = "deny"
+panic                     = "deny"
+indexing_slicing          = "deny"
+
+# Rule 7: Exhaustive matching
+wildcard_enum_match_arm             = "deny"
+match_wildcard_for_single_variants  = "deny"
+
+# Rule 11: #[non_exhaustive] policy
+exhaustive_enums          = "warn"
+
+# Rule 2: Explicit conversions (warn — numeric casts need annotation, not prohibition)
+as_conversions            = "warn"
+cast_possible_truncation  = "warn"
+cast_precision_loss       = "warn"
+cast_sign_loss            = "warn"
+
+# Rule 9: Prefer iterators
+explicit_iter_loop        = "warn"
+manual_filter_map         = "warn"
+manual_find_map           = "warn"
+needless_range_loop       = "warn"
+
+# Documentation
+missing_docs_in_private_items = "warn"
+missing_errors_doc        = "warn"
+missing_panics_doc        = "warn"
+
+# General pedantic + nursery quality baseline
+pedantic  = { level = "warn", priority = -1 }
+nursery   = { level = "warn", priority = -1 }
+
+# Suppressed lints that are too noisy for this domain
+module_name_repetitions   = "allow"
+too_many_lines            = "allow"
+must_use_candidate        = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+# docs.rs builds the full feature set on both Linux and Windows targets so
+# the rendered documentation includes the Windows-only `dxgi` module
+# alongside the cross-platform `nvml` and `nvidia_smi` backends.
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

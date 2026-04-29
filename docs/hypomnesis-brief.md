@@ -1,0 +1,175 @@
+# `hypomnesis` — a brief
+
+> *External measurement of a Rust process's RAM and VRAM state, on Windows and Linux. The counterpart to `anamnesis`.*
+
+---
+
+## Why this crate
+
+candle-mi's v0.1.1–v0.1.3 VRAM saga produced ~889 lines of battle-tested Rust covering capabilities that, as far as I can determine from crates.io, **do not exist elsewhere in the ecosystem**:
+
+| Capability | Who has it in Rust today |
+|-----------|--------------------------|
+| Device-wide NVML memory info (Linux + Windows) | `nvml-wrapper`, `all-smi`, `hardware-query` |
+| Per-process NVML compute processes (Linux) | `nvml-wrapper` |
+| **Per-process VRAM on Windows via `IDXGIAdapter3::QueryVideoMemoryInfo`** | **No one — candle-mi was first** |
+| NVML `u64::MAX` sentinel handling (R570 driver bug on RTX 5060 Ti) | No one |
+| `nvidia-smi` subprocess fallback with sanity checks | No one (generally) |
+| Process RSS via `K32GetProcessMemoryInfo` / `/proc/self/status` | `memory-stats` does RSS, but not combined with VRAM |
+
+The Windows DXGI implementation is the **hard part** — the multi-day deep dive through WDDM architecture, COM pointer manipulation (`IDXGIFactory1` → `IDXGIAdapter` → `IDXGIAdapter3` cast chain), and adapter enumeration (skipping Microsoft Basic Render Driver, handling dedicated vs shared memory segments). It belongs in the ecosystem as a reusable crate, not buried inside a single application's source tree.
+
+## Why the name
+
+Plato's *Phaedrus* distinguishes two kinds of memory:
+
+- **Anamnesis** (ἀνάμνησις) — the soul's inward recollection of truth it always possessed. Used in candle-mi: looking *inside* a model's weights.
+- **Hypomnesis** (ὑπόμνησις) — *external* memory aids, reminders, written records. Plato was skeptical of them because they replace true internal memory with external notation.
+
+A crate that queries and records what's currently in a process's memory is **literally hypomnesis**: external snapshots of memory state. The two names form a deliberate pair.
+
+Shorthand: **`hmn`** (rule: first letter of the Greek prefix + the `mn` root — mirrors `amn` for `anamnesis`).
+
+Availability confirmed on crates.io and GitHub (2026-04-29). A v0.0.1 placeholder (skeleton + stubs) will be published to crates.io early in Phase 2 to secure the name — see Roadmap.
+
+## Scope (v0.1)
+
+**Included:**
+- Process RAM (RSS): Windows, Linux
+- Device-wide GPU memory (total/free/used): NVML on Linux + Windows
+- Per-process GPU memory: NVML on Linux, DXGI on Windows
+- `nvidia-smi` subprocess fallback (device-wide, both platforms)
+- Robust sentinel handling (NVML `u64::MAX`, used > total sanity check)
+- GPU adapter name (from DXGI description field, Windows only)
+
+**Explicitly out of scope:**
+- Inference tracking (candle-mi's `sync_and_trim_gpu` stays in candle-mi — it's candle/cudarc-specific)
+- CPU counters, thermal monitoring, power draw (that's `sysinfo`, `all-smi`, `hardware-query` territory)
+- Apple Metal (future consideration, not v0.1)
+- AMD ROCm (future consideration, not v0.1)
+- MacOS support beyond what's trivial
+
+## Proposed public API
+
+```rust
+// Device-wide query — what hf-fm --check-gpu needs
+pub struct GpuDeviceInfo {
+    pub index: u32,
+    pub name: Option<String>,      // from DXGI or nvidia-smi
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+}
+
+pub fn device_info(index: u32) -> Result<GpuDeviceInfo, HypomnesisError>;
+pub fn device_count() -> Result<u32, HypomnesisError>;
+
+// Per-process query — what candle-mi needs
+pub struct ProcessGpuInfo {
+    pub used_bytes: u64,
+    pub is_per_process: bool,       // false when falling back to device-wide
+    pub source: GpuQuerySource,     // Dxgi | Nvml | NvidiaSmi
+}
+
+pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo, HypomnesisError>;
+
+// RAM — both crates need it
+pub fn process_rss() -> Result<u64, HypomnesisError>;
+
+// Convenience snapshot bundling everything
+pub struct Snapshot {
+    pub ram_bytes: u64,
+    pub gpu: Option<ProcessGpuInfo>,
+    pub gpu_device: Option<GpuDeviceInfo>,
+}
+
+impl Snapshot {
+    pub fn now(device_index: u32) -> Result<Self, HypomnesisError>;
+}
+```
+
+**No candle dependency.** That's the critical break from candle-mi's current API (`MemorySnapshot::now(&candle_core::Device)`).
+
+**`MemoryReport` and printing helpers behind opt-in `report` feature, default off.** The default crate exposes only raw measurement (`Snapshot`, `GpuDeviceInfo`, `ProcessGpuInfo`, the three query functions). Enable `features = ["report"]` to get `MemoryReport` (delta between two snapshots), `print_delta` / `print_before_after`, and `ram_mb` / `vram_mb` formatting helpers — preserved verbatim from candle-mi for migration parity. Phase 3 (candle-mi adopts) becomes a one-line Cargo flag flip, not a code rewrite. Default consumers who want a quick delta can still subtract two `Snapshot`s in 5 lines without enabling the feature.
+
+**Future-proofing rests on `#[non_exhaustive]`, not on parameter type elaboration.** Every public enum (`HypomnesisError`, `GpuQuerySource`) and every public struct (`GpuDeviceInfo`, `ProcessGpuInfo`, `Snapshot`) is `#[non_exhaustive]`, so new variants and fields can be added in 0.x patch releases without breaking callers. Multi-vendor addressing (UUID, LUID, AMD ROCm, Apple Metal) can therefore be layered in later as *new* selector types or *new* functions alongside the v0.1 `device_index: u32` API — no breaking change required.
+
+## Feature gates
+
+```toml
+[features]
+default = ["nvml", "nvidia-smi-fallback"]
+dxgi = ["dep:windows"]              # Windows-only, pulls ~500 kB of bindings
+nvml = ["dep:libloading"]            # dynamic NVML load via libloading
+nvidia-smi-fallback = []             # no deps, just subprocess
+```
+
+On Windows, `dxgi` is strongly recommended (it's the only source of per-process info). Users can opt out for slim device-wide-only builds.
+
+## Dependencies (total)
+
+- `libloading` (already in candle-mi)
+- `windows = "0.62"` with `Win32_Graphics_Dxgi`, `Win32_Graphics_Dxgi_Common` features (Windows only; already in candle-mi)
+- `thiserror` for the error type
+
+That's it. No candle, no serde, no tokio. MSRV 1.88 (match candle-mi).
+
+## First consumer: hf-fetch-model
+
+hf-fetch-model v0.10.x gets `--check-gpu [N]` on `inspect`:
+
+```
+$ hf-fm inspect google/gemma-4-E2B-it model.safetensors --check-gpu
+
+  Model weights:  9.54 GiB  (BF16, 5.12B params)
+  GPU 0:          NVIDIA GeForce RTX 5060 Ti — 16.0 GiB VRAM
+                  free: 14.2 GiB, used: 1.8 GiB
+  Fit:            ✓ 4.66 GiB headroom for weights + KV cache + runtime
+
+  Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
+  weight size for KV cache and activations.
+```
+
+This is the proof-of-concept consumer. hf-fm uses ~10% of hypomnesis's API surface (`device_info` + `device_count`); candle-mi uses the rest.
+
+## Roadmap
+
+**Phase 1 — Extraction (blocking)**
+- Create new repository (sibling of hf-fetch-model and candle-mi on GitHub)
+- Copy candle-mi's `memory.rs` as starting point
+- Strip `candle_core::Device` from the API, replace with `device_index: u32`
+- Split `sync_and_trim_gpu` back to candle-mi (not in scope)
+- Port test suite; expand Windows + Linux coverage
+- Set up CI (GitHub Actions, both OSes)
+
+**Phase 2 — hf-fm adopts (validates the API)**
+- Publish hypomnesis **0.0.1 placeholder** to crates.io early in this phase, purely to reserve the name (skeleton + minimal stubs; not for production use). The Greek root makes drive-by squatting unlikely, but the cost of a placeholder push is low and the cost of losing the name is high.
+- hf-fm `inspect --check-gpu` flag lands using hypomnesis as a path dep
+- Iterate on API rough edges surfaced by real use
+- Publish hypomnesis 0.1.0 to crates.io once API stabilizes
+
+**Phase 3 — candle-mi migrates (optional, cleanup)**
+- candle-mi drops its in-tree memory module
+- Depends on `hypomnesis = "0.1"`
+- Keeps `sync_and_trim_gpu` as its own (candle-specific)
+- Shipped in candle-mi v0.2
+
+## Decisions settled (Phase 1 kickoff, 2026-04-29)
+
+1. **Repo location** — `github.com/PCfVW/hypomnesis`. Sibling on GitHub of `anamnesis`, `candle-mi`, `hf-fetch-model`, `d-ary-heap`.
+2. **License** — `MIT OR Apache-2.0` (matches every sibling crate).
+3. **Error type** — `HypomnesisError` enum with `thiserror`, marked `#[non_exhaustive]`. Variants: `Ram(String)`, `Nvml(String)`, `Dxgi(String)`, `NvidiaSmi(String)`, `DeviceIndexOutOfRange { index, count }`, `NoGpuSource`, `Io(#[from] std::io::Error)`.
+4. **MSRV** — 1.88 (matches candle-mi).
+5. **Authorship** — driven from candle-mi's `src/memory.rs` by copy-and-refactor.
+6. **`device_index: u32` future-proofing** — keep `u32` for v0.1 (NVML-canonical, NVIDIA-only ordering on Windows: DXGI internally walks adapters and returns the N-th NVIDIA adapter with non-zero dedicated VRAM, skipping iGPUs and software drivers). Future-proofing rests on `#[non_exhaustive]` everywhere — see API section. Multi-vendor / UUID / LUID addressing can be added later as *new* functions alongside the existing `u32` API, never as a replacement.
+7. **`dxgi` in default features** — yes. Linux users pay nothing (target-conditional dep); Windows users get per-process VRAM out of the box.
+8. **`MemoryReport` and printing helpers** — gated behind opt-in `report` feature, default off. Names preserved verbatim from candle-mi so Phase 3 (candle-mi v0.2) is a one-line Cargo feature flip rather than a code rewrite. See "Proposed public API" for details.
+
+## Scope boundaries (repeat, for clarity)
+
+- Not a general system-info crate (use `sysinfo`, `hardware-query` for that)
+- Not a CUDA wrapper (use `cust`, `cudarc` for that)
+- Not a GUI or TUI (use `ratatui`, `iced` for that)
+- Not opinionated about *when* to measure — caller's responsibility
+
+One crate, one job: **tell you what's currently in this process's memory, precisely, across Windows and Linux.**

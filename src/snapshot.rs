@@ -135,3 +135,95 @@ impl Snapshot {
         mb
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_docs_in_private_items
+)]
+mod tests {
+    use super::*;
+
+    /// Build a `Snapshot` for tests. Sets `gpu` only when `vram_used` is
+    /// `Some`; sets `gpu_device` only when `total` is non-zero.
+    fn make_snapshot(
+        ram: u64,
+        vram_used: Option<u64>,
+        is_per_process: bool,
+        total: u64,
+    ) -> Snapshot {
+        Snapshot {
+            ram_bytes: ram,
+            gpu: vram_used.map(|used| ProcessGpuInfo {
+                used_bytes: used,
+                is_per_process,
+                source: if is_per_process {
+                    GpuQuerySource::Nvml
+                } else {
+                    GpuQuerySource::NvidiaSmi
+                },
+            }),
+            gpu_device: if total > 0 {
+                Some(GpuDeviceInfo {
+                    index: 0,
+                    name: None,
+                    total_bytes: total,
+                    free_bytes: total.saturating_sub(vram_used.unwrap_or(0)),
+                    used_bytes: vram_used.unwrap_or(0),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_constructs_with_no_gpu() {
+        let snap = make_snapshot(0, None, false, 0);
+        assert_eq!(snap.ram_bytes, 0);
+        assert!(snap.gpu.is_none());
+        assert!(snap.gpu_device.is_none());
+    }
+
+    #[test]
+    fn snapshot_constructs_with_full_gpu() {
+        let snap = make_snapshot(1_048_576, Some(500 * 1_048_576), true, 16_384 * 1_048_576);
+        assert_eq!(snap.ram_bytes, 1_048_576);
+        assert_eq!(snap.gpu.as_ref().unwrap().used_bytes, 500 * 1_048_576);
+        assert!(snap.gpu.as_ref().unwrap().is_per_process);
+        assert_eq!(
+            snap.gpu_device.as_ref().unwrap().total_bytes,
+            16_384 * 1_048_576
+        );
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn ram_mb_conversion() {
+        // exactly 1 MB
+        let snap = make_snapshot(1_048_576, None, false, 0);
+        assert!((snap.ram_mb() - 1.0).abs() < 0.001);
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn ram_mb_zero() {
+        let snap = make_snapshot(0, None, false, 0);
+        assert!(snap.ram_mb().abs() < 0.001);
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn vram_mb_none_when_no_gpu() {
+        let snap = make_snapshot(100, None, false, 0);
+        assert!(snap.vram_mb().is_none());
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn vram_mb_some_when_gpu_present() {
+        let snap = make_snapshot(100, Some(2 * 1_048_576), true, 16 * 1_048_576);
+        assert!((snap.vram_mb().unwrap() - 2.0).abs() < 0.001);
+    }
+}

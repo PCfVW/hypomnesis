@@ -1,6 +1,6 @@
 [package]
 name = "hypomnesis"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 authors = ["Eric Jacopin"]
 description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML, Linux NVML, with nvidia-smi fallback)."
@@ -32,6 +32,10 @@ nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
 report = []
 debug-output = []
+
+[[example]]
+name = "print_demo"
+required-features = ["report"]
 
 [lints.rust]
 elided_lifetimes_in_paths = "deny"

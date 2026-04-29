@@ -10,7 +10,11 @@
 
 use crate::{GpuDeviceInfo, HypomnesisError, ProcessGpuInfo, Result};
 
-#[cfg(any(feature = "nvml", all(windows, feature = "dxgi")))]
+#[cfg(any(
+    feature = "nvml",
+    all(windows, feature = "dxgi"),
+    feature = "nvidia-smi-fallback"
+))]
 use crate::GpuQuerySource;
 
 #[cfg(feature = "nvml")]
@@ -107,7 +111,17 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
         });
     }
 
-    // nvidia-smi fallback wired in Phase B+1.
+    // nvidia-smi fallback (device-wide proper, no name).
+    #[cfg(feature = "nvidia-smi-fallback")]
+    if let (Some(used_bytes), Some(total_bytes)) = nvidia_smi::query(index) {
+        return Ok(GpuDeviceInfo {
+            index,
+            name: None,
+            total_bytes,
+            free_bytes: total_bytes.saturating_sub(used_bytes),
+            used_bytes,
+        });
+    }
 
     bounds_check(index)?;
     Err(HypomnesisError::NoGpuSource)
@@ -151,7 +165,15 @@ pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
         });
     }
 
-    // nvidia-smi fallback wired in Phase B+1.
+    // nvidia-smi fallback — device-wide reading (`is_per_process = false`).
+    #[cfg(feature = "nvidia-smi-fallback")]
+    if let (Some(used_bytes), _) = nvidia_smi::query(device_index) {
+        return Ok(ProcessGpuInfo {
+            used_bytes,
+            is_per_process: false,
+            source: GpuQuerySource::NvidiaSmi,
+        });
+    }
 
     bounds_check(device_index)?;
     Err(HypomnesisError::NoGpuSource)

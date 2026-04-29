@@ -102,3 +102,36 @@ impl Snapshot {
         })
     }
 }
+
+/// Convenience formatting helpers, available with `features = ["report"]`.
+///
+/// Located on `Snapshot` (rather than `MemoryReport`) for parity with
+/// `candle-mi`'s `MemorySnapshot::ram_mb` / `vram_mb` API surface, so
+/// candle-mi v0.2 can adopt `hypomnesis` with a thin adapter wrapper
+/// rather than relocating the methods.
+#[cfg(feature = "report")]
+impl Snapshot {
+    /// `RAM` (`RSS`) usage as megabytes (`bytes / 1_048_576`).
+    #[must_use]
+    pub fn ram_mb(&self) -> f64 {
+        // CAST: u64 → f64, value is memory in bytes — fits in f64 mantissa
+        // for any realistic process size (< 2^53 bytes ≈ 8 PiB).
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let mb = self.ram_bytes as f64 / 1_048_576.0;
+        mb
+    }
+
+    /// Per-process `VRAM` usage as megabytes, if available.
+    ///
+    /// Returns `None` when `gpu` is `None` (no GPU source succeeded).
+    /// Reflects the dispatcher's mixed semantics: per-process when
+    /// `DXGI` / `NVML` produced the value, device-wide when the
+    /// `nvidia-smi` fallback was used (check `gpu.is_per_process`).
+    #[must_use]
+    pub fn vram_mb(&self) -> Option<f64> {
+        // CAST: u64 → f64, same justification as ram_mb.
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let mb = self.gpu.as_ref().map(|p| p.used_bytes as f64 / 1_048_576.0);
+        mb
+    }
+}

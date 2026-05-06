@@ -10,7 +10,7 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> 🚀 **`0.1.0` is the first functional release.** Process `RSS`, `NVML`, `DXGI`, and `nvidia-smi` backends are fully implemented and verified on Windows + Ubuntu WSL2. The public API is `#[non_exhaustive]` so additive features (multi-vendor addressing, AMD ROCm, Apple Metal) can land in 0.1.x patches without breaking callers. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.1.0 entry and [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md) for the design and roadmap.
+> 🚀 **`0.2.0` widens the API without breaking callers.** Adds `Snapshot::all` for multi-adapter enumeration on Windows, `gpu_processes` for compute-process listing, the `hmn` CLI binary behind a default-off `cli` feature, and `report`-feature free-VRAM print helpers (`format_free` / `print_free` on `GpuDeviceInfo`). The public API remains `#[non_exhaustive]` so further additions (AMD ROCm, Apple Metal) can land in 0.2.x patches without breaking callers. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.2.0 entry and [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) for the wave-by-wave rationale.
 
 ## Table of Contents
 
@@ -27,7 +27,7 @@
 
 ```toml
 [dependencies]
-hypomnesis = "0.1"
+hypomnesis = "0.2"
 ```
 
 The default feature set (`nvml`, `dxgi`, `nvidia-smi-fallback`) covers process RSS and per-process / device-wide GPU memory on both Windows (`IDXGIAdapter3` + `NVML`) and Linux (`NVML`), with a `nvidia-smi` subprocess fallback. The `dxgi` dependency on the `windows` crate is target-conditional — Linux users pay nothing for it.
@@ -165,7 +165,7 @@ The crate handles two known driver bugs out of the box:
 
 ## Used by
 
-_No consumers yet — `0.1.0` is the first functional release. **Phase 2** will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag (path-dep first, then `hypomnesis = "0.1"` from crates.io once the API has settled under real use). **Phase 3** may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis = "0.1"` with `features = ["report"]`._
+_No consumers yet — `0.2.0` adds the `hmn` CLI binary and multi-adapter enumeration on top of `0.1.0`'s core. **Phase 2** will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag (path-dep first, then `hypomnesis = "0.2"` from crates.io once the API has settled under real use). **Phase 3** may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis = "0.2"` with `features = ["report"]`._
 
 ## License
 

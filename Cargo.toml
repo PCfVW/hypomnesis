@@ -1,6 +1,6 @@
 [package]
 name = "hypomnesis"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Eric Jacopin"]
 description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML, Linux NVML, with nvidia-smi fallback)."

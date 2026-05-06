@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-06
+
+> *Wider, not taller. Same job — more callers can ask, more devices can answer.*
+
+`v0.2.0` widens the public API without breaking callers. Wave A adds the `report`-feature `format_free` / `print_free` helpers on `GpuDeviceInfo` for the LM-Studio-style headroom check. Wave B adds `Snapshot::all` for multi-adapter enumeration on Windows (NVIDIA dGPUs via `NVML` plus non-NVIDIA `DXGI` adapters such as Intel / AMD `iGPU`s). Wave C adds `gpu_processes` for compute-process listing and ships the `hmn` CLI binary behind a default-off `cli` feature. Public types remain `#[non_exhaustive]` per `v0.1.0` policy, so further additions (AMD `ROCm`, Apple Metal) can land in `0.2.x` patches without breaking callers. See [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) for the wave-by-wave rationale and the verification plan.
+
 ### Added
 
 - **`hmn` CLI binary behind the `cli` feature** (`src/bin/hmn.rs`, new file) — Wave C of the v0.2.0 roadmap. Default-off feature so library users don't pull `clap`; install with `cargo install hypomnesis --features cli`. Two subcommands:

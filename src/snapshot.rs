@@ -87,6 +87,24 @@ impl Snapshot {
     /// `RAM` is always measured. GPU measurement failures are non-fatal —
     /// the corresponding fields are set to `None` rather than producing an error.
     ///
+    /// # Performance
+    ///
+    /// Each call performs a full `NVML` init/shutdown cycle (and, on Windows,
+    /// a fresh `IDXGIFactory1` walk). This adds a few milliseconds of
+    /// overhead per call — fine for occasional sampling around training
+    /// steps or model loads, less ideal for tight per-frame polling. A
+    /// long-lived `NVML` context is planned for v0.2.
+    ///
+    /// # Per-process vs device-wide
+    ///
+    /// When `DXGI` (Windows) or `NVML` (Linux) succeeds, `gpu.used_bytes`
+    /// is genuinely per-process and `gpu.is_per_process` is `true`. When
+    /// the dispatcher falls back to `nvidia-smi` (no `NVML`/`DXGI`
+    /// available, or `WDDM` `NVML_VALUE_NOT_AVAILABLE`), `gpu.used_bytes`
+    /// reflects the **device-wide** total and `gpu.is_per_process` is
+    /// `false`. Callers that need true per-process accounting should
+    /// check `is_per_process` before interpreting the value.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::HypomnesisError::Ram`] if the platform `RAM` query fails.

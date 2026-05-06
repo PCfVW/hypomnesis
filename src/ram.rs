@@ -72,6 +72,7 @@ mod win_ffi {
     // SAFETY: These are stable Windows API functions with well-defined ABI.
     // GetCurrentProcess always returns a valid pseudo-handle.
     // K32GetProcessMemoryInfo writes to caller-provided memory of known size.
+    // GetLastError reads thread-local storage; safe to call any time.
     #[allow(unsafe_code)]
     unsafe extern "system" {
         /// Returns a pseudo-handle to the current process (always valid, never null).
@@ -87,6 +88,11 @@ mod win_ffi {
             ppsmem_counters: *mut ProcessMemoryCounters,
             cb: u32,
         ) -> i32;
+
+        /// Returns the calling thread's last-error code.
+        ///
+        /// See: <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror>
+        pub(super) safe fn GetLastError() -> u32;
     }
 }
 
@@ -126,9 +132,10 @@ fn windows_rss() -> Result<u64> {
         let rss = counters.working_set_size as u64;
         Ok(rss)
     } else {
-        Err(HypomnesisError::Ram(
-            "K32GetProcessMemoryInfo failed".into(),
-        ))
+        let code = win_ffi::GetLastError();
+        Err(HypomnesisError::Ram(format!(
+            "K32GetProcessMemoryInfo failed (GetLastError = {code})"
+        )))
     }
 }
 

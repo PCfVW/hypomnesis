@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`K32GetProcessMemoryInfo` failure now includes the `GetLastError` code** (`src/ram.rs`) — the Windows `RAM` error message previously returned a static `"K32GetProcessMemoryInfo failed"` string with no diagnostic context. The `win_ffi` block now also imports `GetLastError`, and `windows_rss` formats the returned code into the `HypomnesisError::Ram` payload (`"K32GetProcessMemoryInfo failed (GetLastError = N)"`). Failure of this call on the current-process pseudo-handle is exceedingly rare, but if it does fire the user now has a `WinError` code to look up rather than an opaque message.
+- **`Snapshot::now` rustdoc expanded with `# Performance` and per-process sections** (`src/snapshot.rs`) — surfaces two facts that were previously documented only in private modules / on `ProcessGpuInfo`:
+  - **Performance:** each call performs a full `NVML` init/shutdown cycle (and, on Windows, a fresh `IDXGIFactory1` walk), adding a few milliseconds per call — fine for occasional sampling, less ideal for tight per-frame polling. A long-lived `NVML` context is planned for v0.2.
+  - **Per-process vs device-wide:** when the dispatcher falls back to `nvidia-smi` (no `NVML`/`DXGI` available, or `WDDM` `NVML_VALUE_NOT_AVAILABLE`), `gpu.used_bytes` reflects the device-wide total, not the calling process. Callers needing true per-process accounting should check `gpu.is_per_process` before interpreting the value.
+
 ## [0.1.0] - 2026-04-29
 
 First functional release. Wave 2 of Phase 1 — ports the actual measurement code from [candle-mi/src/memory.rs](https://github.com/PCfVW/candle-mi/blob/main/src/memory.rs) (889 lines) into the `0.0.1` placeholder skeleton.

@@ -114,3 +114,59 @@ fn out_of_range_index_yields_device_index_error() {
         "expected DeviceIndexOutOfRange, got {result:?}"
     );
 }
+
+/// `Snapshot::all` should return at least one entry on a machine with
+/// NVIDIA hardware. On Windows with an additional iGPU (Intel / AMD), a
+/// second entry should appear after the NVIDIA one — the test is
+/// length-tolerant so machines without an iGPU still pass.
+#[test]
+#[ignore = "requires NVIDIA GPU + driver"]
+#[allow(clippy::expect_used)]
+fn snapshot_all_enumerates_nvidia_and_optional_extras() {
+    let snaps = Snapshot::all().expect("Snapshot::all failed on NVIDIA-equipped host");
+    assert!(
+        !snaps.is_empty(),
+        "expected at least one GPU snapshot on an NVIDIA-equipped host"
+    );
+
+    // Every entry carries RAM and a populated gpu_device with a
+    // monotonically increasing index starting at 0.
+    for (expected_idx, snap) in snaps.iter().enumerate() {
+        assert!(snap.ram_bytes > 0, "entry {expected_idx} ram_bytes == 0");
+        let dev = snap
+            .gpu_device
+            .as_ref()
+            .expect("Snapshot::all entry missing gpu_device");
+        // CAST: usize → u32, expected_idx is bounded by snaps.len() which
+        // never exceeds u32::MAX in any realistic system.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let want = expected_idx as u32;
+        assert_eq!(
+            dev.index, want,
+            "entry {expected_idx} has index {} (expected {want})",
+            dev.index
+        );
+        assert!(
+            dev.total_bytes > 0,
+            "entry {expected_idx} total_bytes == 0 (name={:?})",
+            dev.name
+        );
+    }
+
+    // On Windows with an iGPU present (the maintainer's reference
+    // machine: RTX 5060 Ti dGPU + AMD iGPU), the second entry should be
+    // the non-NVIDIA DXGI extra. Adapter name is best-effort.
+    #[cfg(windows)]
+    if let Some(extra) = snaps.get(1) {
+        let dev = extra
+            .gpu_device
+            .as_ref()
+            .expect("second Snapshot::all entry missing gpu_device");
+        assert!(dev.index >= 1, "second entry index < 1");
+        // The non-NVIDIA extra is reported via DXGI's per-process path.
+        if let Some(p) = &extra.gpu {
+            assert_eq!(p.source, hypomnesis::GpuQuerySource::Dxgi);
+            assert!(p.is_per_process);
+        }
+    }
+}

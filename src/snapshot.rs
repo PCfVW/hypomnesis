@@ -15,7 +15,14 @@ use crate::Result;
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GpuDeviceInfo {
-    /// Zero-based GPU index (`NVML`-canonical ordering on Windows).
+    /// Zero-based GPU index.
+    ///
+    /// For [`Snapshot::now`] and the NVIDIA portion of [`Snapshot::all`],
+    /// this is the `NVML`-canonical index (which agrees with the `DXGI`
+    /// NVIDIA-filtered index on Windows). For non-NVIDIA Windows
+    /// adapters surfaced by [`Snapshot::all`] (e.g. AMD / Intel `iGPU`),
+    /// it is a synthetic index assigned after the `NVIDIA` count and is
+    /// **not** addressable via [`Snapshot::now`].
     pub index: u32,
     /// Adapter name (e.g., `NVIDIA GeForce RTX 5060 Ti`).
     /// `None` when the source backend (e.g., `NVML` on a system where
@@ -118,6 +125,80 @@ impl Snapshot {
             gpu,
             gpu_device,
         })
+    }
+
+    /// Capture a fresh snapshot of process `RAM` and GPU memory **for every
+    /// visible GPU**.
+    ///
+    /// On Linux: enumerates NVIDIA dGPU(s) via `NVML`. AMD / Intel
+    /// `iGPU`s do not surface — there is no AMD / Intel backend yet
+    /// (an AMD `ROCm` SMI backend and an Apple Metal backend are
+    /// possibilities for a later release; see `docs/roadmap-v0.2.0.md`).
+    ///
+    /// On Windows: enumerates NVIDIA dGPU(s) via `NVML` *plus* every
+    /// other `DXGI` adapter that exposes
+    /// `DedicatedVideoMemory > 0` or `SharedSystemMemory > 0` (e.g.
+    /// AMD / Intel `iGPU`). For non-NVIDIA adapters, `total_bytes` is
+    /// `DedicatedVideoMemory` when non-zero (matches what dGPUs and
+    /// `UMA`-allocated `iGPU`s expose), otherwise the `WDDM`
+    /// shared-memory budget (`SharedSystemMemory`). The semantics of
+    /// `total_bytes` therefore differ subtly between dGPUs and `iGPU`s.
+    /// The Microsoft Basic Render Driver (`VendorId = 0x1414`) is
+    /// always skipped — it has no real GPU memory to report.
+    ///
+    /// Each returned [`Snapshot`] carries the same `ram_bytes`: a single
+    /// `RSS` measurement is taken once and reused, since the wall-time
+    /// delta across the GPU walk is microseconds and per-snapshot
+    /// re-measurement would add no useful precision.
+    ///
+    /// Returns an empty `Vec` when no GPUs are visible. Callers needing
+    /// RAM-only state should use [`crate::process_rss`] or
+    /// [`Self::now`] (which returns a single `Snapshot` with `gpu` and
+    /// `gpu_device` set to `None`).
+    ///
+    /// # Performance
+    ///
+    /// Each device queried calls [`crate::process_gpu_info`] and
+    /// [`crate::device_info`], each of which performs a fresh `NVML`
+    /// init / shutdown cycle. For an N-GPU system this is
+    /// `N × (NVML init + shutdown)`. A long-lived `NVML` context is
+    /// planned for a later release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::HypomnesisError::Ram`] if the platform `RAM`
+    /// query fails.
+    pub fn all() -> Result<Vec<Self>> {
+        let ram_bytes = crate::ram::process_rss()?;
+
+        // device_count() returning Err here means "no enumeration backend
+        // is enabled / every backend failed to report a count" — treat
+        // that as zero NVIDIA GPUs and let the Windows DXGI extras path
+        // (if compiled in) still surface iGPUs. RAM is already captured.
+        let nvidia_count = crate::gpu::device_count().unwrap_or(0);
+        // CAST: u32 → usize, NVML / DXGI device counts are bounded by
+        // hardware (handfuls in practice); fits trivially in usize.
+        #[allow(clippy::as_conversions)]
+        let mut snapshots: Vec<Self> = Vec::with_capacity(nvidia_count as usize);
+
+        for idx in 0..nvidia_count {
+            snapshots.push(Self {
+                ram_bytes,
+                gpu: crate::gpu::process_gpu_info(idx).ok(),
+                gpu_device: crate::gpu::device_info(idx).ok(),
+            });
+        }
+
+        #[cfg(all(windows, feature = "dxgi"))]
+        for (gpu_device, gpu) in crate::gpu::dxgi_non_nvidia_devices(nvidia_count) {
+            snapshots.push(Self {
+                ram_bytes,
+                gpu: Some(gpu),
+                gpu_device: Some(gpu_device),
+            });
+        }
+
+        Ok(snapshots)
     }
 }
 

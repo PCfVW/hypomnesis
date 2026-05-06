@@ -48,3 +48,21 @@ fn snapshot_now_returns_ram_without_gpu() {
     // gpu / gpu_device are best-effort; we don't assert on them in the
     // CI path because hosted runners typically lack NVIDIA hardware.
 }
+
+#[test]
+#[allow(clippy::expect_used)] // RAM query should never fail; GPU absence yields an empty Vec
+fn snapshot_all_returns_ok_and_carries_ram() {
+    // On a runner without NVIDIA / DXGI extras, Snapshot::all() returns
+    // an empty Vec (RAM is captured but discarded — callers wanting
+    // RAM-only state should use process_rss or Snapshot::now). We assert
+    // on shape only so the test passes on hosted runners and on
+    // hardware alike.
+    let snaps = Snapshot::all().expect("Snapshot::all's RAM query should succeed");
+    for snap in &snaps {
+        assert!(
+            snap.ram_bytes > 0,
+            "every Snapshot::all entry should carry positive RAM, got {}",
+            snap.ram_bytes
+        );
+    }
+}

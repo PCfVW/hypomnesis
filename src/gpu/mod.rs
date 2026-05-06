@@ -177,6 +177,61 @@ pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
     Err(HypomnesisError::NoGpuSource)
 }
 
+/// Convert each non-NVIDIA `DXGI` adapter into a `(GpuDeviceInfo, ProcessGpuInfo)`
+/// pair, ready to be wrapped in a `Snapshot` by [`crate::Snapshot::all`].
+///
+/// Indices are assigned sequentially starting at `starting_index` so that
+/// the NVIDIA portion of `Snapshot::all()` (`NVML`-canonical 0..N-1) and
+/// the non-NVIDIA portion (N, N+1, …) form a contiguous index space.
+///
+/// `total_bytes` is the adapter's `DedicatedVideoMemory` when non-zero
+/// (matches what `dGPU`s and `UMA`-allocated `iGPU`s expose), otherwise
+/// `SharedSystemMemory` (`WDDM` shared budget — the right number for
+/// `iGPU`s without `UMA`). The semantics of `total_bytes` therefore
+/// differs subtly between `dGPU`s and `iGPU`s; `Snapshot::all`'s rustdoc
+/// flags this for callers.
+///
+/// `is_per_process` is `true` because `DXGI`'s `CurrentUsage` is
+/// `WDDM`-aware and reports the calling process's own usage, not a
+/// device-wide sum.
+#[cfg(all(windows, feature = "dxgi"))]
+#[must_use]
+pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo, ProcessGpuInfo)> {
+    dxgi::enumerate_non_nvidia()
+        .into_iter()
+        .enumerate()
+        .map(|(offset, entry)| {
+            // CAST: usize → u32, offset is bounded by the DXGI adapter
+            // count (handfuls in practice); never approaches u32::MAX.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            let index = starting_index.saturating_add(offset as u32);
+
+            let total_bytes = if entry.dedicated_video_memory > 0 {
+                entry.dedicated_video_memory
+            } else {
+                entry.shared_system_memory
+            };
+            let used_bytes = entry.current_usage;
+            let free_bytes = total_bytes.saturating_sub(used_bytes);
+
+            (
+                GpuDeviceInfo {
+                    index,
+                    name: entry.adapter_name,
+                    total_bytes,
+                    free_bytes,
+                    used_bytes,
+                },
+                ProcessGpuInfo {
+                    used_bytes,
+                    is_per_process: true,
+                    source: GpuQuerySource::Dxgi,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Bounds-check `index` against whatever count source is available.
 ///
 /// Tries `NVML` first; on Windows, falls back to `DXGI` if `NVML` is

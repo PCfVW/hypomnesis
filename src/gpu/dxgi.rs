@@ -32,6 +32,13 @@ use windows::core::Interface;
 /// NVIDIA adapters, matching `NVML`'s enumeration view.
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
+/// PCI vendor ID for the Microsoft Basic Render Driver.
+///
+/// `MSBR` is the synthetic adapter every Windows install ships with — it
+/// has no underlying GPU memory. Skipped during the
+/// [`enumerate_non_nvidia`] walk so it never surfaces in `Snapshot::all()`.
+const MICROSOFT_BASIC_VENDOR_ID: u32 = 0x1414;
+
 /// Combined result of a single `DXGI` query for a given (NVIDIA-filtered) adapter index.
 ///
 /// Returned by [`query`].
@@ -165,6 +172,134 @@ pub(super) fn adapter_name(idx: u32) -> Option<String> {
 
         raw_idx += 1;
     }
+}
+
+/// One non-NVIDIA, non-`MSBR` `DXGI` adapter that exposes some form of GPU memory.
+///
+/// Returned by [`enumerate_non_nvidia`] for `Snapshot::all()` on Windows
+/// to surface AMD / Intel `iGPU`s alongside the NVIDIA dGPU(s) `NVML`
+/// already enumerates. NVIDIA adapters are intentionally excluded from
+/// this enumeration — `NVML` is the authoritative source for them
+/// (correct device-wide totals, driver-side `free` figure that accounts
+/// for reservation / alignment).
+pub(super) struct DxgiAdapterEntry {
+    /// Adapter name parsed from `DXGI_ADAPTER_DESC.Description`.
+    /// `None` when the description is empty after trimming trailing nulls.
+    pub adapter_name: Option<String>,
+    /// Per-process VRAM usage in bytes — `CurrentUsage` of the
+    /// `DXGI_MEMORY_SEGMENT_GROUP_LOCAL` segment. Zero when the adapter
+    /// does not expose `IDXGIAdapter3` or `QueryVideoMemoryInfo` fails;
+    /// not an error condition (best-effort).
+    pub current_usage: u64,
+    /// `DXGI_ADAPTER_DESC.DedicatedVideoMemory` — dedicated `VRAM` in
+    /// bytes. Non-zero on dGPUs and on `iGPU`s with `BIOS`-allocated
+    /// `UMA` chunks; zero on `iGPU`s without `UMA`.
+    pub dedicated_video_memory: u64,
+    /// `DXGI_ADAPTER_DESC.SharedSystemMemory` — `WDDM` shared-memory
+    /// budget in bytes (the OS-managed slice of system RAM the GPU may
+    /// commit). Non-zero on every real adapter; useful as the
+    /// `total_bytes` fallback for `iGPU`s without a dedicated chunk.
+    pub shared_system_memory: u64,
+}
+
+/// Walk every `DXGI` adapter, returning one entry per non-NVIDIA, non-`MSBR`
+/// adapter that exposes any GPU-accessible memory.
+///
+/// Filter rule: `VendorId != 0x10DE` (NVIDIA, handled by `NVML`) AND
+/// `VendorId != 0x1414` (`MSBR`) AND
+/// (`DedicatedVideoMemory > 0` OR `SharedSystemMemory > 0`).
+///
+/// Used by `Snapshot::all()`. Returns an empty `Vec` if `DXGI` itself
+/// fails to load, or the system has no qualifying non-NVIDIA adapters.
+#[allow(unsafe_code)]
+#[must_use]
+pub(super) fn enumerate_non_nvidia() -> Vec<DxgiAdapterEntry> {
+    // SAFETY: same justification as in `query`.
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<DxgiAdapterEntry> = Vec::new();
+    let mut raw_idx: u32 = 0;
+
+    loop {
+        // SAFETY: EnumAdapters1 returns Err past the last enumerated
+        // adapter; we treat that as the natural end-of-walk and break.
+        let Ok(adapter1) = (unsafe { factory.EnumAdapters1(raw_idx) }) else {
+            break;
+        };
+        let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
+            break;
+        };
+        // SAFETY: GetDesc fills DXGI_ADAPTER_DESC; adapter handle valid.
+        let Ok(desc) = (unsafe { adapter.GetDesc() }) else {
+            break;
+        };
+
+        // CAST: usize → u64, DedicatedVideoMemory and SharedSystemMemory
+        // are usize in DXGI_ADAPTER_DESC; on 64-bit Windows they fit in u64.
+        #[allow(clippy::as_conversions)]
+        let dedicated = desc.DedicatedVideoMemory as u64;
+        // CAST: usize → u64, same justification.
+        #[allow(clippy::as_conversions)]
+        let shared = desc.SharedSystemMemory as u64;
+
+        let qualifies = desc.VendorId != NVIDIA_VENDOR_ID
+            && desc.VendorId != MICROSOFT_BASIC_VENDOR_ID
+            && (dedicated > 0 || shared > 0);
+
+        if qualifies {
+            // BORROW: explicit String::from_utf16_lossy + trim_end_matches
+            // + to_owned — desc.Description is fixed-size [u16; 128] and
+            // we need an owned String to return.
+            let raw_name = String::from_utf16_lossy(&desc.Description);
+            let trimmed = raw_name.trim_end_matches('\0');
+            let adapter_name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+
+            // Per-process LOCAL CurrentUsage. Best-effort: an adapter
+            // that doesn't implement IDXGIAdapter3, or where the query
+            // fails, contributes 0 here. The dispatcher records the
+            // 0 as a per-process reading, not as an error.
+            let current_usage = adapter
+                .cast::<IDXGIAdapter3>()
+                .ok()
+                .and_then(|a3| {
+                    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                    // SAFETY: QueryVideoMemoryInfo fills the caller-provided
+                    // DXGI_QUERY_VIDEO_MEMORY_INFO. Node 0 = primary GPU
+                    // node; LOCAL = dedicated VRAM segment.
+                    unsafe {
+                        a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &raw mut info)
+                    }
+                    .ok()
+                    .map(|()| info.CurrentUsage)
+                })
+                .unwrap_or(0);
+
+            #[cfg(feature = "debug-output")]
+            eprintln!(
+                "[DXGI debug] non-nvidia adapter[raw#{raw_idx}]: vendor={:#x}, \
+                 name={adapter_name:?}, dedicated={dedicated}, shared={shared}, \
+                 current_usage={current_usage}",
+                desc.VendorId
+            );
+
+            out.push(DxgiAdapterEntry {
+                adapter_name,
+                current_usage,
+                dedicated_video_memory: dedicated,
+                shared_system_memory: shared,
+            });
+        }
+
+        raw_idx += 1;
+    }
+
+    out
 }
 
 /// Number of NVIDIA adapters with non-zero dedicated VRAM visible to `DXGI`.

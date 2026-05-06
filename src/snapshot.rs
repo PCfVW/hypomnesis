@@ -154,6 +154,55 @@ impl Snapshot {
     }
 }
 
+/// Free-`VRAM` formatting helpers for [`GpuDeviceInfo`], available with `features = ["report"]`.
+///
+/// Mirrors the [`Snapshot::ram_mb`] / [`Snapshot::vram_mb`] convention:
+/// feature-gated formatting helpers live next to the type they describe.
+/// The motivating use case is the LM-Studio-style headroom check —
+/// *"if I load this model now, will it fit?"* — which is a one-liner via
+/// the existing `free_bytes` field; this helper makes the printed
+/// reporting equally short.
+#[cfg(feature = "report")]
+impl GpuDeviceInfo {
+    /// Format a one-line free-`VRAM` summary as an owned `String` ending in a newline.
+    ///
+    /// Format: `  GPU <idx>: free <N> MB / <T> MB[ [<adapter name>]]\n`.
+    /// The adapter-name suffix is omitted when [`Self::name`] is `None`.
+    /// `MB` here means `MiB` (`bytes / 1_048_576`), matching
+    /// [`Snapshot::ram_mb`] and [`Snapshot::vram_mb`].
+    ///
+    /// Suitable for log frameworks (`tracing::info!("{}", dev.format_free())`),
+    /// file output, or test assertions. [`Self::print_free`] delegates here.
+    #[must_use]
+    pub fn format_free(&self) -> String {
+        // CAST: u64 → f64, byte count for MiB conversion (fits in f64
+        // mantissa for any realistic VRAM size; same justification as
+        // Snapshot::ram_mb).
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let free_mb = self.free_bytes as f64 / 1_048_576.0;
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let total_mb = self.total_bytes as f64 / 1_048_576.0;
+        // BORROW: explicit Option::as_deref + map_or — name is
+        // Option<String>; we need an owned String for the suffix.
+        let name_suffix = self
+            .name
+            .as_deref()
+            .map_or(String::new(), |n| format!(" [{n}]"));
+        format!(
+            "  GPU {}: free {free_mb:.0} MB / {total_mb:.0} MB{name_suffix}\n",
+            self.index
+        )
+    }
+
+    /// Print a one-line free-`VRAM` summary to stdout.
+    ///
+    /// Delegates to [`Self::format_free`]; the printed string is
+    /// byte-for-byte identical to the formatted return value.
+    pub fn print_free(&self) {
+        print!("{}", self.format_free());
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -243,5 +292,68 @@ mod tests {
     fn vram_mb_some_when_gpu_present() {
         let snap = make_snapshot(100, Some(2 * 1_048_576), true, 16 * 1_048_576);
         assert!((snap.vram_mb().unwrap() - 2.0).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // GpuDeviceInfo::format_free / print_free tests (Wave A)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn format_free_with_name() {
+        let dev = GpuDeviceInfo {
+            index: 0,
+            name: Some("NVIDIA Test GPU".to_owned()),
+            total_bytes: 16_384 * 1_048_576,
+            free_bytes: 13_284 * 1_048_576,
+            used_bytes: 3_100 * 1_048_576,
+        };
+        assert_eq!(
+            dev.format_free(),
+            "  GPU 0: free 13284 MB / 16384 MB [NVIDIA Test GPU]\n"
+        );
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn format_free_without_name() {
+        let dev = GpuDeviceInfo {
+            index: 1,
+            name: None,
+            total_bytes: 8_192 * 1_048_576,
+            free_bytes: 4_096 * 1_048_576,
+            used_bytes: 4_096 * 1_048_576,
+        };
+        assert_eq!(dev.format_free(), "  GPU 1: free 4096 MB / 8192 MB\n");
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn format_free_full_device() {
+        // free == 0 (fully-allocated device); should still render cleanly.
+        let dev = GpuDeviceInfo {
+            index: 2,
+            name: Some("Saturated GPU".to_owned()),
+            total_bytes: 4_096 * 1_048_576,
+            free_bytes: 0,
+            used_bytes: 4_096 * 1_048_576,
+        };
+        assert_eq!(
+            dev.format_free(),
+            "  GPU 2: free 0 MB / 4096 MB [Saturated GPU]\n"
+        );
+    }
+
+    #[cfg(feature = "report")]
+    #[test]
+    fn print_free_does_not_panic() {
+        let dev = GpuDeviceInfo {
+            index: 0,
+            name: None,
+            total_bytes: 1_000,
+            free_bytes: 500,
+            used_bytes: 500,
+        };
+        dev.print_free();
     }
 }

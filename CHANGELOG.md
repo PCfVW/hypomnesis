@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`GpuDeviceInfo::format_free` and `GpuDeviceInfo::print_free`** under `#[cfg(feature = "report")]` (`src/snapshot.rs`) — Wave A of the v0.2.0 roadmap. Format: `  GPU <idx>: free <N> MB / <T> MB[ [<adapter name>]]\n`. Mirrors the existing `Snapshot::ram_mb` / `vram_mb` convention (feature-gated `impl` block on the type, in the file that defines it) so callers reach for `dev.print_free()` rather than a free function. The motivating use case is the LM-Studio-style headroom check — *"if I load this model now, will it fit?"* — already a one-liner via the existing `free_bytes` field; this helper makes the printed reporting equally short. `print_free` delegates to `format_free`, locking the format under unit-test verification (4 inline tests covering name-present / name-absent / fully-allocated device / `print_*` smoke). The roadmap's proposed `pub fn free_bytes(&self) -> u64` method was dropped from this wave: `pub free_bytes: u64` already exists as a field on `GpuDeviceInfo`, satisfies the same ergonomics goal, and on the `NVML` path stores the driver's actual free count (which is more accurate than `total - used` once driver-side reservation/alignment is considered).
+
 ### Changed
 
 - **`K32GetProcessMemoryInfo` failure now includes the `GetLastError` code** (`src/ram.rs`) — the Windows `RAM` error message previously returned a static `"K32GetProcessMemoryInfo failed"` string with no diagnostic context. The `win_ffi` block now also imports `GetLastError`, and `windows_rss` formats the returned code into the `HypomnesisError::Ram` payload (`"K32GetProcessMemoryInfo failed (GetLastError = N)"`). Failure of this call on the current-process pseudo-handle is exceedingly rare, but if it does fire the user now has a `WinError` code to look up rather than an opaque message.

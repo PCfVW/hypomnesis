@@ -20,8 +20,8 @@ pub struct GpuDeviceInfo {
     /// For [`Snapshot::now`] and the NVIDIA portion of [`Snapshot::all`],
     /// this is the `NVML`-canonical index (which agrees with the `DXGI`
     /// NVIDIA-filtered index on Windows). For non-NVIDIA Windows
-    /// adapters surfaced by [`Snapshot::all`] (e.g. AMD / Intel `iGPU`),
-    /// it is a synthetic index assigned after the `NVIDIA` count and is
+    /// adapters surfaced by [`Snapshot::all`] (e.g. AMD / Intel iGPUs),
+    /// it is a synthetic index assigned after the NVIDIA count and is
     /// **not** addressable via [`Snapshot::now`].
     pub index: u32,
     /// Adapter name (e.g., `NVIDIA GeForce RTX 5060 Ti`).
@@ -71,8 +71,9 @@ pub enum GpuQuerySource {
 
 /// Combined snapshot of process `RAM` and GPU memory state at a point in time.
 ///
-/// Constructed via `Snapshot::now`. RAM measurement is mandatory; both GPU
-/// fields are best-effort and set to `None` when no backend is usable.
+/// Constructed via [`Snapshot::now`] (one device) or [`Snapshot::all`]
+/// (every visible GPU). `RAM` measurement is mandatory; both GPU fields
+/// are best-effort and set to `None` when no backend is usable.
 ///
 /// `#[non_exhaustive]`: fields may be added in future releases.
 #[non_exhaustive]
@@ -114,8 +115,10 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::HypomnesisError::Ram`] if the platform `RAM` query fails.
-    /// Returns [`crate::HypomnesisError::Io`] if reading `/proc/self/status` fails on Linux.
+    /// Returns [`crate::HypomnesisError::Ram`] if the platform `RAM`
+    /// query fails — including the Linux path, where `/proc/self/status`
+    /// read errors and `VmRSS` parse failures are wrapped into the
+    /// `Ram` variant rather than surfaced as `Io`.
     pub fn now(device_index: u32) -> Result<Self> {
         let ram_bytes = crate::ram::process_rss()?;
         let gpu = crate::gpu::process_gpu_info(device_index).ok();
@@ -130,21 +133,21 @@ impl Snapshot {
     /// Capture a fresh snapshot of process `RAM` and GPU memory **for every
     /// visible GPU**.
     ///
-    /// On Linux: enumerates NVIDIA dGPU(s) via `NVML`. AMD / Intel
-    /// `iGPU`s do not surface — there is no AMD / Intel backend yet
-    /// (an AMD `ROCm` SMI backend and an Apple Metal backend are
-    /// possibilities for a later release; see `docs/roadmap-v0.2.0.md`).
+    /// On Linux: enumerates NVIDIA dGPU(s) via `NVML`. AMD / Intel iGPUs
+    /// do not surface — there is no AMD / Intel backend yet (an AMD
+    /// `ROCm` SMI backend and an Apple Metal backend are possibilities
+    /// for a later release; see `docs/roadmap-v0.2.0.md`).
     ///
     /// On Windows: enumerates NVIDIA dGPU(s) via `NVML` *plus* every
     /// other `DXGI` adapter that exposes
     /// `DedicatedVideoMemory > 0` or `SharedSystemMemory > 0` (e.g.
-    /// AMD / Intel `iGPU`). For non-NVIDIA adapters, `total_bytes` is
+    /// AMD / Intel iGPUs). For non-NVIDIA adapters, `total_bytes` is
     /// `DedicatedVideoMemory` when non-zero (matches what dGPUs and
-    /// `UMA`-allocated `iGPU`s expose), otherwise the `WDDM`
-    /// shared-memory budget (`SharedSystemMemory`). The semantics of
-    /// `total_bytes` therefore differ subtly between dGPUs and `iGPU`s.
-    /// The Microsoft Basic Render Driver (`VendorId = 0x1414`) is
-    /// always skipped — it has no real GPU memory to report.
+    /// UMA-allocated iGPUs expose), otherwise the `WDDM` shared-memory
+    /// budget (`SharedSystemMemory`). The semantics of `total_bytes`
+    /// therefore differ subtly between dGPUs and iGPUs. The Microsoft
+    /// Basic Render Driver (`VendorId = 0x1414`) is always skipped — it
+    /// has no real GPU memory to report.
     ///
     /// Each returned [`Snapshot`] carries the same `ram_bytes`: a single
     /// `RSS` measurement is taken once and reused, since the wall-time
@@ -158,16 +161,22 @@ impl Snapshot {
     ///
     /// # Performance
     ///
-    /// Each device queried calls [`crate::process_gpu_info`] and
+    /// Each NVIDIA device queried calls [`crate::process_gpu_info`] and
     /// [`crate::device_info`], each of which performs a fresh `NVML`
-    /// init / shutdown cycle. For an N-GPU system this is
-    /// `N × (NVML init + shutdown)`. A long-lived `NVML` context is
-    /// planned for a later release.
+    /// init / shutdown cycle (and, on Windows, a fresh `IDXGIFactory1`
+    /// walk). On Windows, `Snapshot::all` additionally walks
+    /// `IDXGIFactory1` once more for the non-NVIDIA enumeration. For an
+    /// N-GPU system the worst-case cost is therefore
+    /// `N × (NVML init + shutdown + DXGI walk) + 1 × DXGI walk` on
+    /// Windows, and `N × (NVML init + shutdown)` on Linux. A long-lived
+    /// `NVML` context is planned for a later release.
     ///
     /// # Errors
     ///
     /// Returns [`crate::HypomnesisError::Ram`] if the platform `RAM`
-    /// query fails.
+    /// query fails — including the Linux path, where `/proc/self/status`
+    /// read errors and `VmRSS` parse failures are wrapped into the
+    /// `Ram` variant rather than surfaced as `Io`.
     pub fn all() -> Result<Vec<Self>> {
         let ram_bytes = crate::ram::process_rss()?;
 

@@ -185,11 +185,11 @@ pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
 /// the non-NVIDIA portion (N, N+1, …) form a contiguous index space.
 ///
 /// `total_bytes` is the adapter's `DedicatedVideoMemory` when non-zero
-/// (matches what `dGPU`s and `UMA`-allocated `iGPU`s expose), otherwise
+/// (matches what dGPUs and UMA-allocated iGPUs expose), otherwise
 /// `SharedSystemMemory` (`WDDM` shared budget — the right number for
-/// `iGPU`s without `UMA`). The semantics of `total_bytes` therefore
-/// differs subtly between `dGPU`s and `iGPU`s; `Snapshot::all`'s rustdoc
-/// flags this for callers.
+/// iGPUs without UMA). The semantics of `total_bytes` therefore differ
+/// subtly between dGPUs and iGPUs; the `Snapshot::all` rustdoc flags
+/// this for callers.
 ///
 /// `is_per_process` is `true` because `DXGI`'s `CurrentUsage` is
 /// `WDDM`-aware and reports the calling process's own usage, not a

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Smoke test: verify the public API surface compiles, is reachable from
-//! outside the crate, and that the always-available functions
-//! (`process_rss`, `Snapshot::now`) succeed without an NVIDIA GPU.
+//! outside the crate, and that the always-available entry points
+//! (`process_rss`, `Snapshot::now`, `Snapshot::all`) succeed without an
+//! NVIDIA GPU. `Snapshot::all` returns an empty `Vec` when no GPUs are
+//! visible — callers wanting RAM-only state should use `process_rss` or
+//! `Snapshot::now` instead.
 //!
 //! Live-GPU tests requiring NVIDIA hardware live in `tests/live_gpu.rs`
 //! and are `#[ignore]`-gated.

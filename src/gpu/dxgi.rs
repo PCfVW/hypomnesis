@@ -13,12 +13,22 @@
 //!
 //! # Adapter filtering
 //!
-//! `device_index: u32` is interpreted as the index into the *filtered*
-//! list of NVIDIA adapters with non-zero dedicated `VRAM`. iGPUs (Intel
-//! `0x8086`, AMD integrated `0x1002`), the Microsoft Basic Render Driver
-//! (`0x1414`), and any non-NVIDIA discrete GPUs are skipped during the
-//! `EnumAdapters1` walk. Filter rule: `VendorId == 0x10DE` AND
-//! `DedicatedVideoMemory > 0`.
+//! Two enumeration paths coexist with opposite filters:
+//!
+//! - **NVIDIA-only walk** ([`query`], [`adapter_name`], [`device_count`]).
+//!   `device_index: u32` is the index into the *filtered* list of NVIDIA
+//!   adapters with non-zero dedicated `VRAM`. iGPUs (Intel `0x8086`, AMD
+//!   integrated `0x1002`), the Microsoft Basic Render Driver (`0x1414`),
+//!   and any non-NVIDIA discrete GPUs are skipped during the
+//!   `EnumAdapters1` walk. Filter rule:
+//!   `VendorId == 0x10DE` AND `DedicatedVideoMemory > 0`.
+//!
+//! - **Non-NVIDIA walk** ([`enumerate_non_nvidia`], used by
+//!   `Snapshot::all` on Windows). Reverses the NVIDIA filter to surface
+//!   AMD / Intel iGPUs and any non-NVIDIA discrete GPUs alongside the
+//!   NVIDIA dGPU(s) `NVML` enumerates. Filter rule:
+//!   `VendorId != 0x10DE` AND `VendorId != 0x1414` AND
+//!   (`DedicatedVideoMemory > 0` OR `SharedSystemMemory > 0`).
 
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
@@ -177,7 +187,7 @@ pub(super) fn adapter_name(idx: u32) -> Option<String> {
 /// One non-NVIDIA, non-`MSBR` `DXGI` adapter that exposes some form of GPU memory.
 ///
 /// Returned by [`enumerate_non_nvidia`] for `Snapshot::all()` on Windows
-/// to surface AMD / Intel `iGPU`s alongside the NVIDIA dGPU(s) `NVML`
+/// to surface AMD / Intel iGPUs alongside the NVIDIA dGPU(s) `NVML`
 /// already enumerates. NVIDIA adapters are intentionally excluded from
 /// this enumeration — `NVML` is the authoritative source for them
 /// (correct device-wide totals, driver-side `free` figure that accounts
@@ -192,13 +202,13 @@ pub(super) struct DxgiAdapterEntry {
     /// not an error condition (best-effort).
     pub current_usage: u64,
     /// `DXGI_ADAPTER_DESC.DedicatedVideoMemory` — dedicated `VRAM` in
-    /// bytes. Non-zero on dGPUs and on `iGPU`s with `BIOS`-allocated
-    /// `UMA` chunks; zero on `iGPU`s without `UMA`.
+    /// bytes. Non-zero on dGPUs and on iGPUs with BIOS-allocated UMA
+    /// chunks; zero on iGPUs without UMA.
     pub dedicated_video_memory: u64,
     /// `DXGI_ADAPTER_DESC.SharedSystemMemory` — `WDDM` shared-memory
     /// budget in bytes (the OS-managed slice of system RAM the GPU may
     /// commit). Non-zero on every real adapter; useful as the
-    /// `total_bytes` fallback for `iGPU`s without a dedicated chunk.
+    /// `total_bytes` fallback for iGPUs without a dedicated chunk.
     pub shared_system_memory: u64,
 }
 

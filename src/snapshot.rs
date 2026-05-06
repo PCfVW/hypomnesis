@@ -69,6 +69,37 @@ pub enum GpuQuerySource {
     NvidiaSmi,
 }
 
+/// One compute process holding GPU memory on a given device.
+///
+/// Distinct from [`ProcessGpuInfo`]: that type describes the *calling*
+/// process's own usage; `GpuProcessEntry` is one row of an enumeration
+/// over **all** compute processes on the device, returned by
+/// [`crate::gpu_processes`].
+///
+/// **Compute-only.** Both backends ([`GpuQuerySource::Nvml`] and
+/// [`GpuQuerySource::NvidiaSmi`]) only see processes with an active
+/// `CUDA` context. Browsers using GPU compositing, games, and
+/// pure-graphics apps do not appear here.
+///
+/// `#[non_exhaustive]`: fields may be added in future releases.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GpuProcessEntry {
+    /// OS process ID.
+    pub pid: u32,
+    /// Process name. `None` when no name source is available; on Windows,
+    /// `Some("?")` when `nvidia-smi` reports a protected process whose
+    /// image name could not be read.
+    pub name: Option<String>,
+    /// GPU memory used by this process in bytes.
+    pub used_bytes: u64,
+    /// Which backend produced this row. Always [`GpuQuerySource::Nvml`]
+    /// or [`GpuQuerySource::NvidiaSmi`] — `DXGI`'s `QueryVideoMemoryInfo`
+    /// only answers for the calling process and cannot enumerate other
+    /// PIDs, so it is never the source of a `GpuProcessEntry`.
+    pub source: GpuQuerySource,
+}
+
 /// Combined snapshot of process `RAM` and GPU memory state at a point in time.
 ///
 /// Constructed via [`Snapshot::now`] (one device) or [`Snapshot::all`]

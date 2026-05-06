@@ -51,9 +51,9 @@ pub mod snapshot;
 pub mod report;
 
 pub use error::{HypomnesisError, Result};
-pub use gpu::{device_count, device_info, process_gpu_info};
+pub use gpu::{device_count, device_info, gpu_processes, process_gpu_info};
 pub use ram::process_rss;
-pub use snapshot::{GpuDeviceInfo, GpuQuerySource, ProcessGpuInfo, Snapshot};
+pub use snapshot::{GpuDeviceInfo, GpuProcessEntry, GpuQuerySource, ProcessGpuInfo, Snapshot};
 
 #[cfg(feature = "report")]
 pub use report::MemoryReport;

@@ -16,6 +16,7 @@
 
 - [Install](#install)
 - [Usage](#usage)
+- [Binary (`hmn`)](#binary-hmn)
 - [Capabilities](#capabilities)
 - [Feature Flags](#feature-flags)
 - [Used by](#used-by)
@@ -80,6 +81,46 @@ GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 16.0 GiB used
 This process: 119 MiB (per-process)
 ```
 
+## Binary (`hmn`)
+
+`hypomnesis` ships a small CLI binary, `hmn`, behind the default-off `cli` feature. Install it with:
+
+```sh
+cargo install hypomnesis --features cli
+```
+
+Two subcommands:
+
+```sh
+hmn                    # device summary (free / total per GPU)
+hmn ps                 # all GPU processes — discovery command
+hmn ps --pid 12345     # filter to one PID
+hmn ps --device 0      # filter to one GPU on multi-GPU rigs
+hmn ps --json          # scriptable output
+```
+
+Example default output (RTX 5060 Ti + AMD iGPU on Windows):
+
+```
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16384 MiB
+GPU 1 [AMD Radeon Graphics]: free 32768 MiB / 32768 MiB
+```
+
+`hmn ps`:
+
+```
+PID    NAME              VRAM      DEVICE
+12345  lm-studio.exe     8.2 GiB   NVIDIA GeForce RTX 5060 Ti
+67890  python.exe        1.4 GiB   NVIDIA GeForce RTX 5060 Ti
+```
+
+**Limitations** (intrinsic to the underlying data sources, not bugs):
+
+1. **Compute-only.** `hmn ps` enumerates only processes with an active `CUDA` context. Browsers using GPU compositing, games, and pure-graphics apps do not appear. This is a property of the `NVML` and `nvidia-smi --query-compute-apps` data sources.
+2. **Windows process names may be `?`.** `nvidia-smi` writes a literal `?` for protected processes whose image name it cannot read. The library preserves this as `Some("?")` rather than failing the row.
+3. **WDDM bug parity.** The `R570` `u64::MAX` sentinel and `used > total` corruption checks the library handles for the calling process are applied per-row in `hmn ps`; affected rows are dropped rather than reported as garbage.
+4. **Windows compute-process attribution is `nvidia-smi`-backed.** `IDXGIAdapter3::QueryVideoMemoryInfo` only answers for the *calling* process, and `NVML`'s per-process query returns `NVML_VALUE_NOT_AVAILABLE` under `WDDM`. So `hmn ps` on Windows is honest-but-second-class compared to Linux's clean `NVML` enumeration.
+
 ## Capabilities
 
 | Metric | Windows | Linux |
@@ -105,6 +146,7 @@ The crate handles two known driver bugs out of the box:
 | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail or are disabled |
 | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity, candidate for `candle-mi` v0.2 migration via Cargo flag flip) |
 | `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
+| `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli`. |
 
 ## Used by
 

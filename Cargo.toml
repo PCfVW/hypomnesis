@@ -18,6 +18,9 @@ thiserror = "2"
 # Optional: NVML dynamic load (Linux + Windows-WDDM device-wide)
 libloading = { version = "0.9", optional = true }
 
+# Optional: clap CLI parser for the `hmn` binary (cli feature only)
+clap = { version = "4", optional = true, features = ["derive"] }
+
 # Optional: per-process VRAM on Windows via DXGI (IDXGIAdapter3::QueryVideoMemoryInfo)
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [
@@ -32,10 +35,17 @@ nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
 report = []
 debug-output = []
+# `cli` is default-off so library users don't pull `clap`; install the
+# binary with `cargo install hypomnesis --features cli`.
+cli = ["dep:clap"]
 
 [[example]]
 name = "print_demo"
 required-features = ["report"]
+
+[[bin]]
+name = "hmn"
+required-features = ["cli"]
 
 [lints.rust]
 elided_lifetimes_in_paths = "deny"

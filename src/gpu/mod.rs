@@ -8,7 +8,7 @@
 //! is via the three dispatchers ([`device_count`], [`device_info`],
 //! [`process_gpu_info`]).
 
-use crate::{GpuDeviceInfo, HypomnesisError, ProcessGpuInfo, Result};
+use crate::{GpuDeviceInfo, GpuProcessEntry, HypomnesisError, ProcessGpuInfo, Result};
 
 #[cfg(any(
     feature = "nvml",
@@ -230,6 +230,108 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
             )
         })
         .collect()
+}
+
+/// List every compute process holding GPU memory on the given device.
+///
+/// Returns one [`GpuProcessEntry`] per running process that has an
+/// active `CUDA` context. Empty `Vec` when the device exists but no
+/// compute processes are using it.
+///
+/// # Source priority
+///
+/// 1. `NVML` (Linux primary). `nvmlDeviceGetComputeRunningProcesses_v3`
+///    yields `(pid, used_bytes)`; `/proc/<pid>/comm` supplies names on
+///    Linux. Capped at 64 processes per device — the existing `NVML`
+///    stack-buffer size. Per-row sentinel and `used > total` checks
+///    mirror the library's other `NVML` consumers; offending rows are
+///    dropped rather than reported as garbage.
+/// 2. `nvidia-smi` (Windows primary, Linux fallback) — subprocess
+///    `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits --id=N`.
+///    On Windows under `WDDM`, `NVML`'s per-process call returns
+///    `NVML_VALUE_NOT_AVAILABLE`, so `nvidia-smi` is the only path that
+///    surfaces other-PID names.
+/// 3. `DXGI` is **not** used — `IDXGIAdapter3::QueryVideoMemoryInfo`
+///    only answers for the calling process and cannot enumerate other
+///    PIDs.
+///
+/// # Limitations
+///
+/// **Compute-only.** Both backends only see processes with an active
+/// `CUDA` context. Browsers using GPU compositing, games, and
+/// pure-graphics apps do not appear here.
+///
+/// **Windows process names may be `?`.** `nvidia-smi` writes a literal
+/// `?` for processes whose image name it cannot read (protected
+/// processes); preserved as `Some("?")` in the returned entry.
+///
+/// # Errors
+///
+/// Returns [`HypomnesisError::DeviceIndexOutOfRange`] if `device_index`
+/// is past the device count reported by `NVML` or `DXGI`.
+/// Returns [`HypomnesisError::NoGpuSource`] if every available backend
+/// fails (or no backend is enabled by features).
+#[allow(unused_variables)] // `device_index` unused when no GPU backend feature is enabled
+#[allow(clippy::missing_const_for_fn)] // const only when no features are enabled
+pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
+    #[cfg(feature = "nvml")]
+    if let Some(rows) = nvml::list_compute_processes(device_index) {
+        let entries: Vec<GpuProcessEntry> = rows
+            .into_iter()
+            .map(|(pid, used_bytes)| {
+                #[cfg(target_os = "linux")]
+                let name = read_proc_comm(pid);
+                #[cfg(not(target_os = "linux"))]
+                let name = None;
+                GpuProcessEntry {
+                    pid,
+                    name,
+                    used_bytes,
+                    source: GpuQuerySource::Nvml,
+                }
+            })
+            .collect();
+        return Ok(entries);
+    }
+
+    #[cfg(feature = "nvidia-smi-fallback")]
+    if let Some(rows) = nvidia_smi::query_compute_apps(device_index) {
+        let entries: Vec<GpuProcessEntry> = rows
+            .into_iter()
+            .map(|app| GpuProcessEntry {
+                pid: app.pid,
+                name: app.name,
+                used_bytes: app.used_bytes,
+                source: GpuQuerySource::NvidiaSmi,
+            })
+            .collect();
+        return Ok(entries);
+    }
+
+    bounds_check(device_index)?;
+    Err(HypomnesisError::NoGpuSource)
+}
+
+/// Read `/proc/<pid>/comm` (Linux only), returning the trimmed
+/// executable name if available.
+///
+/// `/proc/<pid>/comm` is a one-line file containing the process's
+/// `comm` (executable name, truncated to 15 characters by the kernel),
+/// terminated by a newline. World-readable on standard kernels;
+/// returns `None` on any read or trim failure (process exited, perms
+/// stripped, etc.) since name resolution is best-effort.
+#[cfg(all(target_os = "linux", feature = "nvml"))]
+fn read_proc_comm(pid: u32) -> Option<String> {
+    let path = format!("/proc/{pid}/comm");
+    let content = std::fs::read_to_string(&path).ok()?;
+    // BORROW: trim_end_matches + to_owned — kernel writes a trailing
+    // newline; we want an owned String without it.
+    let trimmed = content.trim_end_matches('\n').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 /// Bounds-check `index` against whatever count source is available.

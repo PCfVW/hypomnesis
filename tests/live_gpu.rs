@@ -16,7 +16,7 @@
 //! - Ubuntu (native or WSL2 with the CUDA-on-WSL driver) — exercises
 //!   the `NVML` per-process path.
 
-use hypomnesis::{Snapshot, device_count, device_info, process_gpu_info};
+use hypomnesis::{Snapshot, device_count, device_info, gpu_processes, process_gpu_info};
 
 #[test]
 #[ignore = "requires NVIDIA GPU + driver"]
@@ -168,5 +168,38 @@ fn snapshot_all_enumerates_nvidia_and_optional_extras() {
             assert_eq!(p.source, hypomnesis::GpuQuerySource::Dxgi);
             assert!(p.is_per_process);
         }
+    }
+}
+
+/// `gpu_processes` should succeed on a machine with an NVIDIA driver.
+///
+/// On a vanilla test binary with no CUDA context, the returned `Vec`
+/// is typically empty (compute-only enumeration). The test is
+/// length-tolerant — it asserts `Ok(...)` and validates whatever rows
+/// exist, without requiring any to be present.
+#[test]
+#[ignore = "requires NVIDIA GPU + driver"]
+#[allow(clippy::expect_used)]
+fn gpu_processes_succeeds_on_live_host() {
+    let rows = gpu_processes(0).expect("gpu_processes(0) failed on NVIDIA-equipped host");
+
+    for row in &rows {
+        assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
+        // Source on a live host is `Nvml` (Linux) or `NvidiaSmi`
+        // (Windows under WDDM). DXGI is never the source for an
+        // enumeration — it only answers for the calling process.
+        assert!(
+            matches!(
+                row.source,
+                hypomnesis::GpuQuerySource::Nvml | hypomnesis::GpuQuerySource::NvidiaSmi
+            ),
+            "unexpected source {:?} for gpu_processes row",
+            row.source
+        );
+        assert!(
+            row.used_bytes > 0,
+            "compute process pid {} should have positive used_bytes",
+            row.pid
+        );
     }
 }

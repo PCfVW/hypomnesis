@@ -355,6 +355,164 @@ fn read_process_used(
     }
 }
 
+/// Enumerate every compute process on the given device, returning
+/// `(pid, used_bytes)` for each row that survives the sentinel and
+/// sanity checks.
+///
+/// Used by `crate::gpu_processes` on Linux, where `NVML`'s
+/// `nvmlDeviceGetComputeRunningProcesses_v3` is the authoritative
+/// source. On Windows the same call returns `NVML_VALUE_NOT_AVAILABLE`
+/// under `WDDM` and the dispatcher falls back to `nvidia-smi`.
+///
+/// Returns `None` when `NVML` cannot be loaded, `nvmlInit_v2` /
+/// `nvmlDeviceGetHandleByIndex_v2` / `nvmlDeviceGetMemoryInfo` fail, or
+/// `nvmlDeviceGetComputeRunningProcesses_v3` returns an error other than
+/// `NVML_ERROR_INSUFFICIENT_SIZE` (which we treat as a soft success and
+/// keep the first 64 entries — see [`NVML_MAX_PROCESSES`]).
+///
+/// Per-row filtering matches [`read_process_used`]:
+/// - `used_gpu_memory == u64::MAX` (R570 sentinel) → row dropped.
+/// - `used_gpu_memory > device_total` → row dropped (impossible under
+///   normal conditions; assumed garbage).
+///
+/// Caps at 64 processes per device — the existing `NVML_MAX_PROCESSES`
+/// stack-buffer size. Documented limit; sufficient for any realistic
+/// machine.
+#[allow(unsafe_code)]
+#[must_use]
+pub(super) fn list_compute_processes(idx: u32) -> Option<Vec<(u32, u64)>> {
+    // SAFETY: same justification as in `query`.
+    let lib = unsafe { libloading::Library::new(NVML_LIB_PATH) }.ok()?;
+
+    // SAFETY: same — symbol names match the documented NVML C API.
+    let init: libloading::Symbol<'_, NvmlInitFn> = unsafe { lib.get(b"nvmlInit_v2\0") }.ok()?;
+    let shutdown: libloading::Symbol<'_, NvmlShutdownFn> =
+        unsafe { lib.get(b"nvmlShutdown\0") }.ok()?;
+    let get_handle: libloading::Symbol<'_, NvmlDeviceGetHandleByIndexFn> =
+        unsafe { lib.get(b"nvmlDeviceGetHandleByIndex_v2\0") }.ok()?;
+    let get_memory: libloading::Symbol<'_, NvmlDeviceGetMemoryInfoFn> =
+        unsafe { lib.get(b"nvmlDeviceGetMemoryInfo\0") }.ok()?;
+    let get_processes: libloading::Symbol<'_, NvmlDeviceGetComputeRunningProcessesFn> =
+        unsafe { lib.get(b"nvmlDeviceGetComputeRunningProcesses_v3\0") }.ok()?;
+
+    // SAFETY: nvmlInit_v2 is reentrant + thread-safe.
+    let ret = unsafe { init() };
+    if ret != NVML_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!("[NVML debug] nvmlInit_v2 returned {ret} in list_compute_processes");
+        return None;
+    }
+
+    // From here, every return path MUST call shutdown to balance the init.
+
+    // SAFETY: nvmlDeviceGetHandleByIndex_v2 writes a valid opaque handle
+    // into `device` when it returns NVML_SUCCESS.
+    let mut device: NvmlDevice = std::ptr::null_mut();
+    let ret = unsafe { get_handle(idx, &raw mut device) };
+    if ret != NVML_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!(
+            "[NVML debug] nvmlDeviceGetHandleByIndex_v2(idx={idx}) returned {ret} \
+             in list_compute_processes"
+        );
+        // SAFETY: nvmlShutdown is always safe to call after a successful nvmlInit.
+        unsafe { shutdown() };
+        return None;
+    }
+
+    // SAFETY: nvmlDeviceGetMemoryInfo writes into the caller-provided
+    // NvmlMemoryInfo struct. Used to bound the per-row sanity check.
+    let mut mem_info = NvmlMemoryInfo {
+        total: 0,
+        free: 0,
+        used: 0,
+    };
+    let ret = unsafe { get_memory(device, &raw mut mem_info) };
+    if ret != NVML_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!("[NVML debug] nvmlDeviceGetMemoryInfo returned {ret} in list_compute_processes");
+        // SAFETY: nvmlShutdown after init.
+        unsafe { shutdown() };
+        return None;
+    }
+    let device_total = mem_info.total;
+
+    // CAST: usize → u32, NVML_MAX_PROCESSES = 64 fits in u32
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let mut count = NVML_MAX_PROCESSES as u32;
+    let mut infos = [NvmlProcessInfo {
+        pid: 0,
+        used_gpu_memory: 0,
+        gpu_instance_id: 0,
+        compute_instance_id: 0,
+    }; NVML_MAX_PROCESSES];
+
+    // SAFETY: nvmlDeviceGetComputeRunningProcesses_v3 fills `infos` with
+    // up to `count` entries and updates `count` to the actual number
+    // written. On NVML_ERROR_INSUFFICIENT_SIZE we still have the first
+    // 64 entries and treat that as a soft success.
+    let ret = unsafe { get_processes(device, &raw mut count, infos.as_mut_ptr()) };
+
+    // SAFETY: nvmlShutdown balances the matched nvmlInit_v2.
+    unsafe { shutdown() };
+
+    if ret != NVML_SUCCESS && ret != NVML_ERROR_INSUFFICIENT_SIZE {
+        #[cfg(feature = "debug-output")]
+        eprintln!(
+            "[NVML debug] nvmlDeviceGetComputeRunningProcesses_v3 returned {ret} \
+             in list_compute_processes (likely WDDM NVML_VALUE_NOT_AVAILABLE)"
+        );
+        return None;
+    }
+
+    // CAST: u32 → usize, NVML count is bounded by buffer size; usize >= 32 bits everywhere
+    #[allow(clippy::as_conversions)]
+    let actual_count = (count as usize).min(NVML_MAX_PROCESSES);
+
+    // BORROW: explicit slice + filter_map — bypasses the R570 u64::MAX
+    // sentinel and the used > device_total sanity check on a per-row
+    // basis, matching `read_process_used`'s policy.
+    let rows: Vec<(u32, u64)> = infos
+        .get(..actual_count)
+        .map(|s| {
+            s.iter()
+                .filter_map(|info| {
+                    if info.used_gpu_memory == u64::MAX {
+                        #[cfg(feature = "debug-output")]
+                        eprintln!(
+                            "[NVML debug] list_compute_processes: pid {} used_gpu_memory == u64::MAX \
+                             (R570 sentinel); dropping row",
+                            info.pid
+                        );
+                        None
+                    } else if info.used_gpu_memory > device_total {
+                        #[cfg(feature = "debug-output")]
+                        eprintln!(
+                            "[NVML debug] list_compute_processes: pid {} used_gpu_memory ({}) > \
+                             device total ({device_total}); dropping row",
+                            info.pid, info.used_gpu_memory
+                        );
+                        None
+                    } else {
+                        Some((info.pid, info.used_gpu_memory))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    #[cfg(feature = "debug-output")]
+    eprintln!(
+        "[NVML debug] list_compute_processes(idx={idx}): {} row(s) after filtering \
+         ({} reported by NVML, {} buffer cap)",
+        rows.len(),
+        count,
+        NVML_MAX_PROCESSES
+    );
+
+    Some(rows)
+}
+
 /// Number of NVIDIA GPUs visible to `NVML`.
 ///
 /// Returns `None` if `NVML` can't be loaded or `nvmlDeviceGetCount_v2`

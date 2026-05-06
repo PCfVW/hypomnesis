@@ -10,12 +10,15 @@
 //! Live-GPU tests requiring NVIDIA hardware live in `tests/live_gpu.rs`
 //! and are `#[ignore]`-gated.
 
-use hypomnesis::{GpuDeviceInfo, GpuQuerySource, HypomnesisError, ProcessGpuInfo, Snapshot};
+use hypomnesis::{
+    GpuDeviceInfo, GpuProcessEntry, GpuQuerySource, HypomnesisError, ProcessGpuInfo, Snapshot,
+};
 
 #[test]
 fn public_types_are_reachable_via_crate_root() {
     let _: Option<GpuDeviceInfo> = None;
     let _: Option<ProcessGpuInfo> = None;
+    let _: Option<GpuProcessEntry> = None;
     let _: Option<Snapshot> = None;
     let _: GpuQuerySource = GpuQuerySource::Dxgi;
     let _: GpuQuerySource = GpuQuerySource::Nvml;
@@ -67,5 +70,40 @@ fn snapshot_all_returns_ok_and_carries_ram() {
             "every Snapshot::all entry should carry positive RAM, got {}",
             snap.ram_bytes
         );
+    }
+}
+
+#[test]
+fn gpu_processes_returns_result_or_no_gpu_source() {
+    // On a runner without NVIDIA / nvidia-smi, gpu_processes(0) typically
+    // returns Err(NoGpuSource) (or DeviceIndexOutOfRange when bounds_check
+    // catches a count source). Either is acceptable. On a host with
+    // NVIDIA, returns Ok(Vec) — possibly empty if no CUDA processes are
+    // active. We assert on shape only so the test passes on hosted
+    // runners and on hardware alike.
+    match hypomnesis::gpu_processes(0) {
+        Ok(rows) => {
+            for row in &rows {
+                // PIDs of 0 would be impossible on Linux/Windows; sanity-check.
+                assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
+                // Source must be one of the two enumerable backends —
+                // DXGI cannot enumerate other PIDs.
+                assert!(
+                    matches!(row.source, GpuQuerySource::Nvml | GpuQuerySource::NvidiaSmi),
+                    "unexpected source {:?} on a gpu_processes row",
+                    row.source
+                );
+            }
+        }
+        Err(e) => {
+            // Expected on hosted runners with no NVIDIA hardware.
+            assert!(
+                matches!(
+                    e,
+                    HypomnesisError::NoGpuSource | HypomnesisError::DeviceIndexOutOfRange { .. }
+                ),
+                "unexpected error from gpu_processes(0): {e:?}"
+            );
+        }
     }
 }

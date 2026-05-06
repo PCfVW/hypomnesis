@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`hmn ps` now writes a one-line summary to stderr after each run** (`src/bin/hmn.rs`) — `hmn: <N> compute process[es] found[ matching <filters>].`. Always printed (zero or non-zero count), including in `--json` mode, so interactive users get an unambiguous "command worked, here's the count" line without breaking stdout's scriptability — pipelines like `hmn ps | awk 'NR>1 {…}'` or `hmn ps --json | jq` continue to see only the table or JSON array on stdout. Filter clause is appended only when `--pid` and/or `--device` is active. Pluralisation handles 0 / 1 / N correctly. 6 inline tests for `format_ps_summary` cover the cross-product. Redirect `2>/dev/null` to suppress.
 - **`GpuQuerySource::NvidiaSmi` rustdoc clarified** (`src/snapshot.rs`) — the variant doc previously said "(device-wide)", which was accurate for `ProcessGpuInfo` but misleading after Wave C added `GpuProcessEntry`, where each `NvidiaSmi`-sourced row is per-process (one row per `CUDA` process from `nvidia-smi --query-compute-apps`). The doc now spells out both contexts.
 - **`src/lib.rs` Capabilities + Feature-flags tables updated** — added a new "Compute-process listing (other PIDs)" row (`nvidia-smi --query-compute-apps` on Windows, `NVML` + `/proc/<pid>/comm` on Linux) and a row for the `cli` feature.
 - **`src/gpu/mod.rs` module doc** — "the three dispatchers" updated to "the four dispatchers" with `gpu_processes` listed alongside `device_count`, `device_info`, `process_gpu_info`.

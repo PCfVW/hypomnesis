@@ -200,7 +200,43 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
     } else {
         print!("{}", format_ps_table(&rows));
     }
+    // Human-readable summary on stderr — preserves stdout's scriptability
+    // (header-only table or `[]` for empty) while giving interactive
+    // users an unambiguous "command worked, here's the count" line.
+    // Always printed, even when rows is non-empty, so the message is a
+    // consistent confirmation rather than an error indicator. Redirect
+    // 2>/dev/null to suppress.
+    eprintln!(
+        "hmn: {}",
+        format_ps_summary(rows.len(), pid_filter, device_filter)
+    );
     Ok(())
+}
+
+/// Build the stderr summary string for `hmn ps`. Format:
+/// `<N> compute process[es] found[ matching <filters>].`. Filter clause
+/// is appended only when at least one filter is active so the
+/// no-filter case stays terse.
+fn format_ps_summary(count: usize, pid_filter: Option<u32>, device_filter: Option<u32>) -> String {
+    let noun = if count == 1 {
+        "compute process"
+    } else {
+        "compute processes"
+    };
+
+    let mut out = format!("{count} {noun} found");
+
+    let filter_clause = match (pid_filter, device_filter) {
+        (Some(p), Some(d)) => Some(format!("pid={p} device={d}")),
+        (Some(p), None) => Some(format!("pid={p}")),
+        (None, Some(d)) => Some(format!("device={d}")),
+        (None, None) => None,
+    };
+    if let Some(clause) = filter_clause {
+        let _ = write!(out, " matching {clause}");
+    }
+    out.push('.');
+    out
 }
 
 /// Format `ps` rows as a fixed-column text table. Always prints the
@@ -546,5 +582,53 @@ mod tests {
     #[test]
     fn format_summary_empty_input() {
         assert_eq!(format_summary(&[]), "");
+    }
+
+    // --- format_ps_summary (stderr count line) ---
+
+    #[test]
+    fn format_ps_summary_zero_no_filters() {
+        assert_eq!(
+            format_ps_summary(0, None, None),
+            "0 compute processes found."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_one_no_filters() {
+        // "1 compute process found." — singular noun, no filter clause.
+        assert_eq!(format_ps_summary(1, None, None), "1 compute process found.");
+    }
+
+    #[test]
+    fn format_ps_summary_many_no_filters() {
+        assert_eq!(
+            format_ps_summary(7, None, None),
+            "7 compute processes found."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_with_pid_filter() {
+        assert_eq!(
+            format_ps_summary(0, Some(12345), None),
+            "0 compute processes found matching pid=12345."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_with_device_filter() {
+        assert_eq!(
+            format_ps_summary(2, None, Some(0)),
+            "2 compute processes found matching device=0."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_with_both_filters() {
+        assert_eq!(
+            format_ps_summary(1, Some(99), Some(1)),
+            "1 compute process found matching pid=99 device=1."
+        );
     }
 }

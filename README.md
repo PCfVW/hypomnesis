@@ -120,6 +120,15 @@ PID    NAME              VRAM      DEVICE
 67890  python.exe        1.4 GiB   NVIDIA GeForce RTX 5060 Ti
 ```
 
+A one-line summary is written to **stderr** after each `hmn ps` run:
+
+```
+hmn: 2 compute processes found.
+hmn: 0 compute processes found matching pid=99 device=0.   # with filters
+```
+
+The stderr summary is always printed, even when the table is empty, so interactive users get an unambiguous "command worked, here's the count" line without breaking stdout's scriptability. Pipelines like `hmn ps | awk 'NR>1 {print $1}'` or `hmn ps --json | jq` work as expected. Redirect `2>/dev/null` to suppress the summary.
+
 **Limitations** (intrinsic to the underlying data sources, not bugs):
 
 1. **Compute-only.** `hmn ps` enumerates only processes with an active `CUDA` context. Browsers using GPU compositing, games, and pure-graphics apps do not appear. This is a property of the `NVML` and `nvidia-smi --query-compute-apps` data sources.

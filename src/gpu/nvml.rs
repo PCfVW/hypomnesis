@@ -3,12 +3,14 @@
 //! `NVML` backend (cross-platform).
 //!
 //! Dynamically loads `libnvidia-ml.so.1` (Linux) or `nvml.dll` (Windows)
-//! via `libloading` and exposes two crate-internal entry points used by
-//! the dispatchers in `src/gpu/mod.rs`:
+//! via `libloading` and exposes three crate-internal entry points used
+//! by the dispatchers in `src/gpu/mod.rs`:
 //!
 //! - [`query`] — combined per-process + device-wide query for one device
 //!   index in a single `NVML` init/shutdown cycle.
 //! - [`device_count`] — number of NVIDIA GPUs visible to `NVML`.
+//! - [`list_compute_processes`] — every compute process on a given
+//!   device (used by `crate::gpu_processes`).
 //!
 //! Each entry point performs its own `nvmlInit_v2` / `nvmlShutdown` pair.
 //! Per the v0.1 design, this trades a few milliseconds of init overhead
@@ -26,11 +28,13 @@
 //! # `R570` driver bug
 //!
 //! Some `R570`-series drivers (observed on `RTX 5060 Ti`) return
-//! `u64::MAX` for every running process's GPU memory. [`query`] detects
-//! this sentinel and reports `process_used_bytes = None` so the
+//! `u64::MAX` for every running process's GPU memory. Both [`query`]
+//! (which records the calling process's row) and
+//! [`list_compute_processes`] (which records every CUDA process on the
+//! device) detect this sentinel and drop the affected row(s) so the
 //! dispatcher can fall back to `nvidia-smi`. A second sanity check
 //! catches the case where per-process > device-wide total (impossible
-//! under normal conditions; assumed garbage and reported as `None`).
+//! under normal conditions; assumed garbage and dropped).
 
 /// Path to the `NVML` shared library on Linux (stable across driver versions).
 #[cfg(target_os = "linux")]

@@ -5,8 +5,8 @@
 //! Each backend (`nvml`, `dxgi`, `nvidia_smi`) is gated by a Cargo
 //! feature; the dispatchers below try them in priority order and surface
 //! the first success. Backend modules are crate-private — public access
-//! is via the three dispatchers ([`device_count`], [`device_info`],
-//! [`process_gpu_info`]).
+//! is via the four dispatchers ([`device_count`], [`device_info`],
+//! [`process_gpu_info`], [`gpu_processes`]).
 
 use crate::{GpuDeviceInfo, GpuProcessEntry, HypomnesisError, ProcessGpuInfo, Result};
 

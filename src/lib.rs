@@ -15,6 +15,7 @@
 //! | Process `RSS` | `K32GetProcessMemoryInfo` | `/proc/self/status` |
 //! | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) |
 //! | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) |
+//! | Compute-process listing (other PIDs) | `nvidia-smi --query-compute-apps` | `NVML` + `/proc/<pid>/comm` |
 //! | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess |
 //!
 //! ## Quick start
@@ -38,6 +39,7 @@
 //! | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail |
 //! | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity) |
 //! | `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
+//! | `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli` |
 
 #![deny(unsafe_code)]
 #![allow(unknown_lints)]

@@ -65,7 +65,11 @@ pub enum GpuQuerySource {
     Dxgi,
     /// `NVML` per-process query (`nvmlDeviceGetComputeRunningProcesses`).
     Nvml,
-    /// `nvidia-smi` subprocess fallback (device-wide).
+    /// `nvidia-smi` subprocess. In [`ProcessGpuInfo`] this is the
+    /// device-wide fallback (the subprocess cannot break the figure
+    /// down per-process for the *calling* process). In
+    /// [`GpuProcessEntry`] each row is per-process — one entry per
+    /// `CUDA` process from `nvidia-smi --query-compute-apps`.
     NvidiaSmi,
 }
 

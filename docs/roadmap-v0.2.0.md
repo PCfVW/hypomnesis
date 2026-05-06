@@ -17,7 +17,7 @@ Anything that turns out to be controversial in pre-release review can be peeled 
 
 ## Scope
 
-Three waves, ordered for testability — each wave's output is verifiable on the maintainer's actual hardware (Windows + RTX 5060 Ti + AMD iGPU; Ubuntu WSL2 + RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver).
+Three waves, ordered for testability. Single-adapter NVIDIA paths are verifiable on the maintainer's actual hardware (Windows + Ryzen 9 5950X + RTX 5060 Ti; Ubuntu WSL2 + RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver). The Ryzen 9 5950X has no integrated GPU, so the **multi-adapter** path on Windows (NVIDIA dGPU plus a non-NVIDIA `DXGI` adapter such as an Intel / AMD iGPU) cannot be verified end-to-end on this hardware — the code is exercised by length-tolerant live tests and code review only, and waits on either an iGPU-equipped machine or an external contributor's PR for a hands-on confirmation.
 
 ### Wave A — `GpuDeviceInfo::print_free` (shipped)
 
@@ -155,11 +155,15 @@ These are properties of the underlying data sources and must be documented in `-
 
 ## Verification plan (Wave 2 of v0.2.0)
 
-The same hardware that validated v0.1.0 covers v0.2.0:
+The same hardware that validated v0.1.0 covers most of v0.2.0:
 
-- **Windows host (RTX 5060 Ti + AMD iGPU)** — verifies Wave B's multi-adapter enumeration with two real adapters of different vendors. Verifies Wave A's `free_bytes` matches `nvidia-smi --query-gpu=memory.free` to within the WDDM-commit-vs-nvidia-smi rounding gap. Verifies `hmn ps` against `nvidia-smi --query-compute-apps`.
-- **Ubuntu WSL2 (RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver)** — verifies the Linux NVML-only path of `Snapshot::all()` (single device, no AMD iGPU surfaced — that's expected). Verifies `hmn ps` enumerates a Python+CUDA process correctly.
+- **Windows host (Ryzen 9 5950X + RTX 5060 Ti, single GPU)** — verifies Wave A's `free_bytes` matches `nvidia-smi --query-gpu=memory.free` to within the WDDM-commit-vs-nvidia-smi rounding gap. Verifies the NVIDIA branch of Wave B's `Snapshot::all` enumeration. Verifies `hmn ps` against `nvidia-smi --query-compute-apps`.
+- **Ubuntu WSL2 (RTX 5060 Ti via NVIDIA's CUDA-on-WSL driver)** — verifies the Linux `NVML` path of `Snapshot::all()` (single device, no iGPU — that's expected). Verifies `hmn ps` enumerates a Python+CUDA process correctly.
 - **R570 sentinel path** — manual verification that the `u64::MAX` fallback still triggers and `hmn ps` rows fall back to `nvidia-smi` cleanly. Cannot be automated in CI without hardware.
+
+**Not yet verifiable on the maintainer's hardware:**
+
+- **Wave B multi-adapter end-to-end** — the 5950X has no iGPU and no second discrete GPU is installed. Wave B's `enumerate_non_nvidia` code path runs on every `Snapshot::all` call (the debug-output trace confirms it walks `EnumAdapters1`), but no qualifying non-NVIDIA adapter exists to surface. The live test [`snapshot_all_enumerates_nvidia_and_optional_extras`](../tests/live_gpu.rs) is length-tolerant by design and passes here; the multi-adapter assertions inside it have not yet been triggered on real hardware. This is acceptable for a v0.2 minor release because the code is reviewed and unit-tested, but a v0.3+ ought to either pick up an iGPU-equipped test machine or wait for a contributor PR before doubling down on this path.
 
 CI matrix and publish flow remain unchanged from v0.1.0 — see `reference_publish_flow.md` in this Claude Code project's memory.
 

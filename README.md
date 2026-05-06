@@ -99,14 +99,20 @@ hmn ps --device 0      # filter to one GPU on multi-GPU rigs
 hmn ps --json          # scriptable output
 ```
 
-Example default output (RTX 5060 Ti + AMD iGPU on Windows):
+Example default output (single NVIDIA dGPU, the maintainer's reference machine — Ryzen 9 5950X has no iGPU, so only one adapter surfaces):
 
 ```
 GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16384 MiB
-GPU 1 [AMD Radeon Graphics]: free 32768 MiB / 32768 MiB
 ```
 
-`hmn ps`:
+Illustrative output on a *heterogeneous* machine (NVIDIA dGPU + Intel/AMD iGPU on Windows). Not yet verified end-to-end on real hardware — see [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) "Verification plan":
+
+```
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16384 MiB
+GPU 1 [Intel Iris Xe Graphics]: free 32768 MiB / 32768 MiB
+```
+
+`hmn ps` (illustrative — empty on machines with no active CUDA workload):
 
 ```
 PID    NAME              VRAM      DEVICE

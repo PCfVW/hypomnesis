@@ -153,9 +153,13 @@ fn snapshot_all_enumerates_nvidia_and_optional_extras() {
         );
     }
 
-    // On Windows with an iGPU present (the maintainer's reference
-    // machine: RTX 5060 Ti dGPU + AMD iGPU), the second entry should be
-    // the non-NVIDIA DXGI extra. Adapter name is best-effort.
+    // On Windows hosts that expose a non-NVIDIA `DXGI` adapter with
+    // non-zero memory (e.g. an Intel / AMD iGPU alongside the NVIDIA
+    // dGPU), the second entry should be the non-NVIDIA DXGI extra. The
+    // maintainer's reference machine (Ryzen 9 5950X + RTX 5060 Ti) has
+    // no iGPU on the CPU, so this branch isn't exercised here — it
+    // waits on iGPU-equipped hardware or a contributor's PR for live
+    // verification. Adapter name is best-effort.
     #[cfg(windows)]
     if let Some(extra) = snaps.get(1) {
         let dev = extra

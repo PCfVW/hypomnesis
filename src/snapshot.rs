@@ -372,7 +372,12 @@ impl GpuDeviceInfo {
     /// Format a one-line used-`VRAM` summary as an owned `String` ending in a newline.
     ///
     /// Format: `  GPU <idx>: used <U> MB[ [<adapter name>]]\n`.
-    /// Style and unit conventions identical to [`Self::format_total`].
+    /// Mirrors [`Self::format_free`]'s style exactly — two-space indent,
+    /// `MB` displayed for `MiB` (`bytes / 1_048_576`), trailing newline,
+    /// optional ` [<name>]` suffix omitted when [`Self::name`] is `None`.
+    ///
+    /// Suitable for log frameworks (`tracing::info!("{}", dev.format_used())`),
+    /// file output, or test assertions.
     #[must_use]
     pub fn format_used(&self) -> String {
         // CAST: u64 → f64, byte count for MiB conversion (fits in f64

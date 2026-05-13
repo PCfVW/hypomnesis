@@ -279,6 +279,20 @@ impl Snapshot {
     }
 }
 
+impl GpuDeviceInfo {
+    /// Adapter name, or `"unknown GPU"` when [`Self::name`] is `None`.
+    ///
+    /// Convenience wrapper for `self.name.as_deref().unwrap_or("unknown GPU")`,
+    /// added so downstream consumers don't diverge on the fallback phrase.
+    /// The returned string is **not** localized — consumers needing a
+    /// different phrase or non-English output should match on [`Self::name`]
+    /// directly.
+    #[must_use]
+    pub fn name_or_unknown(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown GPU")
+    }
+}
+
 /// Free-`VRAM` formatting helpers for [`GpuDeviceInfo`], available with `features = ["report"]`.
 ///
 /// Mirrors the [`Snapshot::ram_mb`] / [`Snapshot::vram_mb`] convention:
@@ -605,6 +619,34 @@ mod tests {
             used_bytes: 500,
         };
         dev.print_free();
+    }
+
+    // -----------------------------------------------------------------------
+    // GpuDeviceInfo::name_or_unknown tests (Wave B of v0.2.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn name_or_unknown_returns_inner_when_some() {
+        let dev = GpuDeviceInfo {
+            index: 0,
+            name: Some("NVIDIA Test GPU".to_owned()),
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+        };
+        assert_eq!(dev.name_or_unknown(), "NVIDIA Test GPU");
+    }
+
+    #[test]
+    fn name_or_unknown_returns_fallback_when_none() {
+        let dev = GpuDeviceInfo {
+            index: 0,
+            name: None,
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+        };
+        assert_eq!(dev.name_or_unknown(), "unknown GPU");
     }
 
     // -----------------------------------------------------------------------

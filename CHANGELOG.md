@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`test-helpers` Cargo feature + `GpuDeviceInfoBuilder`** (`src/snapshot.rs`) — Wave A of the v0.2.1 roadmap. Default-off, additive feature exposing a chained builder (`GpuDeviceInfo::builder().index(...).name(...).total_bytes(...).free_bytes(...).used_bytes(...).build()`) so downstream test fixtures can synthesise `GpuDeviceInfo` values that `#[non_exhaustive]` would otherwise forbid via struct-literal syntax. Unblocks the render-path / arithmetic unit tests in `hf-fetch-model`'s `gpu_check.rs` and the equivalent in `candle-mi` when it adopts. The chosen design — feature-gated builder rather than positional `synthetic(...)` constructor — preserves the future-proofing `#[non_exhaustive]` provides: new fields on `GpuDeviceInfo` will be exposed as new defaulted setters here without breaking existing test code. 6 inline tests cover defaults, individual setters, and a full round-trip. Production code must never enable the feature; the doc-comment makes the semver caveat explicit. See [`docs/roadmap-v0.2.1.md`](docs/roadmap-v0.2.1.md) Wave A and [`docs/hypomnesis-adoption.md`](docs/hypomnesis-adoption.md) finding #1 for rationale.
+
 ## [0.2.0] - 2026-05-06
 
 > *Wider, not taller. Same job — more callers can ask, more devices can answer.*

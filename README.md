@@ -162,6 +162,7 @@ The crate handles two known driver bugs out of the box:
 | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity, candidate for `candle-mi` v0.2 migration via Cargo flag flip) |
 | `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
 | `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli`. |
+| `test-helpers` | no | Expose `GpuDeviceInfoBuilder` for downstream tests that need synthetic `GpuDeviceInfo` fixtures. Default-off, additive — production code must never enable it. |
 
 ## Used by
 

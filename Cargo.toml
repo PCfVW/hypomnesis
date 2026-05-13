@@ -38,6 +38,10 @@ debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the
 # binary with `cargo install hypomnesis --features cli`.
 cli = ["dep:clap"]
+# `test-helpers` exposes a `GpuDeviceInfoBuilder` for downstream tests
+# that need synthetic fixtures of the `#[non_exhaustive]` `GpuDeviceInfo`
+# type. Default-off, additive — production code must never enable it.
+test-helpers = []
 
 [[example]]
 name = "print_demo"

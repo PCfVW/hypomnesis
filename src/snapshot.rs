@@ -328,6 +328,131 @@ impl GpuDeviceInfo {
     }
 }
 
+/// Builder for synthetic [`GpuDeviceInfo`] values in downstream tests.
+///
+/// Available only with `features = ["test-helpers"]`. Not intended for
+/// production code — the canonical way to obtain a `GpuDeviceInfo` is
+/// via [`crate::device_info`], [`Snapshot::now`], or [`Snapshot::all`],
+/// each of which goes through a real GPU backend.
+///
+/// `#[non_exhaustive]` on `GpuDeviceInfo` forbids struct-literal
+/// construction from external crates, which would otherwise block
+/// downstream unit tests that need synthetic fixtures (e.g., to test
+/// render paths or arithmetic over the type's fields). The builder
+/// closes that gap without weakening the future-proofing the
+/// `#[non_exhaustive]` annotation provides — new fields on
+/// `GpuDeviceInfo` will be exposed as new defaulted setters here.
+///
+/// Each setter consumes `self` and returns `Self`, enabling a chained
+/// construction (`GpuDeviceInfo::builder().index(1).total_bytes(N).build()`).
+/// Unset fields take the documented defaults: `index = 0`, `name = None`,
+/// `total_bytes = 0`, `free_bytes = 0`, `used_bytes = 0`.
+///
+/// # Semver
+///
+/// The `test-helpers` feature is **not** semver-stable in the same sense
+/// as the production API. New setters are expected to land alongside any
+/// new field added to `GpuDeviceInfo`, and downstream tests using the
+/// builder are expected to absorb those additions. Production code must
+/// never enable the feature.
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "test-helpers")]
+/// # {
+/// use hypomnesis::GpuDeviceInfo;
+///
+/// let dev = GpuDeviceInfo::builder()
+///     .index(0)
+///     .name(Some("Synthetic GPU".to_owned()))
+///     .total_bytes(16 * 1_024 * 1_024 * 1_024)
+///     .free_bytes(14 * 1_024 * 1_024 * 1_024)
+///     .used_bytes(2 * 1_024 * 1_024 * 1_024)
+///     .build();
+/// assert_eq!(dev.total_bytes, 16 * 1_024 * 1_024 * 1_024);
+/// # }
+/// ```
+#[cfg(feature = "test-helpers")]
+#[derive(Debug, Clone, Default)]
+pub struct GpuDeviceInfoBuilder {
+    /// Pending [`GpuDeviceInfo::index`] value, defaults to `0`.
+    index: u32,
+    /// Pending [`GpuDeviceInfo::name`] value, defaults to `None`.
+    name: Option<String>,
+    /// Pending [`GpuDeviceInfo::total_bytes`] value, defaults to `0`.
+    total_bytes: u64,
+    /// Pending [`GpuDeviceInfo::free_bytes`] value, defaults to `0`.
+    free_bytes: u64,
+    /// Pending [`GpuDeviceInfo::used_bytes`] value, defaults to `0`.
+    used_bytes: u64,
+}
+
+#[cfg(feature = "test-helpers")]
+impl GpuDeviceInfo {
+    /// Start a builder for constructing synthetic `GpuDeviceInfo` values
+    /// in downstream tests.
+    ///
+    /// Available only with `features = ["test-helpers"]`. See
+    /// [`GpuDeviceInfoBuilder`] for the full discussion.
+    #[must_use]
+    pub fn builder() -> GpuDeviceInfoBuilder {
+        GpuDeviceInfoBuilder::default()
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl GpuDeviceInfoBuilder {
+    /// Set the zero-based GPU index.
+    #[must_use]
+    pub const fn index(mut self, index: u32) -> Self {
+        self.index = index;
+        self
+    }
+
+    /// Set the adapter name (`None` to leave unset).
+    #[must_use]
+    pub fn name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Set the total GPU memory in bytes.
+    #[must_use]
+    pub const fn total_bytes(mut self, total: u64) -> Self {
+        self.total_bytes = total;
+        self
+    }
+
+    /// Set the free GPU memory in bytes (device-wide).
+    #[must_use]
+    pub const fn free_bytes(mut self, free: u64) -> Self {
+        self.free_bytes = free;
+        self
+    }
+
+    /// Set the used GPU memory in bytes (device-wide).
+    #[must_use]
+    pub const fn used_bytes(mut self, used: u64) -> Self {
+        self.used_bytes = used;
+        self
+    }
+
+    /// Consume the builder and produce the configured `GpuDeviceInfo`.
+    ///
+    /// Unset fields take the documented defaults.
+    #[must_use]
+    pub fn build(self) -> GpuDeviceInfo {
+        GpuDeviceInfo {
+            index: self.index,
+            name: self.name,
+            total_bytes: self.total_bytes,
+            free_bytes: self.free_bytes,
+            used_bytes: self.used_bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -480,5 +605,73 @@ mod tests {
             used_bytes: 500,
         };
         dev.print_free();
+    }
+
+    // -----------------------------------------------------------------------
+    // GpuDeviceInfoBuilder tests (Wave A of v0.2.1)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_defaults_produce_zeroed_device() {
+        let dev = GpuDeviceInfo::builder().build();
+        assert_eq!(dev.index, 0);
+        assert!(dev.name.is_none());
+        assert_eq!(dev.total_bytes, 0);
+        assert_eq!(dev.free_bytes, 0);
+        assert_eq!(dev.used_bytes, 0);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_index_setter() {
+        let dev = GpuDeviceInfo::builder().index(7).build();
+        assert_eq!(dev.index, 7);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_name_setter_some() {
+        let dev = GpuDeviceInfo::builder()
+            .name(Some("Synthetic GPU".to_owned()))
+            .build();
+        assert_eq!(dev.name.as_deref(), Some("Synthetic GPU"));
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_name_setter_none_is_default() {
+        let dev = GpuDeviceInfo::builder().name(None).build();
+        assert!(dev.name.is_none());
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_byte_setters() {
+        let dev = GpuDeviceInfo::builder()
+            .total_bytes(16 * 1_024 * 1_024 * 1_024)
+            .free_bytes(14 * 1_024 * 1_024 * 1_024)
+            .used_bytes(2 * 1_024 * 1_024 * 1_024)
+            .build();
+        assert_eq!(dev.total_bytes, 16 * 1_024 * 1_024 * 1_024);
+        assert_eq!(dev.free_bytes, 14 * 1_024 * 1_024 * 1_024);
+        assert_eq!(dev.used_bytes, 2 * 1_024 * 1_024 * 1_024);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn builder_full_round_trip() {
+        let dev = GpuDeviceInfo::builder()
+            .index(1)
+            .name(Some("Round-Trip GPU".to_owned()))
+            .total_bytes(17_179_869_184)
+            .free_bytes(15_246_684_160)
+            .used_bytes(1_933_185_024)
+            .build();
+        assert_eq!(dev.index, 1);
+        assert_eq!(dev.name.as_deref(), Some("Round-Trip GPU"));
+        assert_eq!(dev.total_bytes, 17_179_869_184);
+        assert_eq!(dev.free_bytes, 15_246_684_160);
+        assert_eq!(dev.used_bytes, 1_933_185_024);
     }
 }

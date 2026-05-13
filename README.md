@@ -166,7 +166,9 @@ The crate handles two known driver bugs out of the box:
 
 ## Used by
 
-_No consumers yet — `0.2.0` adds the `hmn` CLI binary and multi-adapter enumeration on top of `0.1.0`'s core. **Phase 2** will integrate with [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model)'s `inspect --check-gpu` flag (path-dep first, then `hypomnesis = "0.2"` from crates.io once the API has settled under real use). **Phase 3** may migrate [candle-mi](https://github.com/PCfVW/candle-mi)'s in-tree memory module to depend on `hypomnesis = "0.2"` with `features = ["report"]`._
+- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
+
+_Forthcoming: [candle-mi](https://github.com/PCfVW/candle-mi) is expected to migrate its in-tree memory module to `hypomnesis` (`features = ["report"]`) after v0.2.1 lands._
 
 ## License
 

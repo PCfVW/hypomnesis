@@ -118,7 +118,7 @@ That's it. No candle, no serde, no tokio. MSRV 1.88 (match candle-mi).
 
 ## First consumer: hf-fetch-model
 
-> **Status:** Phase 2 — blocked on Phase 1 Wave 2's `0.1.0` release. Once `hypomnesis 0.1.0` ships to crates.io, `hf-fetch-model` adopts it directly via `hypomnesis = "0.1"` (no path dep needed; `0.0.1` is the placeholder and `0.1.0` is the first functional release).
+> **Status:** Phase 2 — **shipped**. `hf-fetch-model 0.10.1` (released 2026-05-12) adopts `hypomnesis = "0.2"` for the `inspect --check-gpu` flag described below. See [`docs/hypomnesis-adoption.md`](hypomnesis-adoption.md) for the dogfooding report and the v0.2.1 roadmap items the integration surfaced.
 
 hf-fetch-model v0.10.x gets `--check-gpu [N]` on `inspect`:
 
@@ -134,7 +134,7 @@ $ hf-fm inspect google/gemma-4-E2B-it model.safetensors --check-gpu
   weight size for KV cache and activations.
 ```
 
-This is the proof-of-concept consumer. hf-fm uses ~10% of hypomnesis's API surface (`device_info` + `device_count`); candle-mi uses the rest.
+This is the proof-of-concept consumer. `hf-fm` uses `device_info` directly (well under 10% of hypomnesis's API surface). `device_count` is deferred to the multi-GPU follow-up (`--check-gpu all`, `hf-fm` v0.10.4) — `device_info`'s `DeviceIndexOutOfRange { index, count }` variant already exposes the count whenever an out-of-range index is queried, so the v0.10.1 single-device path does not need a separate count call. `candle-mi` is expected to exercise the broader surface (`Snapshot`, `report`-feature helpers) when it migrates to `hypomnesis 0.2.1`.
 
 ## Roadmap
 

@@ -6,6 +6,31 @@
 ///
 /// `#[non_exhaustive]`: new variants will be added as new backends are introduced
 /// (e.g., AMD `ROCm` SMI, Apple Metal). Patch-release-safe.
+///
+/// # `Display` vs structured fields
+///
+/// `HypomnesisError`'s `Display` impl is the **default English one-liner** —
+/// suitable for logs, library-tier error reporting, and `?`-propagation where
+/// the consumer is content with the default rendering. Structured fields
+/// ([`Self::DeviceIndexOutOfRange`]'s `index` / `count`, the inner `String` of
+/// [`Self::Nvml`] / [`Self::Dxgi`] / [`Self::NvidiaSmi`]) are the **canonical
+/// source** for any consumer that wants to:
+///
+/// - Localize the message to a non-English language.
+/// - Restyle for a CLI / GUI / JSON output (column-aligned tables,
+///   wrap-aware formatting, JSON keys for the structured pieces).
+/// - Apply singular / plural agreement, custom punctuation, or richer
+///   formatting (`"have 1 device"` vs the default `"have 1 devices"`,
+///   for instance).
+///
+/// This contract makes `Display` stable for the common case while leaving
+/// custom-render consumers free to assemble their own strings without
+/// fighting the default. Consumers writing user-facing tools should prefer
+/// `match err { HypomnesisError::DeviceIndexOutOfRange { index, count } => ... }`
+/// over `format!("{err}")`. Future `Display`-string improvements will avoid
+/// adding structural information that the structured fields already expose
+/// (so consumers that hand-format from the fields cannot end up
+/// double-rendering the count).
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum HypomnesisError {

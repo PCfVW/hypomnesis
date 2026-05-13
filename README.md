@@ -35,13 +35,13 @@ The default feature set (`nvml`, `dxgi`, `nvidia-smi-fallback`) covers process R
 For candle-mi-compatible delta and printing helpers (`MemoryReport`, `print_delta`, `print_before_after`, `ram_mb`, `vram_mb`):
 
 ```toml
-hypomnesis = { version = "0.1", features = ["report"] }
+hypomnesis = { version = "0.2", features = ["report"] }
 ```
 
 For a stripped-down build (process RSS only, no GPU backends):
 
 ```toml
-hypomnesis = { version = "0.1", default-features = false }
+hypomnesis = { version = "0.2", default-features = false }
 ```
 
 ## Usage

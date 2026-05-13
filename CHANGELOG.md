@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-13
+
 > *Sharper, not wider. Same surface — easier to test against, kinder to repeat callers.*
 
 `v0.2.1` is a patch release composed entirely of wear-and-tear feedback from `hf-fetch-model 0.10.1`, the first external consumer to adopt `hypomnesis`. The five waves — `test-helpers` builder, `name_or_unknown` convenience, `format_total` / `format_used` parity for `report`-feature consumers, the `HypomnesisError` `Display`-vs-structured-fields contract, and a docs pass on the brief and the `README.md` "Used by" — are each small and additive under `#[non_exhaustive]`, but they land together because dogfooding produced a coherent set: every item closes a gap a real downstream developer actually hit, not a gap synthesised from imagined use. The motivating principle going forward — *every patch release is informed by at least one real consumer's adoption experience* — is itself one of the v0.2.1 deliverables. See [`docs/roadmap-v0.2.1.md`](docs/roadmap-v0.2.1.md) for the wave-by-wave rationale and [`docs/hypomnesis-adoption.md`](docs/hypomnesis-adoption.md) for the underlying adoption report.

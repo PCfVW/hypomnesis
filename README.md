@@ -10,7 +10,7 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> 🚀 **`0.2.0` widens the API without breaking callers.** Adds `Snapshot::all` for multi-adapter enumeration on Windows, `gpu_processes` for compute-process listing, the `hmn` CLI binary behind a default-off `cli` feature, and `report`-feature free-VRAM print helpers (`format_free` / `print_free` on `GpuDeviceInfo`). The public API remains `#[non_exhaustive]` so further additions (AMD ROCm, Apple Metal) can land in 0.2.x patches without breaking callers. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.2.0 entry and [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) for the wave-by-wave rationale.
+> 🚀 **`0.2.1` is the first dogfooding-driven patch.** Five wear-and-tear additions surfaced by [`hf-fetch-model 0.10.1`](https://github.com/PCfVW/hf-fetch-model)'s adoption: a `test-helpers`-feature `GpuDeviceInfoBuilder` so downstream tests can synthesise `#[non_exhaustive]` `GpuDeviceInfo` fixtures, a `name_or_unknown()` convenience to settle consumer divergence on the fallback phrase, `format_total` / `format_used` parity helpers for `report`-feature consumers, an `HypomnesisError` `Display`-vs-structured-fields contract codified in the doc-comment, and a `README.md` "Used by" + brief refresh. All additive under the `#[non_exhaustive]` policy carried over from v0.2.0 (`Snapshot::all`, `gpu_processes`, `hmn` CLI, `format_free` / `print_free`). See [`CHANGELOG.md`](CHANGELOG.md) for the v0.2.1 entry, [`docs/roadmap-v0.2.1.md`](docs/roadmap-v0.2.1.md) for the wave-by-wave rationale, and [`docs/hypomnesis-adoption.md`](docs/hypomnesis-adoption.md) for the underlying dogfooding report.
 
 ## Table of Contents
 

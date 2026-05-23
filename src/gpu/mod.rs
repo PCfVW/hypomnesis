@@ -40,6 +40,11 @@ mod metal;
 /// is enabled, or if every enabled backend failed to report a count.
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled (body collapses)
 pub fn device_count() -> Result<u32> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let Some(count) = metal::device_count() {
+        return Ok(count);
+    }
+
     #[cfg(feature = "nvml")]
     if let Some(count) = nvml::device_count() {
         return Ok(count);
@@ -83,6 +88,17 @@ pub fn device_count() -> Result<u32> {
 #[allow(unused_variables)] // `index` unused when no GPU backend feature is enabled
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled (body collapses)
 pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let Some(d) = metal::query(index) {
+        return Ok(GpuDeviceInfo {
+            index,
+            name: Some(d.adapter_name),
+            total_bytes: d.dedicated_video_memory,
+            free_bytes: d.dedicated_video_memory.saturating_sub(d.current_usage),
+            used_bytes: d.current_usage,
+        });
+    }
+
     #[cfg(feature = "nvml")]
     if let Some(snap) = nvml::query(index) {
         #[cfg(all(windows, feature = "dxgi"))]
@@ -146,6 +162,11 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
 #[allow(unused_variables)] // `device_index` unused when no GPU backend feature is enabled
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled (body collapses)
 pub fn process_gpu_info(device_index: u32) -> Result<ProcessGpuInfo> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let Some(info) = metal::process_gpu_info(device_index) {
+        return Ok(info);
+    }
+
     #[cfg(all(windows, feature = "dxgi"))]
     if let Some(d) = dxgi::query(device_index) {
         return Ok(ProcessGpuInfo {
@@ -277,6 +298,11 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
 #[allow(unused_variables)] // `device_index` unused when no GPU backend feature is enabled
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled
 pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if let Some(rows) = metal::list_compute_processes(device_index) {
+        return Ok(rows);
+    }
+
     #[cfg(feature = "nvml")]
     if let Some(rows) = nvml::list_compute_processes(device_index) {
         let entries: Vec<GpuProcessEntry> = rows

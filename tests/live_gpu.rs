@@ -98,6 +98,14 @@ fn process_gpu_info_returns_expected_source_per_platform() {
             info.source
         );
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS the Metal backend is the per-process path — the
+        // BSD ledger `graphics_footprint` entry for the calling PID.
+        assert_eq!(info.source, hypomnesis::GpuQuerySource::Metal);
+        assert!(info.is_per_process);
+    }
 }
 
 /// Out-of-range index should yield `DeviceIndexOutOfRange` when at least

@@ -23,6 +23,7 @@ fn public_types_are_reachable_via_crate_root() {
     let _: GpuQuerySource = GpuQuerySource::Dxgi;
     let _: GpuQuerySource = GpuQuerySource::Nvml;
     let _: GpuQuerySource = GpuQuerySource::NvidiaSmi;
+    let _: GpuQuerySource = GpuQuerySource::Metal;
     let _: HypomnesisError = HypomnesisError::NoGpuSource;
 }
 

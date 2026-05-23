@@ -71,6 +71,8 @@ pub enum GpuQuerySource {
     /// [`GpuProcessEntry`] each row is per-process — one entry per
     /// `CUDA` process from `nvidia-smi --query-compute-apps`.
     NvidiaSmi,
+    /// Apple Metal per-process query (`ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint`).
+    Metal,
 }
 
 /// One compute process holding GPU memory on a given device.

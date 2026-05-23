@@ -87,10 +87,17 @@ fn gpu_processes_returns_result_or_no_gpu_source() {
             for row in &rows {
                 // PIDs of 0 would be impossible on Linux/Windows; sanity-check.
                 assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
-                // Source must be one of the two enumerable backends —
-                // DXGI cannot enumerate other PIDs.
+                // Source must be one of the enumerable backends —
+                // DXGI cannot enumerate other PIDs; NVML / nvidia-smi enumerate
+                // NVIDIA processes; Metal enumerates same-user PIDs via the
+                // macOS kernel ledger.
                 assert!(
-                    matches!(row.source, GpuQuerySource::Nvml | GpuQuerySource::NvidiaSmi),
+                    matches!(
+                        row.source,
+                        GpuQuerySource::Nvml
+                            | GpuQuerySource::NvidiaSmi
+                            | GpuQuerySource::Metal
+                    ),
                     "unexpected source {:?} on a gpu_processes row",
                     row.source
                 );

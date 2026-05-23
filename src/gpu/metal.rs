@@ -516,9 +516,24 @@ fn process_self_pid() -> i32 {
 /// Per-process GPU memory usage for the calling PID on `device_index`.
 ///
 /// Returns `None` for any `device_index != 0`. Otherwise reads
-/// `graphics_footprint` from the BSD ledger for the calling PID.
-pub(super) fn process_gpu_info(_device_index: u32) -> Option<crate::gpu::ProcessGpuInfo> {
-    unimplemented!("populated in Step 3")
+/// `graphics_footprint` from the BSD ledger for the calling PID and
+/// wraps it in a [`crate::ProcessGpuInfo`] with [`crate::GpuQuerySource::Metal`]
+/// as the source tag. The `GpuQuerySource::Metal` variant is added by
+/// the `gpu_dispatcher_wiring` leaf; `cargo check` for this module
+/// will fail until that leaf lands. The `cfg(all(target_os = "macos",
+/// feature = "metal"))` gate on `mod metal;` ensures the macOS build
+/// only succeeds once the variant exists.
+pub(super) fn process_gpu_info(device_index: u32) -> Option<crate::ProcessGpuInfo> {
+    if device_index != 0 {
+        return None;
+    }
+    let self_pid = process_self_pid();
+    let used_bytes = read_graphics_footprint(self_pid)?;
+    Some(crate::ProcessGpuInfo {
+        used_bytes,
+        is_per_process: true,
+        source: crate::GpuQuerySource::Metal,
+    })
 }
 
 /// Enumerate every same-user process holding GPU memory on

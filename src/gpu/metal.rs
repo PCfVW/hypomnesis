@@ -491,8 +491,14 @@ pub(super) fn query(idx: u32) -> Option<MetalQueryResult> {
 
 /// Number of Metal devices visible — `Some(1)` on Apple Silicon,
 /// `None` elsewhere (Intel Macs are out of scope for v0.2.2).
+///
+/// Detects Apple Silicon by reading `machdep.cpu.brand_string` and
+/// looking for "Apple"; the alternative `hw.optional.arm64` sysctl
+/// returns a 32-bit `int` and so cannot be read through the
+/// [`read_sysctl_u64`] helper without a separate u32 variant.
 pub(super) fn device_count() -> Option<u32> {
-    if read_sysctl_u64(b"hw.optional.arm64\0") == Some(1) {
+    let brand = read_sysctl_string(b"machdep.cpu.brand_string\0")?;
+    if brand.contains("Apple") {
         Some(1)
     } else {
         None

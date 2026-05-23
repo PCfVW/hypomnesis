@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Stubs in this module are populated in the gpu-metal leaf's Steps 2–4
-// (`query`/`device_count`, `process_gpu_info`, `list_compute_processes`).
-// The dead-code allow is dropped as each step wires its surface up.
+// Stubs for `process_gpu_info` and `list_compute_processes` are
+// populated in the gpu-metal leaf's Steps 3 and 4. The dead-code allow
+// covers the not-yet-wired surfaces and is dropped when they wire up.
 #![allow(dead_code)]
 
 //! macOS GPU backend — per-process Metal memory on Apple Silicon UMA.
@@ -40,7 +40,8 @@
 //!   writes-corrected probe; Appendix A's C externs map 1:1 to the
 //!   Rust externs declared in [`libsystem_ffi`].
 
-use core::ffi::c_char;
+use core::ffi::{c_char, c_void};
+use std::sync::OnceLock;
 
 /// libSystem FFI declarations for the macOS GPU backend.
 ///
@@ -61,7 +62,10 @@ mod libsystem_ffi {
         /// Returns the calling process's PID. Cannot fail.
         ///
         /// See: `<unistd.h>`. Marked `safe` per Rust 2024 idiom — the
-        /// kernel guarantees a valid PID is always returned.
+        /// kernel guarantees a valid PID is always returned. Declared
+        /// for ABI completeness of the libSystem surface; the calling
+        /// PID is read via `std::process::id` (safe stdlib) elsewhere.
+        #[allow(dead_code)]
         pub(super) safe fn getpid() -> i32;
 
         /// BSD kernel ledger syscall (no user-space header ships this).
@@ -70,11 +74,15 @@ mod libsystem_ffi {
         /// [`super::LEDGER_TEMPLATE_INFO`], [`super::LEDGER_ENTRY_INFO_V2`].
         /// `arg1`/`arg2`/`arg3` semantics depend on `cmd`; see R02
         /// Appendix A `bridge.h` for the call conventions actually
-        /// exercised here. Returns `0` on success, `-1` with `errno`
-        /// set on failure (e.g. `EPERM` for cross-user reads).
+        /// exercised here. All three args have C type `caddr_t`
+        /// (`char *`) — for `LEDGER_ENTRY_INFO_V2` arg1 is the PID
+        /// reinterpreted as a pointer-sized integer, mirroring R02's
+        /// `caddr_t(bitPattern: Int(pid))`. Returns `0` on success,
+        /// `-1` with `errno` set on failure (e.g. `EPERM` for cross-user
+        /// reads).
         pub(super) unsafe fn ledger(
             cmd: i32,
-            arg1: i32,
+            arg1: *mut c_void,
             arg2: *mut c_void,
             arg3: *mut c_void,
         ) -> i32;
@@ -218,6 +226,246 @@ pub(super) struct MetalQueryResult {
     pub adapter_name: String,
 }
 
+/// Cached index of the `graphics_footprint` entry in the per-PID
+/// ledger entry array. Resolved by name on first read via
+/// [`resolve_graphics_footprint_index`]; observed value on macOS 26.x
+/// is 36, but the literal must never appear as a Rust expression value
+/// — see R01 § Reference Design.
+static GRAPHICS_FOOTPRINT_INDEX: OnceLock<i32> = OnceLock::new();
+
+/// Maximum ledger-entry count probed at init.
+///
+/// XNU defines ~70 entries on macOS 26.x; this cap bounds the
+/// `LEDGER_TEMPLATE_INFO` buffer growth. Set well above the observed
+/// count to absorb future kernel additions without truncation.
+const LEDGER_TEMPLATE_BUF_CAP: usize = 128;
+
+/// Read a `u64` `sysctlbyname` value (e.g. `b"hw.memsize\0"`).
+///
+/// `name` must be a NUL-terminated byte slice. Returns `None` if the
+/// syscall fails or returns a non-8-byte value.
+#[allow(unsafe_code)]
+fn read_sysctl_u64(name: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len: usize = size_of::<u64>();
+    // CAST: &u64 → *mut c_void via `&raw mut value` then explicit cast;
+    // the sysctl ABI treats the out-buffer as an opaque byte region.
+    #[allow(clippy::as_conversions, clippy::ptr_as_ptr)]
+    let out_ptr = (&raw mut value).cast::<c_void>();
+    // SAFETY: `name` is caller-provided as a NUL-terminated byte slice;
+    // its `as_ptr()` is valid for `name.len()` bytes including the
+    // terminator the kernel scans for. `out_ptr` points to an 8-byte
+    // stack-resident `u64`. `&raw mut len` is a live `usize` whose
+    // initial value matches the buffer capacity. `newp`/`newlen` are
+    // null/zero — read-only query.
+    let rc = unsafe {
+        // INDEX: `name[0]` is the first byte of the NUL-terminated
+        // name; passing a zero-length slice would yield a dangling
+        // pointer, so reject empty names up-front via the slice's
+        // own bounds check on `as_ptr`.
+        libsystem_ffi::sysctlbyname(
+            name.as_ptr().cast::<c_char>(),
+            out_ptr,
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == size_of::<u64>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Read a UTF-8 `sysctlbyname` string (e.g. `b"machdep.cpu.brand_string\0"`).
+///
+/// Two-call probe: query the buffer length first with a null `oldp`,
+/// then allocate and re-query. Returns `None` if either call fails or
+/// the result is not valid UTF-8 after trimming the trailing NUL.
+#[allow(unsafe_code)]
+fn read_sysctl_string(name: &[u8]) -> Option<String> {
+    let mut len: usize = 0;
+    // SAFETY: `name.as_ptr()` is a NUL-terminated C string; `oldp =
+    // null` instructs the kernel to write the required buffer size
+    // into `*oldlenp`. `newp`/`newlen` are null/zero (read-only).
+    let rc = unsafe {
+        libsystem_ffi::sysctlbyname(
+            name.as_ptr().cast::<c_char>(),
+            core::ptr::null_mut(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0_u8; len];
+    // SAFETY: `buf` is a freshly allocated Vec<u8> with `len` bytes
+    // capacity AND length; `as_mut_ptr` is valid for `buf.len()`
+    // bytes. `&raw mut len` still holds the kernel-reported size.
+    let rc2 = unsafe {
+        libsystem_ffi::sysctlbyname(
+            name.as_ptr().cast::<c_char>(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc2 != 0 {
+        return None;
+    }
+    // Trim trailing NUL byte(s) the kernel includes in the count.
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    // BORROW: `String::from_utf8(buf).ok()` — sysctl strings are ASCII
+    // by convention; UTF-8 decode failure surfaces as `None`.
+    String::from_utf8(buf).ok()
+}
+
+/// Discover the `graphics_footprint` ledger entry index by name.
+///
+/// Calls `ledger(LEDGER_TEMPLATE_INFO, buf, &count, NULL)` per R02
+/// Appendix A and linear-scans the returned [`LedgerTemplateInfo`]
+/// rows for an `lti_name` whose decoded prefix equals
+/// `"graphics_footprint"`. Returns `None` if the syscall fails or the
+/// entry is absent on this kernel.
+#[allow(unsafe_code)]
+fn resolve_graphics_footprint_index() -> Option<i32> {
+    // SAFETY: `LedgerTemplateInfo` is `#[repr(C)]` with only `c_char`
+    // array fields (POD). All-zero is a valid bit pattern; we
+    // initialise via `core::mem::zeroed` per element so the resulting
+    // `Vec` is fully initialised before the FFI call sees its buffer.
+    let mut buf: Vec<LedgerTemplateInfo> = (0..LEDGER_TEMPLATE_BUF_CAP)
+        .map(|_| unsafe { core::mem::zeroed::<LedgerTemplateInfo>() })
+        .collect();
+    // CAST: usize → i32, count is bounded by `LEDGER_TEMPLATE_BUF_CAP`
+    // (128); fits trivially in i32.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let mut count: i32 = LEDGER_TEMPLATE_BUF_CAP as i32;
+    // SAFETY: arg1 is the template buffer (`caddr_t`); arg2 is the
+    // count in/out pointer (`caddr_t` aliasing an `i32`); arg3 is
+    // NULL. R02 Appendix A's `loadTemplateNames` uses the same
+    // convention. The kernel writes at most `count` rows and updates
+    // `*count` with the number actually written.
+    let rc = unsafe {
+        libsystem_ffi::ledger(
+            LEDGER_TEMPLATE_INFO,
+            buf.as_mut_ptr().cast::<c_void>(),
+            (&raw mut count).cast::<c_void>(),
+            core::ptr::null_mut(),
+        )
+    };
+    if rc != 0 || count <= 0 {
+        return None;
+    }
+    // CAST: i32 → usize, count was just checked > 0 and is bounded
+    // by `LEDGER_TEMPLATE_BUF_CAP`.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let returned = (count as usize).min(LEDGER_TEMPLATE_BUF_CAP);
+    let target = b"graphics_footprint";
+    for (i, row) in buf.iter().take(returned).enumerate() {
+        // The XNU entry name is a 32-byte NUL-terminated ASCII field.
+        // Decode by iterating until the first NUL; produce a
+        // bounded-length `Vec<u8>` that lets us compare with `target`
+        // without raw slice indexing.
+        // CAST: c_char → u8, the kernel writes ASCII bytes; both have
+        // identical wire representation.
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        let name_bytes: Vec<u8> = row
+            .lti_name
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        if name_bytes == target {
+            // CAST: usize → i32, `i < returned <= LEDGER_TEMPLATE_BUF_CAP`
+            // (128); fits in i32.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            return Some(i as i32);
+        }
+    }
+    None
+}
+
+/// Read `graphics_footprint` (resident GPU-attributed bytes) for `pid`.
+///
+/// Calls `ledger(LEDGER_ENTRY_INFO_V2, pid, buf, &count)` and reads the
+/// `lei_balance` of the resolved entry index. Returns `None` if the
+/// syscall fails (e.g. cross-user PID without root → `EPERM`, or PID
+/// has exited → `ESRCH`), or the index has not yet been resolvable.
+///
+/// R02 Round 05 confirmed this entry tracks Metal-written pages on
+/// Apple Silicon UMA — see `__reports__/macos_ledger/05-findings_writes_v0.md`
+/// Table 1 (Phase 1→2 delta = +256 MiB, exact).
+#[allow(unsafe_code)]
+fn read_graphics_footprint(pid: i32) -> Option<u64> {
+    let idx = *GRAPHICS_FOOTPRINT_INDEX
+        .get_or_init(|| resolve_graphics_footprint_index().unwrap_or(-1));
+    if idx < 0 {
+        return None;
+    }
+    // CAST: i32 → usize, `idx >= 0` was just checked.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let idx_usize = idx as usize;
+
+    // Allocate one row per kernel entry. The kernel writes
+    // `LEDGER_TEMPLATE_BUF_CAP` rows max; we size the buffer the same
+    // way the template probe did so indexing into it is in-range.
+    // SAFETY: `LedgerEntryInfo` is `#[repr(C)]` with only integer
+    // fields (POD). All-zero is a valid bit pattern; per-element
+    // `zeroed` initialises the whole `Vec` before the FFI sees it.
+    let mut buf: Vec<LedgerEntryInfo> = (0..LEDGER_TEMPLATE_BUF_CAP)
+        .map(|_| unsafe { core::mem::zeroed::<LedgerEntryInfo>() })
+        .collect();
+    // CAST: usize → i32, bounded by `LEDGER_TEMPLATE_BUF_CAP` (128).
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let mut count: i32 = LEDGER_TEMPLATE_BUF_CAP as i32;
+    // CAST: i32 PID → *mut c_void, mirroring R02 Appendix A's
+    // `caddr_t(bitPattern: Int(pid))` — the syscall reinterprets
+    // arg1's pointer-sized bits as the target PID. PIDs are
+    // non-negative on macOS, so the sign-loss step is benign.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let pid_as_ptr = pid as usize as *mut c_void;
+    // SAFETY: arg1 is the PID encoded as a pointer; arg2 is the
+    // entry-array buffer; arg3 is the count in/out. R02 Appendix A's
+    // `readLedger` uses the exact same argument layout. Cross-user
+    // PIDs surface as a non-zero return (errno = EPERM); PID-exited
+    // surfaces as ESRCH. Both are folded into `None` below.
+    let rc = unsafe {
+        libsystem_ffi::ledger(
+            LEDGER_ENTRY_INFO_V2,
+            pid_as_ptr,
+            buf.as_mut_ptr().cast::<c_void>(),
+            (&raw mut count).cast::<c_void>(),
+        )
+    };
+    if rc != 0 || count <= 0 {
+        return None;
+    }
+    // CAST: i32 → usize, `count > 0` just checked.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let returned = (count as usize).min(LEDGER_TEMPLATE_BUF_CAP);
+    if idx_usize >= returned {
+        return None;
+    }
+    // Use `.get()` to avoid panic-prone indexing; `idx_usize < returned`
+    // already checked, so the `?` short-circuit is defensive only.
+    let balance = buf.get(idx_usize)?.lei_balance;
+    if balance < 0 {
+        // Negative balances are not physically meaningful for a
+        // bytes-unit entry; surface as absent rather than wrapping.
+        None
+    } else {
+        // CAST: i64 → u64, `balance >= 0` just checked.
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        Some(balance as u64)
+    }
+}
+
 /// Run a single Metal device query for `idx`.
 ///
 /// On Apple Silicon there is a single integrated GPU; this returns
@@ -225,14 +473,44 @@ pub(super) struct MetalQueryResult {
 /// [`MetalQueryResult`] populated from `ledger(graphics_footprint)`
 /// for the calling PID, `sysctl hw.memsize` for the total, and
 /// `sysctl machdep.cpu.brand_string` for the name.
-pub(super) fn query(_idx: u32) -> Option<MetalQueryResult> {
-    unimplemented!("populated in Step 2")
+pub(super) fn query(idx: u32) -> Option<MetalQueryResult> {
+    if idx != 0 {
+        return None;
+    }
+    let self_pid = process_self_pid();
+    let current_usage = read_graphics_footprint(self_pid).unwrap_or(0);
+    let dedicated_video_memory = read_sysctl_u64(b"hw.memsize\0")?;
+    let adapter_name = read_sysctl_string(b"machdep.cpu.brand_string\0")
+        .unwrap_or_else(|| "Apple GPU".into());
+    Some(MetalQueryResult {
+        current_usage,
+        dedicated_video_memory,
+        adapter_name,
+    })
 }
 
 /// Number of Metal devices visible — `Some(1)` on Apple Silicon,
 /// `None` elsewhere (Intel Macs are out of scope for v0.2.2).
 pub(super) fn device_count() -> Option<u32> {
-    unimplemented!("populated in Step 2")
+    if read_sysctl_u64(b"hw.optional.arm64\0") == Some(1) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Calling-process PID via `std::process::id` — safe-stdlib path that
+/// avoids the libSystem `getpid` FFI for the trivial self-PID case.
+///
+/// Kept as a separate fn so Step 3 / Step 4 share the same casting
+/// annotation site.
+fn process_self_pid() -> i32 {
+    // CAST: u32 → i32, POSIX PIDs are non-negative i32; `std::process::id`
+    // returns the same bit pattern as `getpid()` would.
+    #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+    {
+        std::process::id() as i32
+    }
 }
 
 /// Per-process GPU memory usage for the calling PID on `device_index`.

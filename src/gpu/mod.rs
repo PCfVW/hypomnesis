@@ -26,6 +26,9 @@ mod dxgi;
 #[cfg(feature = "nvidia-smi-fallback")]
 mod nvidia_smi;
 
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod metal;
+
 /// Number of NVIDIA GPUs visible to `NVML` (`NVML`-canonical ordering).
 ///
 /// On Windows the count uses `NVML`; if `NVML` is unavailable, the

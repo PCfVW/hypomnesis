@@ -29,10 +29,11 @@ windows = { version = "0.62", optional = true, features = [
 ] }
 
 [features]
-default = ["nvml", "nvidia-smi-fallback", "dxgi"]
+default = ["nvml", "nvidia-smi-fallback", "dxgi", "metal"]
 nvml = ["dep:libloading"]
 nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
+metal = []
 report = []
 debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the

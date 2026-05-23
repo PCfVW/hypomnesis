@@ -538,9 +538,146 @@ pub(super) fn process_gpu_info(device_index: u32) -> Option<crate::ProcessGpuInf
 
 /// Enumerate every same-user process holding GPU memory on
 /// `device_index`. Cross-user PIDs (`EPERM` on the ledger read) are
-/// skipped silently.
+/// skipped silently, as are PIDs with a zero `graphics_footprint`
+/// balance (mirrors NVML's per-process filter on Linux).
+///
+/// Two-phase `proc_listpids`: query the buffer size first, then fill.
+/// PID count may grow between the two calls; the iteration is capped
+/// at the buffer's filled length to remain safe.
+#[allow(unsafe_code)]
 pub(super) fn list_compute_processes(
-    _device_index: u32,
-) -> Option<Vec<crate::gpu::GpuProcessEntry>> {
-    unimplemented!("populated in Step 4")
+    device_index: u32,
+) -> Option<Vec<crate::GpuProcessEntry>> {
+    if device_index != 0 {
+        return None;
+    }
+
+    // Phase 1 — size probe: `buffer = NULL, buffersize = 0` returns
+    // the byte count the kernel would write.
+    // SAFETY: `PROC_ALL_PIDS` is a documented selector; `typeinfo = 0`
+    // means "any predicate"; `buffer = NULL`/`buffersize = 0` is the
+    // documented size-probe convention.
+    let size_bytes = unsafe {
+        libsystem_ffi::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if size_bytes <= 0 {
+        return None;
+    }
+    // CAST: i32 → usize, `size_bytes > 0` just checked. `size_bytes`
+    // is bounded by the kernel's max PID count × 4; comfortably fits.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let size_usize = size_bytes as usize;
+    let pid_count = size_usize / size_of::<i32>();
+    if pid_count == 0 {
+        return None;
+    }
+
+    // Phase 2 — fill. Allocate `pid_count` i32 slots; the kernel may
+    // see a slightly larger live PID count by the time it runs but
+    // will not exceed the byte budget we pass.
+    let mut pids: Vec<i32> = vec![0_i32; pid_count];
+    // CAST: usize → i32, `size_usize == pid_count * 4` and was just
+    // computed from the kernel's own i32 return; round-trips safely.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let cap_bytes = (pid_count * size_of::<i32>()) as i32;
+    // SAFETY: `pids.as_mut_ptr` is valid for `pid_count *
+    // size_of::<i32>()` bytes (matches `cap_bytes`). The kernel
+    // writes up to `cap_bytes` bytes worth of PIDs and returns the
+    // actual byte count written.
+    let written_bytes = unsafe {
+        libsystem_ffi::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast::<c_void>(),
+            cap_bytes,
+        )
+    };
+    if written_bytes <= 0 {
+        return None;
+    }
+    // CAST: i32 → usize, `written_bytes > 0` just checked.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let written_usize = (written_bytes as usize).min(size_usize);
+    let written_pids = written_usize / size_of::<i32>();
+
+    let mut out: Vec<crate::GpuProcessEntry> = Vec::new();
+    // Iterate up to the buffer's actual filled length; cap by
+    // `pid_count` defensively against any kernel-side count growth.
+    for &pid in pids.iter().take(written_pids) {
+        if pid <= 0 {
+            continue;
+        }
+        let Some(used) = read_graphics_footprint(pid) else {
+            // Cross-user EPERM, ESRCH (exited), or absent index —
+            // all surface as `None` here and are silently skipped.
+            continue;
+        };
+        if used == 0 {
+            continue;
+        }
+        let name = read_proc_pidpath_basename(pid);
+        // CAST: i32 → u32, `pid > 0` just checked; PIDs are
+        // non-negative on macOS.
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        let pid_u32 = pid as u32;
+        out.push(crate::GpuProcessEntry {
+            pid: pid_u32,
+            name,
+            used_bytes: used,
+            source: crate::GpuQuerySource::Metal,
+        });
+    }
+
+    Some(out)
+}
+
+/// Resolve `pid`'s executable basename via `proc_pidpath`.
+///
+/// Returns `None` on syscall failure (process exited, cross-user
+/// permission denial, or path-decoding failure). The basename is the
+/// final `/`-separated component of the full executable path.
+#[allow(unsafe_code)]
+fn read_proc_pidpath_basename(pid: i32) -> Option<String> {
+    let mut buf: [u8; PROC_PIDPATHINFO_MAXSIZE] = [0; PROC_PIDPATHINFO_MAXSIZE];
+    // CAST: usize → u32, `PROC_PIDPATHINFO_MAXSIZE` is 4096; fits.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let cap_u32 = PROC_PIDPATHINFO_MAXSIZE as u32;
+    // SAFETY: `buf.as_mut_ptr` is valid for `PROC_PIDPATHINFO_MAXSIZE`
+    // bytes (its declared length). The kernel writes a NUL-terminated
+    // path of at most `cap_u32` bytes and returns the length excluding
+    // the NUL. PID validity is handled by the kernel; a stale/cross-user
+    // PID returns 0.
+    let len = unsafe {
+        libsystem_ffi::proc_pidpath(
+            pid,
+            buf.as_mut_ptr().cast::<c_void>(),
+            cap_u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    // CAST: i32 → usize, `len > 0` just checked and bounded by
+    // `cap_u32`.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    let len_usize = (len as usize).min(PROC_PIDPATHINFO_MAXSIZE);
+    // Take only the bytes the kernel wrote (excludes terminator).
+    let path_bytes = buf.get(..len_usize)?;
+    // BORROW: `from_utf8` borrows; `to_owned` produces the returned
+    // `String` so the stack buffer can be dropped.
+    let path_str = core::str::from_utf8(path_bytes).ok()?.to_owned();
+    // Extract basename — the substring after the final '/'.
+    let basename = path_str.rsplit('/').next().unwrap_or(&path_str);
+    if basename.is_empty() {
+        None
+    } else {
+        // BORROW: `to_owned` — `basename` is borrowed from `path_str`
+        // which is dropped at function return.
+        Some(basename.to_owned())
+    }
 }

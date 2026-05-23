@@ -90,12 +90,24 @@ pub fn device_count() -> Result<u32> {
 pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if let Some(d) = metal::query(index) {
+        // On Apple Silicon UMA the discrete-GPU "free vs total" mental
+        // model doesn't apply: `hw.memsize` is the physical DRAM ceiling
+        // (acts as `total`), and Apple's own
+        // `MTLDevice.recommendedMaxWorkingSetSize` is the kernel-projected
+        // soft cap on what the GPU can hold resident with good
+        // performance (acts as `free`). `used = total - free` is the
+        // implied non-GPU reserve. See
+        // `__reports__/macos_ledger/13-findings_metal_budget_v0.md` for
+        // the empirical justification — every libSystem-only alternative
+        // diverges from Apple's number by 37%+.
         return Ok(GpuDeviceInfo {
             index,
             name: Some(d.adapter_name),
             total_bytes: d.dedicated_video_memory,
-            free_bytes: d.dedicated_video_memory.saturating_sub(d.current_usage),
-            used_bytes: d.current_usage,
+            free_bytes: d.recommended_max_working_set,
+            used_bytes: d
+                .dedicated_video_memory
+                .saturating_sub(d.recommended_max_working_set),
         });
     }
 

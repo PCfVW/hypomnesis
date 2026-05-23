@@ -219,6 +219,18 @@ pub(super) struct MetalQueryResult {
     /// this is the system DRAM size, which is also the GPU's address
     /// space ceiling.
     pub dedicated_video_memory: u64,
+    /// Apple-driver-recommended GPU working-set budget in bytes —
+    /// `MTLDevice.recommendedMaxWorkingSetSize`. The value the kernel
+    /// projects as "memory the GPU can hold resident with good
+    /// performance," factoring in compression + system reserves. Used
+    /// as the macOS analogue of `free_bytes` on a discrete GPU.
+    ///
+    /// Empirical justification for using this Metal-driver value over
+    /// the libSystem alternatives originally proposed (free + purgeable,
+    /// inactive, `hw.memsize − Σ graphics_footprint`) is in
+    /// `__reports__/macos_ledger/13-findings_metal_budget_v0.md`. None
+    /// of the libSystem alternatives lands within useful accuracy.
+    pub recommended_max_working_set: u64,
     /// Adapter name — the CPU brand string
     /// (`machdep.cpu.brand_string`, e.g. `"Apple M3 Pro"`). On Apple
     /// Silicon the CPU and GPU share the same die, so the CPU brand
@@ -239,6 +251,53 @@ static GRAPHICS_FOOTPRINT_INDEX: OnceLock<i32> = OnceLock::new();
 /// `LEDGER_TEMPLATE_INFO` buffer growth. Set well above the observed
 /// count to absorb future kernel additions without truncation.
 const LEDGER_TEMPLATE_BUF_CAP: usize = 128;
+
+/// Cached system-default Metal device handle.
+///
+/// Acquired on first call to [`recommended_max_working_set_size`] via
+/// `MTLCreateSystemDefaultDevice`; never re-acquired thereafter. The
+/// driver's per-device cost of acquiring a handle is ~100-200 µs the
+/// first time and unmeasurable thereafter — see
+/// `__reports__/macos_ledger/13-findings_metal_budget_v0.md` § Results
+/// Tables 2 and 3.
+///
+/// `Option<...>` because the call may legitimately return `nil` on a
+/// system without a usable Metal device (extremely rare on Apple
+/// Silicon; possible in very locked-down environments).
+static METAL_DEVICE: OnceLock<
+    Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>>,
+> = OnceLock::new();
+
+/// Compile-time guard: if a future `objc2-metal` version drops the
+/// `Send + Sync` supertraits on `MTLDevice`, this fails to compile and
+/// the implementation must switch to a newtype with explicit
+/// `unsafe impl Send + Sync` to remain safe in the static `OnceLock`.
+const _: fn() = || {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    >();
+};
+
+/// Read `MTLDevice.recommendedMaxWorkingSetSize` for the system-default
+/// device, caching the device handle for the life of the process.
+///
+/// Returns `None` if `MTLCreateSystemDefaultDevice` returns `nil`. The
+/// caller (in [`query`]) falls back to the total physical DRAM in that
+/// case — that's the conservative upper bound on what the GPU can hold.
+fn recommended_max_working_set_size() -> Option<u64> {
+    // objc2-metal's bindings expose this property as a safe method; no
+    // `unsafe` block is required at the call site. The trait import is
+    // necessary because the method is a trait method, not an inherent.
+    use objc2_metal::MTLDevice;
+    METAL_DEVICE
+        // `MTLCreateSystemDefaultDevice` is declared `extern "C-unwind"`
+        // and doesn't coerce to a closure type; wrap in `||` so
+        // `get_or_init` accepts it.
+        .get_or_init(|| objc2_metal::MTLCreateSystemDefaultDevice())
+        .as_ref()
+        .map(|d| d.recommendedMaxWorkingSetSize())
+}
 
 /// Read a `u64` `sysctlbyname` value (e.g. `b"hw.memsize\0"`).
 ///
@@ -482,9 +541,16 @@ pub(super) fn query(idx: u32) -> Option<MetalQueryResult> {
     let dedicated_video_memory = read_sysctl_u64(b"hw.memsize\0")?;
     let adapter_name = read_sysctl_string(b"machdep.cpu.brand_string\0")
         .unwrap_or_else(|| "Apple GPU".into());
+    // Falls back to total DRAM if the Metal driver cannot be loaded
+    // (extremely rare on Apple Silicon; possible on very locked-down
+    // environments). `dedicated_video_memory` is the conservative
+    // upper bound on what `free_bytes` can be.
+    let recommended_max_working_set =
+        recommended_max_working_set_size().unwrap_or(dedicated_video_memory);
     Some(MetalQueryResult {
         current_usage,
         dedicated_video_memory,
+        recommended_max_working_set,
         adapter_name,
     })
 }

@@ -32,7 +32,7 @@ hypomnesis = "0.2"
 
 The default feature set (`nvml`, `dxgi`, `nvidia-smi-fallback`) covers process RSS and per-process / device-wide GPU memory on both Windows (`IDXGIAdapter3` + `NVML`) and Linux (`NVML`), with a `nvidia-smi` subprocess fallback. The `dxgi` dependency on the `windows` crate is target-conditional — Linux users pay nothing for it.
 
-On macOS, the `metal` feature is in the default set and provides process RSS and per-process GPU memory via libSystem syscalls (`task_info`, `ledger`, `sysctl`). No extra crate dependency is required — Apple Silicon's unified memory architecture means a single libSystem-backed path covers both RAM and VRAM.
+On macOS, the `metal` feature is in the default set. Process RSS and per-process GPU memory come from libSystem syscalls (`task_info`, `ledger`, `sysctl`). The device-wide "free" figure comes from `MTLDevice.recommendedMaxWorkingSetSize` via the `objc2-metal` binding (target-conditional, macOS-only) — no libSystem signal on Apple Silicon UMA approximates Apple's own kernel-projected GPU working-set budget within useful accuracy. See `__reports__/macos_ledger/13-findings_metal_budget_v0.md` for the empirical comparison.
 
 For candle-mi-compatible delta and printing helpers (`MemoryReport`, `print_delta`, `print_before_after`, `ram_mb`, `vram_mb`):
 
@@ -143,7 +143,7 @@ The stderr summary is always printed, even when the table is empty, so interacti
 | Metric | Windows | Linux | macOS |
 |--------|---------|-------|-------|
 | Process RSS | `K32GetProcessMemoryInfo` | `/proc/self/status` (no `unsafe`) | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
-| Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` |
+| Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
 | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
 | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 

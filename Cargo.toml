@@ -28,12 +28,28 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
+# Optional: MTLDevice.recommendedMaxWorkingSetSize for device-wide free-bytes
+# on Apple Silicon UMA. Empirical justification for reintroducing this
+# Apple-framework dep against the v0.2.2 KT report's libSystem-only stance
+# is in __reports__/macos_ledger/13-findings_metal_budget_v0.md (on the
+# claude/sanity-vm-budget-vs-metal branch). Minimal feature set: only
+# `MTLDevice` is enabled, which gates both `MTLCreateSystemDefaultDevice`
+# and the device-property reads we need. Default features (which include
+# every other MTL* type) are deliberately disabled.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = { version = "0.3", optional = true, default-features = false, features = ["MTLDevice"] }
+# Direct dep on `objc2` — already transitive via objc2-metal, but the
+# static OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> declaration
+# in src/gpu/metal.rs names types from `objc2::rc` and `objc2::runtime`,
+# which requires the crate to be in scope as a direct dependency.
+objc2 = { version = "0.6", optional = true }
+
 [features]
 default = ["nvml", "nvidia-smi-fallback", "dxgi", "metal"]
 nvml = ["dep:libloading"]
 nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
-metal = []
+metal = ["dep:objc2-metal", "dep:objc2"]
 report = []
 debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the

@@ -6,11 +6,11 @@
 //! Subcommands:
 //!
 //! - `hmn` (default) — one line per visible GPU with free / total `VRAM`.
-//!   Uses [`hypomnesis::Snapshot::all`], so on Windows the AMD / Intel
-//!   `iGPU` surfaces alongside the NVIDIA dGPU(s).
-//! - `hmn ps` — list compute processes holding GPU memory across one
-//!   or all NVIDIA devices. Compute-only — see the `--help` text and
-//!   the rustdoc for [`hypomnesis::gpu_processes`].
+//!   Uses [`hypomnesis::Snapshot::all`].
+//! - `hmn ps` — list processes holding GPU memory across one or all
+//!   visible devices. Per-platform caveats are listed under the
+//!   `Limitations` section of `hmn --help` and in the rustdoc for
+//!   [`hypomnesis::gpu_processes`].
 //!
 //! Install with `cargo install hypomnesis --features cli`.
 
@@ -27,19 +27,22 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
     about = "GPU memory CLI: device summary (default) + compute-process listing (`hmn ps`).",
     long_about = "GPU memory CLI for hypomnesis.\n\
                   \n\
-                  Default subcommand: prints one line per visible GPU with free / total VRAM \
-                  (NVIDIA dGPUs, plus AMD / Intel iGPUs on Windows).\n\
+                  Default subcommand: prints one line per visible GPU with free / total VRAM.\n\
                   \n\
-                  `hmn ps`: lists compute processes holding GPU memory.\n\
+                  `hmn ps`: lists processes holding GPU memory.\n\
                   \n\
-                  Limitations:\n\
-                  - Compute-only. Both backends (NVML on Linux, nvidia-smi on Windows) only \
-                  see processes with an active CUDA context. Browsers using GPU compositing, \
-                  games, and pure-graphics apps do not appear.\n\
-                  - Windows process names may be `?` for protected processes whose image name \
-                  nvidia-smi cannot read.\n\
-                  - The R570 u64::MAX sentinel and used > total checks are applied per-row; \
-                  affected rows are dropped rather than reported as garbage."
+                  Limitations (per platform):\n\
+                  - Windows / Linux (NVIDIA backends): only processes with an active CUDA \
+                  context appear. Browsers using GPU compositing, games, and pure-graphics \
+                  apps do not appear.\n\
+                  - Windows: process names may be `?` for protected processes whose image \
+                  name nvidia-smi cannot read.\n\
+                  - Windows / Linux (NVIDIA): the R570 u64::MAX sentinel and used > total \
+                  checks are applied per-row; affected rows are dropped rather than reported \
+                  as garbage.\n\
+                  - macOS: values reflect currently-resident GPU pages; the kernel evicts \
+                  idle Metal pages, so the same PID may report different values across \
+                  calls."
 )]
 struct Cli {
     /// Subcommand. Omitted for the default device-summary view.
@@ -50,13 +53,15 @@ struct Cli {
 /// Subcommand tree for `hmn`.
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// List compute processes holding GPU memory (CUDA-only).
+    /// List processes holding GPU memory. See `hmn --help` Limitations
+    /// for per-platform caveats (Windows / Linux NVIDIA backends are
+    /// CUDA-context-only; macOS reports currently-resident pages).
     Ps {
         /// Filter to processes whose PID matches.
         #[arg(long, value_name = "PID")]
         pid: Option<u32>,
-        /// Filter to a single GPU index. Default: every NVIDIA device
-        /// reported by `device_count()`.
+        /// Filter to a single GPU index. Default: every device reported
+        /// by `device_count()`.
         #[arg(long, value_name = "INDEX")]
         device: Option<u32>,
         /// Emit a JSON array (one object per row) instead of the

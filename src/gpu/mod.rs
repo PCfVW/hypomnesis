@@ -96,10 +96,7 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
         // `MTLDevice.recommendedMaxWorkingSetSize` is the kernel-projected
         // soft cap on what the GPU can hold resident with good
         // performance (acts as `free`). `used = total - free` is the
-        // implied non-GPU reserve. See
-        // `__reports__/macos_ledger/13-findings_metal_budget_v0.md` for
-        // the empirical justification — every libSystem-only alternative
-        // diverges from Apple's number by 37%+.
+        // implied non-GPU reserve.
         return Ok(GpuDeviceInfo {
             index,
             name: Some(d.adapter_name),

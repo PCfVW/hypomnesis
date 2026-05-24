@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-05-13
+> *Three platforms. Same contract. Resident-bytes everywhere.*
+
+Adds first-class macOS support on Apple Silicon (Apple Silicon M-series). Process RSS, per-process GPU memory, and the compute-process listing come from libSystem syscalls (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`) with no third-party Apple-framework wrapper. The device-wide GPU budget is read via `MTLDevice.recommendedMaxWorkingSetSize` through a minimal `objc2-metal` dependency — the only Apple-API call that isn't satisfiable from libSystem alone. Cross-platform `used_bytes` semantics are preserved (resident bytes — the macOS `graphics_footprint` ledger entry behaves the same way Windows `WorkingSetSize` and Linux `VmRSS` do under memory pressure). The `metal` Cargo feature joins the default set alongside `dxgi`; both are platform-gated so the wrong-platform user pays nothing.
+
+### Added
+
+- **macOS process RSS** via `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` (`src/ram.rs`) — new `darwin_ffi` submodule mirrors the existing `win_ffi` pattern: one `unsafe extern "C"` block for `task_info` and `mach_task_self`, one `#[repr(C)] TaskVmInfo` struct laid out per XNU `<mach/task_info.h>`, one `macos_rss()` returning `phys_footprint` (the kernel-ledger figure backing Activity Monitor's "Memory" column). The `process_rss()` dispatcher gains a `#[cfg(target_os = "macos")]` arm.
+- **macOS per-process GPU memory** via `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` (`src/gpu/metal.rs`, new file) — the BSD kernel ledger syscall reads the resident GPU-attributed bytes of any same-user PID without `task_for_pid` or any entitlement. The `graphics_footprint` entry index is discovered by name at first call via `LEDGER_TEMPLATE_INFO` and cached in a `OnceLock<i32>` (no hardcoded index — the kernel's entry ordering is not part of any stable ABI).
+- **macOS device-wide GPU budget** via `MTLDevice.recommendedMaxWorkingSetSize` (`src/gpu/metal.rs`) — Apple's own kernel-projected GPU working-set budget, read once into a `OnceLock<Retained<ProtocolObject<dyn MTLDevice>>>` and reused for every subsequent `device_info()` call (sub-microsecond per-query cost after a one-time ~200 µs init). A `const _: fn() = || { … }` block compile-asserts that the cached type is `Send + Sync` so the static design is verified at build time.
+- **macOS compute-process listing** via `proc_listpids(PROC_ALL_PIDS, …)` + per-PID `ledger` + `proc_pidpath` (`src/gpu/metal.rs`) — enumerates every same-user PID, reads each one's `graphics_footprint`, retains rows with footprint > 0, populates `name` via `proc_pidpath`. Cross-user PIDs surface as `EPERM` and are silently skipped; never panics, never returns `Err`.
+- **`GpuQuerySource::Metal` variant** (`src/snapshot.rs`) — added always, unconditionally, mirroring the policy of `Dxgi`/`Nvml`/`NvidiaSmi`: every variant is reachable from the crate root on every platform so cross-platform smoke tests can instantiate them.
+- **`metal` Cargo feature**, added to the default set — gated by `cfg(all(target_os = "macos", feature = "metal"))` at the module-import site in `src/gpu/mod.rs` so Windows/Linux builds compile it out. Pattern mirrors the existing `dxgi`/`windows` target-conditional dep.
+- **`tests/macos_smoke.rs`** — six `#[cfg(target_os = "macos")]`-gated integration tests covering RSS, device count, device info (Apple-brand name + ≥ 8 GiB total), `process_gpu_info` (Metal source, per-process flag), `gpu_processes` shape (closes parity with the cross-platform `gpu_processes_returns_result_or_no_gpu_source`), and `Snapshot::now` GPU-presence on macOS. Two tests are `#[ignore]`-gated because they require Apple Silicon with a usable Metal device.
+
+### Changed
+
+- **Capabilities tables in `README.md` and `src/lib.rs` gain a macOS column**, with one row per metric (`task_info`, `sysctl hw.memsize` + `MTLDevice.recommendedMaxWorkingSetSize`, `ledger.graphics_footprint`, `proc_listpids` + per-PID `ledger` + `proc_pidpath`, no fallback).
+- **`tests/smoke.rs::gpu_processes_returns_result_or_no_gpu_source`** now accepts `GpuQuerySource::Metal` as a valid row source, alongside `Nvml` and `NvidiaSmi`. DXGI remains intentionally excluded — it cannot enumerate other PIDs.
+- **`tests/live_gpu.rs::process_gpu_info_returns_expected_source_per_platform`** gains a `#[cfg(target_os = "macos")]` arm asserting `info.source == GpuQuerySource::Metal` and `info.is_per_process`, completing per-platform parity with the existing Windows + Linux arms.
+- **`README.md` adds a "macOS UMA semantics: what `free_bytes` means" subsection** explaining that on Apple Silicon UMA the discrete-GPU "free vs total" mental model is replaced by `MTLDevice.recommendedMaxWorkingSetSize` (the kernel-projected GPU working-set budget) over `sysctl hw.memsize` (physical DRAM), and noting that per-process `used_bytes` exhibits resident-bytes volatility under memory pressure — identical to Windows `WorkingSetSize` and Linux `VmRSS`.
+- **`docs/hypomnesis-brief.md`** — tagline, capabilities bullets, comparison table, future-platforms line, and closing line all updated to reflect macOS as a shipped platform rather than a future consideration.
+
+### Dependencies
+
+- **`objc2-metal = "0.3"`** added under `[target.'cfg(target_os = "macos")'.dependencies]` as `optional = true` with `default-features = false, features = ["MTLDevice"]` — the minimal feature set that gates both `MTLCreateSystemDefaultDevice` and the device-property reads. Default features (every other `MTL*` type) are deliberately disabled.
+- **`objc2 = "0.6"`** added as a sibling dep — already a transitive of `objc2-metal`, but the static `OnceLock<Retained<ProtocolObject<dyn MTLDevice>>>` in `src/gpu/metal.rs` names types from `objc2::rc` and `objc2::runtime`, so the crate must be a direct dependency.
+- Both are pulled in only when the `metal` feature is active AND the target is `target_os = "macos"`. Windows and Linux dependency graphs are unchanged.
+
+
 
 > *Sharper, not wider. Same surface — easier to test against, kinder to repeat callers.*
 

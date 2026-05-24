@@ -1,6 +1,6 @@
 # `hypomnesis` — a brief
 
-> *External measurement of a Rust process's RAM and VRAM state, on Windows and Linux. The counterpart to `anamnesis`.*
+> *External measurement of a Rust process's RAM and VRAM state, on Windows, Linux, and macOS. The counterpart to `anamnesis`.*
 
 ---
 
@@ -13,9 +13,10 @@ candle-mi's v0.1.1–v0.1.3 VRAM saga produced ~889 lines of battle-tested Rust 
 | Device-wide NVML memory info (Linux + Windows) | `nvml-wrapper`, `all-smi`, `hardware-query` |
 | Per-process NVML compute processes (Linux) | `nvml-wrapper` |
 | **Per-process VRAM on Windows via `IDXGIAdapter3::QueryVideoMemoryInfo`** | **No one — candle-mi was first** |
+| **Per-process Metal VRAM on macOS via `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint`** | **No one — hypomnesis is first** |
 | NVML `u64::MAX` sentinel handling (R570 driver bug on RTX 5060 Ti) | No one |
 | `nvidia-smi` subprocess fallback with sanity checks | No one (generally) |
-| Process RSS via `K32GetProcessMemoryInfo` / `/proc/self/status` | `memory-stats` does RSS, but not combined with VRAM |
+| Process RSS via `K32GetProcessMemoryInfo` / `/proc/self/status` / `task_info(TASK_VM_INFO_PURGEABLE)` | `memory-stats` does RSS, but not combined with VRAM and not on macOS |
 
 The Windows DXGI implementation is the **hard part** — the multi-day deep dive through WDDM architecture, COM pointer manipulation (`IDXGIFactory1` → `IDXGIAdapter` → `IDXGIAdapter3` cast chain), and adapter enumeration (skipping Microsoft Basic Render Driver, handling dedicated vs shared memory segments). It belongs in the ecosystem as a reusable crate, not buried inside a single application's source tree.
 
@@ -35,19 +36,20 @@ Availability confirmed on crates.io and GitHub (2026-04-29). The v0.0.1 placehol
 ## Scope (v0.1)
 
 **Included:**
-- Process RAM (RSS): Windows, Linux
-- Device-wide GPU memory (total/free/used): NVML on Linux + Windows
-- Per-process GPU memory: NVML on Linux, DXGI on Windows
-- `nvidia-smi` subprocess fallback (device-wide, both platforms)
+- Process RAM (RSS): Windows, Linux, macOS
+- Device-wide GPU memory (total/free/used): NVML on Linux + Windows, `sysctl hw.memsize` + `MTLDevice.recommendedMaxWorkingSetSize` on macOS
+- Per-process GPU memory: NVML on Linux, DXGI on Windows, `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` on macOS
+- Compute-process listing: NVML + `/proc/<pid>/comm` on Linux, `nvidia-smi` on Windows, `proc_listpids` + per-PID `ledger` + `proc_pidpath` on macOS
+- `nvidia-smi` subprocess fallback (device-wide, Windows + Linux)
 - Robust sentinel handling (NVML `u64::MAX`, used > total sanity check)
-- GPU adapter name (from DXGI description field, Windows only)
+- GPU adapter name (DXGI description field on Windows, NVML on Linux, CPU brand string on macOS)
 
 **Explicitly out of scope:**
 - Inference tracking (candle-mi's `sync_and_trim_gpu` stays in candle-mi — it's candle/cudarc-specific)
 - CPU counters, thermal monitoring, power draw (that's `sysinfo`, `all-smi`, `hardware-query` territory)
-- Apple Metal (future consideration, not v0.1)
-- AMD ROCm (future consideration, not v0.1)
-- MacOS support beyond what's trivial
+- AMD ROCm (future consideration)
+- Intel Macs (the macOS path detects Apple Silicon via `machdep.cpu.brand_string`; Intel Macs fall through to `NoGpuSource`)
+- Multi-GPU Mac Pro with eGPU (single-device assumption on Apple Silicon)
 
 ## Proposed public API
 
@@ -196,4 +198,4 @@ The full crate skeleton is in place, CI is green, and the v0.0.1 placeholder is 
 - Not a GUI or TUI (use `ratatui`, `iced` for that)
 - Not opinionated about *when* to measure — caller's responsibility
 
-One crate, one job: **tell you what's currently in this process's memory, precisely, across Windows and Linux.**
+One crate, one job: **tell you what's currently in this process's memory, precisely, across Windows, Linux, and macOS.**

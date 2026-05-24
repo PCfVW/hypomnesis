@@ -30,15 +30,8 @@
 //! The `graphics_footprint` ledger entry index is **discovered by name
 //! at first call** via `LEDGER_TEMPLATE_INFO`, then cached in a
 //! `OnceLock<i32>`. The index observed on macOS 26.x happens to be 36
-//! but must never be hardcoded as a literal expression — see R01
-//! § Reference Design and § Open Questions.
-//!
-//! References:
-//! - R01 (`__reports__/macos_ledger/09-knowledge_transfer_v3.md`) —
-//!   reference design and name-lookup mandate.
-//! - R02 (`__reports__/macos_ledger/05-findings_writes_v0.md`) —
-//!   writes-corrected probe; Appendix A's C externs map 1:1 to the
-//!   Rust externs declared in [`libsystem_ffi`].
+//! but must never be hardcoded as a literal expression — the entry
+//! ordering is not part of any stable ABI guarantee.
 
 use core::ffi::{c_char, c_void};
 use std::sync::OnceLock;
@@ -48,7 +41,7 @@ use std::sync::OnceLock;
 /// Every entry below is a stable libSystem syscall available on every
 /// macOS install since at least 10.15. No header from
 /// `Kernel.framework` is shipped in user space for `ledger()`, so the
-/// signature is declared inline per R02 Appendix A's `bridge.h`.
+/// signature is declared inline against the kernel's documented ABI.
 mod libsystem_ffi {
     use core::ffi::{c_char, c_void};
 
@@ -72,14 +65,12 @@ mod libsystem_ffi {
         ///
         /// `cmd` selects the operation: [`super::LEDGER_INFO`],
         /// [`super::LEDGER_TEMPLATE_INFO`], [`super::LEDGER_ENTRY_INFO_V2`].
-        /// `arg1`/`arg2`/`arg3` semantics depend on `cmd`; see R02
-        /// Appendix A `bridge.h` for the call conventions actually
-        /// exercised here. All three args have C type `caddr_t`
-        /// (`char *`) — for `LEDGER_ENTRY_INFO_V2` arg1 is the PID
-        /// reinterpreted as a pointer-sized integer, mirroring R02's
-        /// `caddr_t(bitPattern: Int(pid))`. Returns `0` on success,
-        /// `-1` with `errno` set on failure (e.g. `EPERM` for cross-user
-        /// reads).
+        /// `arg1`/`arg2`/`arg3` semantics depend on `cmd`. All three
+        /// have C type `caddr_t` (`char *`); for `LEDGER_ENTRY_INFO_V2`
+        /// arg1 is the target PID reinterpreted as a pointer-sized
+        /// integer (kernel convention — see `osfmk/kern/ledger.c`).
+        /// Returns `0` on success, `-1` with `errno` set on failure
+        /// (e.g. `EPERM` for cross-user reads).
         pub(super) unsafe fn ledger(
             cmd: i32,
             arg1: *mut c_void,
@@ -131,7 +122,7 @@ mod libsystem_ffi {
 /// `LEDGER_INFO` command — query the per-PID ledger metadata
 /// (`li_entries` = number of entries, `li_name` = task name).
 ///
-/// Value from XNU `osfmk/kern/ledger.h` (and R02 Appendix A `bridge.h`).
+/// Value from XNU `osfmk/kern/ledger.h`.
 const LEDGER_INFO: i32 = 0;
 
 /// `LEDGER_TEMPLATE_INFO` command — fetch the array of
@@ -179,8 +170,8 @@ struct LedgerTemplateInfo {
 ///
 /// One row per ledger entry, returned in an array by
 /// `ledger(LEDGER_ENTRY_INFO_V2, pid, …)`. Layout is the V2 ABI
-/// (sizeof = 88 bytes) verified empirically in R02 Appendix A; this
-/// is **not** the V1 `ledger_entry_info` shape.
+/// (sizeof = 88 bytes) — this is **not** the V1 `ledger_entry_info`
+/// shape.
 ///
 /// See: <https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/ledger.h>
 #[repr(C)]
@@ -225,11 +216,13 @@ pub(super) struct MetalQueryResult {
     /// performance," factoring in compression + system reserves. Used
     /// as the macOS analogue of `free_bytes` on a discrete GPU.
     ///
-    /// Empirical justification for using this Metal-driver value over
-    /// the libSystem alternatives originally proposed (free + purgeable,
-    /// inactive, `hw.memsize − Σ graphics_footprint`) is in
-    /// `__reports__/macos_ledger/13-findings_metal_budget_v0.md`. None
-    /// of the libSystem alternatives lands within useful accuracy.
+    /// Apple's driver is the only source for this number: libSystem
+    /// alternatives — `(free + purgeable) × page_size`, that plus
+    /// inactive, and `hw.memsize − Σ graphics_footprint` — diverge
+    /// from it by 37% to 91% on a typical Apple Silicon host. The
+    /// gap is structural, not noise: Apple's figure bakes in
+    /// kernel compression / eviction capability that no kernel-state
+    /// counter exposes.
     pub recommended_max_working_set: u64,
     /// Adapter name — the CPU brand string
     /// (`machdep.cpu.brand_string`, e.g. `"Apple M3 Pro"`). On Apple
@@ -242,7 +235,7 @@ pub(super) struct MetalQueryResult {
 /// ledger entry array. Resolved by name on first read via
 /// [`resolve_graphics_footprint_index`]; observed value on macOS 26.x
 /// is 36, but the literal must never appear as a Rust expression value
-/// — see R01 § Reference Design.
+/// — the kernel's entry ordering is not part of any stable ABI.
 static GRAPHICS_FOOTPRINT_INDEX: OnceLock<i32> = OnceLock::new();
 
 /// Maximum ledger-entry count probed at init.
@@ -257,9 +250,8 @@ const LEDGER_TEMPLATE_BUF_CAP: usize = 128;
 /// Acquired on first call to [`recommended_max_working_set_size`] via
 /// `MTLCreateSystemDefaultDevice`; never re-acquired thereafter. The
 /// driver's per-device cost of acquiring a handle is ~100-200 µs the
-/// first time and unmeasurable thereafter — see
-/// `__reports__/macos_ledger/13-findings_metal_budget_v0.md` § Results
-/// Tables 2 and 3.
+/// first time and unmeasurable thereafter (the property read on a
+/// cached handle is a synchronised getter on the device object).
 ///
 /// `Option<...>` because the call may legitimately return `nil` on a
 /// system without a usable Metal device (extremely rare on Apple
@@ -387,11 +379,11 @@ fn read_sysctl_string(name: &[u8]) -> Option<String> {
 
 /// Discover the `graphics_footprint` ledger entry index by name.
 ///
-/// Calls `ledger(LEDGER_TEMPLATE_INFO, buf, &count, NULL)` per R02
-/// Appendix A and linear-scans the returned [`LedgerTemplateInfo`]
-/// rows for an `lti_name` whose decoded prefix equals
-/// `"graphics_footprint"`. Returns `None` if the syscall fails or the
-/// entry is absent on this kernel.
+/// Calls `ledger(LEDGER_TEMPLATE_INFO, buf, &count, NULL)` and
+/// linear-scans the returned [`LedgerTemplateInfo`] rows for an
+/// `lti_name` whose decoded prefix equals `"graphics_footprint"`.
+/// Returns `None` if the syscall fails or the entry is absent on this
+/// kernel.
 #[allow(unsafe_code)]
 fn resolve_graphics_footprint_index() -> Option<i32> {
     // SAFETY: `LedgerTemplateInfo` is `#[repr(C)]` with only `c_char`
@@ -407,8 +399,7 @@ fn resolve_graphics_footprint_index() -> Option<i32> {
     let mut count: i32 = LEDGER_TEMPLATE_BUF_CAP as i32;
     // SAFETY: arg1 is the template buffer (`caddr_t`); arg2 is the
     // count in/out pointer (`caddr_t` aliasing an `i32`); arg3 is
-    // NULL. R02 Appendix A's `loadTemplateNames` uses the same
-    // convention. The kernel writes at most `count` rows and updates
+    // NULL. The kernel writes at most `count` rows and updates
     // `*count` with the number actually written.
     let rc = unsafe {
         libsystem_ffi::ledger(
@@ -457,9 +448,10 @@ fn resolve_graphics_footprint_index() -> Option<i32> {
 /// syscall fails (e.g. cross-user PID without root → `EPERM`, or PID
 /// has exited → `ESRCH`), or the index has not yet been resolvable.
 ///
-/// R02 Round 05 confirmed this entry tracks Metal-written pages on
-/// Apple Silicon UMA — see `__reports__/macos_ledger/05-findings_writes_v0.md`
-/// Table 1 (Phase 1→2 delta = +256 MiB, exact).
+/// `graphics_footprint` tracks resident Metal-written pages on Apple
+/// Silicon UMA: writing every byte of a 256 MiB `MTLBuffer` increases
+/// the entry by exactly 256 MiB (resident-bytes semantics, the macOS
+/// analogue of Windows `WorkingSetSize` and Linux `VmRSS`).
 #[allow(unsafe_code)]
 fn read_graphics_footprint(pid: i32) -> Option<u64> {
     let idx = *GRAPHICS_FOOTPRINT_INDEX
@@ -483,16 +475,15 @@ fn read_graphics_footprint(pid: i32) -> Option<u64> {
     // CAST: usize → i32, bounded by `LEDGER_TEMPLATE_BUF_CAP` (128).
     #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let mut count: i32 = LEDGER_TEMPLATE_BUF_CAP as i32;
-    // CAST: i32 PID → *mut c_void, mirroring R02 Appendix A's
-    // `caddr_t(bitPattern: Int(pid))` — the syscall reinterprets
-    // arg1's pointer-sized bits as the target PID. PIDs are
-    // non-negative on macOS, so the sign-loss step is benign.
+    // CAST: i32 PID → *mut c_void. The `ledger` syscall reinterprets
+    // arg1's pointer-sized bits as the target PID (kernel convention,
+    // mirroring `caddr_t(bitPattern: Int(pid))` on the Swift side).
+    // PIDs are non-negative on macOS, so the sign-loss step is benign.
     #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
     let pid_as_ptr = pid as usize as *mut c_void;
     // SAFETY: arg1 is the PID encoded as a pointer; arg2 is the
-    // entry-array buffer; arg3 is the count in/out. R02 Appendix A's
-    // `readLedger` uses the exact same argument layout. Cross-user
-    // PIDs surface as a non-zero return (errno = EPERM); PID-exited
+    // entry-array buffer; arg3 is the count in/out. Cross-user PIDs
+    // surface as a non-zero return (errno = EPERM); PID-exited
     // surfaces as ESRCH. Both are folded into `None` below.
     let rc = unsafe {
         libsystem_ffi::ledger(

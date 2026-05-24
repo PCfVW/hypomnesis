@@ -215,14 +215,6 @@ pub(super) struct MetalQueryResult {
     /// projects as "memory the GPU can hold resident with good
     /// performance," factoring in compression + system reserves. Used
     /// as the macOS analogue of `free_bytes` on a discrete GPU.
-    ///
-    /// Apple's driver is the only source for this number: libSystem
-    /// alternatives — `(free + purgeable) × page_size`, that plus
-    /// inactive, and `hw.memsize − Σ graphics_footprint` — diverge
-    /// from it by 37% to 91% on a typical Apple Silicon host. The
-    /// gap is structural, not noise: Apple's figure bakes in
-    /// kernel compression / eviction capability that no kernel-state
-    /// counter exposes.
     pub recommended_max_working_set: u64,
     /// Adapter name — the CPU brand string
     /// (`machdep.cpu.brand_string`, e.g. `"Apple M3 Pro"`). On Apple

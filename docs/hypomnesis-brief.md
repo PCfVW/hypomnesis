@@ -49,7 +49,6 @@ Availability confirmed on crates.io and GitHub (2026-04-29). The v0.0.1 placehol
 - CPU counters, thermal monitoring, power draw (that's `sysinfo`, `all-smi`, `hardware-query` territory)
 - AMD ROCm (future consideration)
 - Intel Macs (the macOS path detects Apple Silicon via `machdep.cpu.brand_string`; Intel Macs fall through to `NoGpuSource`)
-- Multi-GPU Mac Pro with eGPU (single-device assumption on Apple Silicon)
 
 ## Proposed public API
 

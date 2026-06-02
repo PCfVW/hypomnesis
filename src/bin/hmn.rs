@@ -195,6 +195,21 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
         }
     }
 
+    // Human-facing display order: VRAM descending so the biggest
+    // consumers land at the top (the row a user asking "what's
+    // eating my GPU memory?" wants to see first), name ascending
+    // for tie-break grouping (duplicate-name processes like
+    // `msedgewebview2.exe` cluster together), then PID ascending
+    // for stable order across runs when name + bytes tie. The
+    // library's `gpu_processes()` returns rows PID-sorted; this
+    // overrides that for display only.
+    rows.sort_by(|a, b| {
+        b.used_bytes
+            .cmp(&a.used_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+
     if json {
         print!("{}", format_ps_json(&rows));
     } else {

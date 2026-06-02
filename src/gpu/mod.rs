@@ -309,7 +309,7 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
     // Windows primary path below.
     #[cfg(all(target_os = "linux", feature = "nvml"))]
     if let Some(rows) = nvml::list_compute_processes(device_index) {
-        let entries: Vec<GpuProcessEntry> = rows
+        let mut entries: Vec<GpuProcessEntry> = rows
             .into_iter()
             .map(|(pid, used_bytes)| {
                 let name = read_proc_comm(pid);
@@ -321,6 +321,7 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
                 }
             })
             .collect();
+        sort_by_pid(&mut entries);
         return Ok(entries);
     }
 
@@ -332,7 +333,7 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
     // isn't registered.
     #[cfg(all(windows, feature = "pdh"))]
     if let Ok(rows) = pdh::query_per_process_vram(device_index) {
-        let entries: Vec<GpuProcessEntry> = rows
+        let mut entries: Vec<GpuProcessEntry> = rows
             .into_iter()
             .map(|(pid, used_bytes)| GpuProcessEntry {
                 pid,
@@ -341,12 +342,13 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
                 source: GpuQuerySource::Pdh,
             })
             .collect();
+        sort_by_pid(&mut entries);
         return Ok(entries);
     }
 
     #[cfg(feature = "nvidia-smi-fallback")]
     if let Some(rows) = nvidia_smi::query_compute_apps(device_index) {
-        let entries: Vec<GpuProcessEntry> = rows
+        let mut entries: Vec<GpuProcessEntry> = rows
             .into_iter()
             .map(|app| GpuProcessEntry {
                 pid: app.pid,
@@ -355,11 +357,32 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
                 source: GpuQuerySource::NvidiaSmi,
             })
             .collect();
+        sort_by_pid(&mut entries);
         return Ok(entries);
     }
 
     bounds_check(device_index)?;
     Err(HypomnesisError::NoGpuSource)
+}
+
+/// Sort [`gpu_processes`] output by `pid` ascending.
+///
+/// Deterministic across calls — the same input state produces the
+/// same output order, regardless of whether the underlying backend
+/// (NVML, PDH, nvidia-smi) emits its rows in PID order, allocation
+/// order, or hash-iteration order. Matches the convention every
+/// other process-listing API uses (Unix `ps`, `top -p`, `NVML`'s
+/// `nvmlDeviceGetComputeRunningProcesses`). Library consumers can
+/// re-sort as they please without fighting an opinionated default —
+/// the CLI's `hmn ps`, for instance, re-sorts by `used_bytes`
+/// descending for human-facing display.
+#[cfg(any(
+    all(target_os = "linux", feature = "nvml"),
+    all(windows, feature = "pdh"),
+    feature = "nvidia-smi-fallback"
+))]
+fn sort_by_pid(entries: &mut [GpuProcessEntry]) {
+    entries.sort_by_key(|e| e.pid);
 }
 
 /// Read `/proc/<pid>/comm` (Linux only), returning the trimmed

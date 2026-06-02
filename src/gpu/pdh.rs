@@ -535,6 +535,42 @@ impl Drop for HandleGuard {
 /// 32767 chars) is out of scope — no realistic executable uses it.
 const NAME_BUF_LEN: usize = 1024;
 
+/// Synthetic display name for `PID 4`, the Windows kernel
+/// pseudo-process.
+///
+/// Defined as a named constant so the security-relevant intent —
+/// "this row is the kernel itself, not an unresolvable user process" —
+/// is greppable from a single place.
+const KERNEL_PROCESS_NAME: &str = "[kernel]";
+
+/// Map a Windows PID to a synthetic name when the PID is a kernel
+/// pseudo-process (currently only `PID 4`). Returns `None` for every
+/// other PID — the caller falls through to the `OpenProcess`-based
+/// lookup.
+///
+/// Why a special case: `PID 4` is the Windows kernel itself, owning
+/// all kernel-mode threads. There is no executable image to read, so
+/// [`QueryFullProcessImageNameW`] fails for fundamental architectural
+/// reasons rather than privilege reasons. Without this special case,
+/// `PID 4` would render as `?` in `hmn ps` — indistinguishable from a
+/// foreign-user process that would resolve under elevation, which is
+/// a real security signal hidden by the noise. Mapping `PID 4` to
+/// `[kernel]` removes the most common false positive from the
+/// "unresolvable even elevated" set, leaving only genuinely
+/// suspicious `?` rows to investigate.
+///
+/// The PID-4-is-kernel convention has been stable on Windows since
+/// at least NT 5.0 (Windows 2000); Microsoft has not signalled any
+/// intent to change it.
+#[must_use]
+const fn kernel_name_for_pid(pid: u32) -> Option<&'static str> {
+    if pid == 4 {
+        Some(KERNEL_PROCESS_NAME)
+    } else {
+        None
+    }
+}
+
 /// Resolve a `Windows` `PID` to its executable basename, using
 /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)` +
 /// `QueryFullProcessImageNameW(PROCESS_NAME_WIN32, ...)` followed by
@@ -563,6 +599,16 @@ const NAME_BUF_LEN: usize = 1024;
 #[allow(unsafe_code)]
 #[must_use]
 pub(super) fn name_from_pid_windows(pid: u32) -> Option<String> {
+    // Kernel pseudo-process short-circuit: PID 4 has no executable
+    // image, so the OpenProcess path below would fail and produce a
+    // `?` row. Render it as `[kernel]` instead so it isn't confused
+    // with foreign-user / privileged processes that would resolve
+    // under elevation. See `kernel_name_for_pid` doc-comment for the
+    // security rationale.
+    if let Some(synthetic) = kernel_name_for_pid(pid) {
+        return Some(synthetic.to_owned());
+    }
+
     // SAFETY: OpenProcess is a documented Win32 function. Failure modes
     // (PID exited, access-denied, invalid PID) all surface as Err; the
     // .ok()? converts that into a None return without leaking any
@@ -642,7 +688,7 @@ fn basename_from_path(path: &str) -> String {
     clippy::missing_docs_in_private_items
 )]
 mod tests {
-    use super::{basename_from_path, parse_instance_name, parse_multi_string};
+    use super::{basename_from_path, kernel_name_for_pid, parse_instance_name, parse_multi_string};
 
     #[test]
     fn parse_instance_name_basic() {
@@ -780,5 +826,27 @@ mod tests {
         // Just a separator → empty basename.
         assert_eq!(basename_from_path("\\"), "");
         assert_eq!(basename_from_path("/"), "");
+    }
+
+    // -------------------------------------------------------------------
+    // kernel_name_for_pid tests (Wave C follow-up — security relevance)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn kernel_name_for_pid_recognises_pid_4() {
+        // The Windows kernel pseudo-process. Synthetic name is `[kernel]`.
+        assert_eq!(kernel_name_for_pid(4), Some("[kernel]"));
+    }
+
+    #[test]
+    fn kernel_name_for_pid_returns_none_for_other_pids() {
+        // No other PIDs are special-cased. The caller falls through to
+        // OpenProcess.
+        assert_eq!(kernel_name_for_pid(0), None);
+        assert_eq!(kernel_name_for_pid(1), None);
+        assert_eq!(kernel_name_for_pid(3), None);
+        assert_eq!(kernel_name_for_pid(5), None);
+        assert_eq!(kernel_name_for_pid(1000), None);
+        assert_eq!(kernel_name_for_pid(u32::MAX), None);
     }
 }

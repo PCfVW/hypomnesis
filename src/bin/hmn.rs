@@ -51,11 +51,18 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
                   - `?` in the NAME column means the calling user cannot resolve the process's \
                   name via `OpenProcess`. Most cases (system services, other-user processes \
                   like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` is run as Administrator. \
-                  PID 4 remains `?` even elevated — that's the Windows kernel pseudo-process; \
-                  there is no executable image to read. PPL-protected processes (Windows \
-                  Defender, anti-cheat engines) would also remain `?` even elevated, but \
+                  The Windows kernel itself (PID 4) is rendered as `[kernel]`, not `?`, so \
+                  it does not pollute the suspicious-`?` set. PPL-protected processes \
+                  (Windows Defender, anti-cheat engines) would remain `?` even elevated, but \
                   typically do not appear in `hmn ps` output unless they are actively \
                   holding GPU memory.\n\
+                  - Security note: a `?` row holding substantial VRAM that does not resolve \
+                  under elevation is worth investigating — by construction it is either a \
+                  process owned by another user / running as SYSTEM, a PPL-protected process, \
+                  or a transient race. None of these are intrinsically malicious, but on a \
+                  single-user desktop none of them should hold large amounts of GPU memory \
+                  unexpectedly. The protected-count parenthetical on the summary line is \
+                  intentionally surfaced because this distinction matters.\n\
                   - Pre-WDDM-2.0 Windows falls back to `nvidia-smi --query-compute-apps`, \
                   which is compute-only and may show `[N/A]` memory under consumer WDDM \
                   (parser drops those rows).\n\

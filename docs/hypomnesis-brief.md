@@ -12,7 +12,8 @@ candle-mi's v0.1.1–v0.1.3 VRAM saga produced ~889 lines of battle-tested Rust 
 |-----------|--------------------------|
 | Device-wide NVML memory info (Linux + Windows) | `nvml-wrapper`, `all-smi`, `hardware-query` |
 | Per-process NVML compute processes (Linux) | `nvml-wrapper` |
-| **Per-process VRAM on Windows via `IDXGIAdapter3::QueryVideoMemoryInfo`** | **No one — candle-mi was first** |
+| **Per-process VRAM on Windows for the calling process via `IDXGIAdapter3::QueryVideoMemoryInfo`** | **No one — candle-mi was first** |
+| **Per-process VRAM on Windows for foreign processes via `PDH` `\GPU Process Memory(*)\Dedicated Usage` (consumer `WDDM 2.0`+)** | **No one — hypomnesis v0.2.2 was first** |
 | NVML `u64::MAX` sentinel handling (R570 driver bug on RTX 5060 Ti) | No one |
 | `nvidia-smi` subprocess fallback with sanity checks | No one (generally) |
 | Process RSS via `K32GetProcessMemoryInfo` / `/proc/self/status` | `memory-stats` does RSS, but not combined with VRAM |

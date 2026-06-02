@@ -131,10 +131,15 @@ The stderr summary is always printed, even when the table is empty, so interacti
 
 **Limitations** (intrinsic to the underlying data sources, not bugs):
 
-1. **Compute-only.** `hmn ps` enumerates only processes with an active `CUDA` context. Browsers using GPU compositing, games, and pure-graphics apps do not appear. This is a property of the `NVML` and `nvidia-smi --query-compute-apps` data sources.
-2. **Windows process names may be `?`.** `nvidia-smi` writes a literal `?` for protected processes whose image name it cannot read. The library preserves this as `Some("?")` rather than failing the row.
-3. **WDDM bug parity.** The `R570` `u64::MAX` sentinel and `used > total` corruption checks the library handles for the calling process are applied per-row in `hmn ps`; affected rows are dropped rather than reported as garbage.
-4. **Windows compute-process attribution is `nvidia-smi`-backed.** `IDXGIAdapter3::QueryVideoMemoryInfo` only answers for the *calling* process, and `NVML`'s per-process query returns `NVML_VALUE_NOT_AVAILABLE` under `WDDM`. So `hmn ps` on Windows is honest-but-second-class compared to Linux's clean `NVML` enumeration.
+1. **Per-platform semantics differ — compute-only on Linux, all-GPU-users on Windows.** `hmn ps` on Linux (via `NVML`'s `nvmlDeviceGetComputeRunningProcesses_v3`) enumerates only processes with an active `CUDA` context — browsers using GPU compositing, games, and pure-graphics apps do not appear. `hmn ps` on Windows (via `PDH`'s `\GPU Process Memory(*)\Dedicated Usage`) enumerates **every** process holding GPU memory — the desktop compositor (`dwm.exe`), browsers, games, and `CUDA` / compute alongside. The semantic shift reflects what each platform's kernel actually accounts for; check the `source` field on `GpuProcessEntry` if you care about the distinction.
+
+2. **Windows `used_bytes` reflects WDDM's *dedicated commit*, not resident set.** Under `WDDM` a process can commit GPU allocations exceeding physical `VRAM` — the kernel pages them via the shared system memory budget. Numbers exceeding the device's total `VRAM` are real, not bugs: they match Task Manager's `Dedicated GPU memory` column. (Example: on a 16 GiB GPU, a heavy browser process can show 15+ GiB committed.)
+
+3. **`?` in the NAME column means the calling user cannot resolve that PID's name via `OpenProcess`.** Most cases — system services, other-user processes like `dwm.exe`, `csrss.exe`, vendor services — resolve when `hmn ps` is run as Administrator. **PID 4 remains `?` even elevated**: it's the Windows kernel pseudo-process, with no executable image to read. `PPL`-protected processes (Windows Defender, anti-cheat engines) would also remain `?` even elevated, but typically do not appear in `hmn ps` output unless they are actively holding GPU memory.
+
+4. **Pre-`WDDM 2.0` Windows falls back to `nvidia-smi --query-compute-apps`.** Vanishingly rare in 2026 — `WDDM 2.0` shipped with Windows 10 1709 (October 2017). On the fallback path, `hmn ps` is compute-only (matching the Linux semantic) and `used_memory` may be `[N/A]` under `WDDM` (parser drops those rows). The `source` field on `GpuProcessEntry` reads `GpuQuerySource::NvidiaSmi` rather than `GpuQuerySource::Pdh` on this path.
+
+5. **`R570`-class driver-bug filtering.** The `u64::MAX` sentinel (`R570` driver bug on `RTX 5060 Ti` and similar consumer GeForce cards) and the `used > total` corruption checks are applied per-row in `hmn ps`; affected rows are dropped rather than reported as garbage.
 
 ## Capabilities
 

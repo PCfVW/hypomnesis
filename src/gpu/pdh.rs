@@ -27,6 +27,23 @@
 //! has a stable C ABI, and is callable from any program — no admin
 //! elevation required for read access.
 //!
+//! # `used_bytes` semantics: dedicated commit, not resident set
+//!
+//! The `Dedicated Usage` counter reports `VidMm`'s **committed**
+//! allocation total for the process, **not** what is resident on the
+//! GPU at sample time. Under `WDDM` a process can commit GPU
+//! allocations exceeding physical `VRAM` — the kernel pages the
+//! committed pages over the shared system memory budget. As a result,
+//! a single heavy-graphics process (browser, modern editor with GPU
+//! compositing) can show `used_bytes` exceeding the device's physical
+//! `VRAM`; on a 16 GiB card the maintainer has observed Firefox at
+//! ~15 GiB committed. These numbers are not bugs in `hypomnesis` —
+//! they match what Task Manager's `Dedicated GPU memory` column
+//! displays, because both ultimately read from the same `VidMm`
+//! ledger. Consumers wanting "resident bytes only" must look
+//! elsewhere (there is no public `WDDM` API for it; ETW provides it
+//! at the cost of a heavy session setup, out of scope here).
+//!
 //! # Adapter targeting
 //!
 //! Each `PDH` instance name encodes the WDDM adapter `LUID`. To

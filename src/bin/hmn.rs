@@ -8,9 +8,12 @@
 //! - `hmn` (default) — one line per visible GPU with free / total `VRAM`.
 //!   Uses [`hypomnesis::Snapshot::all`], so on Windows the AMD / Intel
 //!   `iGPU` surfaces alongside the NVIDIA dGPU(s).
-//! - `hmn ps` — list compute processes holding GPU memory across one
-//!   or all NVIDIA devices. Compute-only — see the `--help` text and
-//!   the rustdoc for [`hypomnesis::gpu_processes`].
+//! - `hmn ps` — list processes holding GPU memory across one or all
+//!   visible NVIDIA devices. On Linux (`NVML`) the list is
+//!   compute-only; on Windows (`PDH`, `WDDM 2.0`+) the list includes
+//!   every GPU memory holder (compositor, browsers, games, compute).
+//!   See the `--help` Limitations text and the rustdoc for
+//!   [`hypomnesis::gpu_processes`] for the per-platform breakdown.
 //!
 //! Install with `cargo install hypomnesis --features cli`.
 
@@ -19,25 +22,43 @@ use std::fmt::Write as _;
 use clap::{Parser, Subcommand};
 use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
 
-/// `hmn` CLI: device summary plus compute-process listing.
+/// `hmn` CLI: device summary plus GPU-process listing.
 #[derive(Parser, Debug)]
 #[command(
     name = "hmn",
     version,
-    about = "GPU memory CLI: device summary (default) + compute-process listing (`hmn ps`).",
+    about = "GPU memory CLI: device summary (default) + GPU-process listing (`hmn ps`).",
     long_about = "GPU memory CLI for hypomnesis.\n\
                   \n\
                   Default subcommand: prints one line per visible GPU with free / total VRAM \
                   (NVIDIA dGPUs, plus AMD / Intel iGPUs on Windows).\n\
                   \n\
-                  `hmn ps`: lists compute processes holding GPU memory.\n\
+                  `hmn ps`: lists processes holding GPU memory.\n\
                   \n\
-                  Limitations:\n\
-                  - Compute-only. Both backends (NVML on Linux, nvidia-smi on Windows) only \
-                  see processes with an active CUDA context. Browsers using GPU compositing, \
-                  games, and pure-graphics apps do not appear.\n\
-                  - Windows process names may be `?` for protected processes whose image name \
-                  nvidia-smi cannot read.\n\
+                  Limitations (per-platform):\n\
+                  - Linux / NVML backend is compute-only — only processes with an active CUDA \
+                  context appear. Browsers using GPU compositing, games, and pure-graphics \
+                  apps do not.\n\
+                  - Windows / PDH backend (consumer WDDM 2.0+) lists EVERY GPU memory holder: \
+                  the desktop compositor, browsers, games, and CUDA / compute alongside. The \
+                  semantic shift from the Linux compute-only list is intentional and reflects \
+                  what `VidMm` actually accounts for.\n\
+                  - Windows `used_bytes` reflects WDDM's dedicated commit, not resident set. \
+                  Under WDDM a process can commit GPU allocations exceeding physical VRAM — \
+                  the kernel pages them via the shared system memory budget. Numbers \
+                  exceeding the device's total VRAM are real, not bugs; they match Task \
+                  Manager's `Dedicated GPU memory` column.\n\
+                  - `?` in the NAME column means the calling user cannot resolve the process's \
+                  name via `OpenProcess`. Most cases (system services, other-user processes \
+                  like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` is run as Administrator. \
+                  PID 4 remains `?` even elevated — that's the Windows kernel pseudo-process; \
+                  there is no executable image to read. PPL-protected processes (Windows \
+                  Defender, anti-cheat engines) would also remain `?` even elevated, but \
+                  typically do not appear in `hmn ps` output unless they are actively \
+                  holding GPU memory.\n\
+                  - Pre-WDDM-2.0 Windows falls back to `nvidia-smi --query-compute-apps`, \
+                  which is compute-only and may show `[N/A]` memory under consumer WDDM \
+                  (parser drops those rows).\n\
                   - The R570 u64::MAX sentinel and used > total checks are applied per-row; \
                   affected rows are dropped rather than reported as garbage."
 )]
@@ -50,7 +71,10 @@ struct Cli {
 /// Subcommand tree for `hmn`.
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// List compute processes holding GPU memory (CUDA-only).
+    /// List processes holding GPU memory. On Linux: compute-only via
+    /// NVML. On Windows / WDDM 2.0+: every GPU memory holder via PDH
+    /// (compositor, browsers, compute, etc.). See `hmn --help`
+    /// Limitations for the full per-platform breakdown.
     Ps {
         /// Filter to processes whose PID matches.
         #[arg(long, value_name = "PID")]
@@ -223,20 +247,43 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
     // 2>/dev/null to suppress.
     eprintln!(
         "hmn: {}",
-        format_ps_summary(rows.len(), pid_filter, device_filter)
+        format_ps_summary(&rows, pid_filter, device_filter)
     );
     Ok(())
 }
 
 /// Build the stderr summary string for `hmn ps`. Format:
-/// `<N> compute process[es] found[ matching <filters>].`. Filter clause
-/// is appended only when at least one filter is active so the
-/// no-filter case stays terse.
-fn format_ps_summary(count: usize, pid_filter: Option<u32>, device_filter: Option<u32>) -> String {
+/// `<N> GPU process[es] found[ matching <filters>][ (<M> protected — re-run elevated for names)].`
+///
+/// Three appendices, each elided when not applicable:
+///
+/// - **Filter clause** (` matching pid=N device=M`): appended only
+///   when at least one filter is active.
+/// - **Protected clause** (` (<M> protected — re-run elevated for names)`):
+///   appended only when at least one row has `name: None`. Surfaces
+///   the actionable hint that Administrator-level access would
+///   resolve those names — most are system services or other-user
+///   processes the calling user can't `OpenProcess` against. PID 4
+///   (the Windows kernel pseudo-process) remains unresolvable even
+///   elevated, but it's the only one in practice on a typical
+///   machine.
+///
+/// "GPU process" / "GPU processes" (not the previous-release
+/// "compute process" / "compute processes") because on the `PDH`
+/// Windows path the list includes every GPU memory holder
+/// (compositor, browsers, games, compute), not just `CUDA` contexts.
+fn format_ps_summary(
+    rows: &[PsRow],
+    pid_filter: Option<u32>,
+    device_filter: Option<u32>,
+) -> String {
+    let count = rows.len();
+    let protected = rows.iter().filter(|r| r.name.is_none()).count();
+
     let noun = if count == 1 {
-        "compute process"
+        "GPU process"
     } else {
-        "compute processes"
+        "GPU processes"
     };
 
     let mut out = format!("{count} {noun} found");
@@ -250,6 +297,11 @@ fn format_ps_summary(count: usize, pid_filter: Option<u32>, device_filter: Optio
     if let Some(clause) = filter_clause {
         let _ = write!(out, " matching {clause}");
     }
+
+    if protected > 0 {
+        let _ = write!(out, " ({protected} protected — re-run elevated for names)");
+    }
+
     out.push('.');
     out
 }
@@ -601,49 +653,118 @@ mod tests {
 
     // --- format_ps_summary (stderr count line) ---
 
+    /// Build `n` `PsRow`s with resolved names — used by tests that
+    /// focus on count and filter clauses, not the protected-count
+    /// parenthetical (which is exercised separately).
+    fn unprotected_rows(n: u32) -> Vec<PsRow> {
+        (0..n)
+            .map(|i| row(1000 + i, Some("test.exe"), 0, 0, None))
+            .collect()
+    }
+
+    /// Build `n` `PsRow`s with `name: None` — used to exercise the
+    /// protected-count parenthetical.
+    fn protected_rows(n: u32) -> Vec<PsRow> {
+        (0..n).map(|i| row(2000 + i, None, 0, 0, None)).collect()
+    }
+
     #[test]
     fn format_ps_summary_zero_no_filters() {
         assert_eq!(
-            format_ps_summary(0, None, None),
-            "0 compute processes found."
+            format_ps_summary(&unprotected_rows(0), None, None),
+            "0 GPU processes found."
         );
     }
 
     #[test]
     fn format_ps_summary_one_no_filters() {
-        // "1 compute process found." — singular noun, no filter clause.
-        assert_eq!(format_ps_summary(1, None, None), "1 compute process found.");
+        // "1 GPU process found." — singular noun, no filter clause.
+        assert_eq!(
+            format_ps_summary(&unprotected_rows(1), None, None),
+            "1 GPU process found."
+        );
     }
 
     #[test]
     fn format_ps_summary_many_no_filters() {
         assert_eq!(
-            format_ps_summary(7, None, None),
-            "7 compute processes found."
+            format_ps_summary(&unprotected_rows(7), None, None),
+            "7 GPU processes found."
         );
     }
 
     #[test]
     fn format_ps_summary_with_pid_filter() {
         assert_eq!(
-            format_ps_summary(0, Some(12345), None),
-            "0 compute processes found matching pid=12345."
+            format_ps_summary(&unprotected_rows(0), Some(12345), None),
+            "0 GPU processes found matching pid=12345."
         );
     }
 
     #[test]
     fn format_ps_summary_with_device_filter() {
         assert_eq!(
-            format_ps_summary(2, None, Some(0)),
-            "2 compute processes found matching device=0."
+            format_ps_summary(&unprotected_rows(2), None, Some(0)),
+            "2 GPU processes found matching device=0."
         );
     }
 
     #[test]
     fn format_ps_summary_with_both_filters() {
         assert_eq!(
-            format_ps_summary(1, Some(99), Some(1)),
-            "1 compute process found matching pid=99 device=1."
+            format_ps_summary(&unprotected_rows(1), Some(99), Some(1)),
+            "1 GPU process found matching pid=99 device=1."
+        );
+    }
+
+    // -- protected-count parenthetical --
+
+    #[test]
+    fn format_ps_summary_one_protected_appends_parenthetical() {
+        let mut rows = unprotected_rows(3);
+        rows.extend(protected_rows(1));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "4 GPU processes found (1 protected — re-run elevated for names)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_many_protected_appends_parenthetical() {
+        let mut rows = unprotected_rows(28);
+        rows.extend(protected_rows(4));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "32 GPU processes found (4 protected — re-run elevated for names)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_all_protected() {
+        let rows = protected_rows(3);
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (3 protected — re-run elevated for names)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_zero_protected_elides_parenthetical() {
+        // No protected rows → no parenthetical, matching the
+        // filter-clause "only when active" convention.
+        assert_eq!(
+            format_ps_summary(&unprotected_rows(5), None, None),
+            "5 GPU processes found."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_protected_with_filters_both_appear() {
+        let mut rows = unprotected_rows(2);
+        rows.extend(protected_rows(1));
+        assert_eq!(
+            format_ps_summary(&rows, Some(42), Some(0)),
+            "3 GPU processes found matching pid=42 device=0 (1 protected — re-run elevated for names)."
         );
     }
 }

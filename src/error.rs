@@ -70,10 +70,10 @@ pub enum HypomnesisError {
 
     /// No GPU measurement source was usable.
     ///
-    /// Returned when `NVML`, `DXGI`, and `nvidia-smi` all failed (or were
-    /// disabled by feature flags) for a single query.
+    /// Returned when `NVML`, `DXGI`, `PDH`, and `nvidia-smi` all failed
+    /// (or were disabled by feature flags) for a single query.
     #[error(
-        "no GPU measurement source available (NVML, DXGI, and nvidia-smi all failed or are disabled)"
+        "no GPU measurement source available (NVML, DXGI, PDH, and nvidia-smi all failed or are disabled)"
     )]
     NoGpuSource,
 

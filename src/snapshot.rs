@@ -119,9 +119,13 @@ pub struct GpuProcessEntry {
     /// Process name. `None` when no name source is available — `PDH`
     /// rows whose `OpenProcess` was access-denied (cross-user, protected
     /// processes), or `NVML` rows whose `/proc/<pid>/comm` was
-    /// unreadable. On Windows under the `nvidia-smi` fallback,
-    /// `Some("?")` for protected processes whose image name `nvidia-smi`
-    /// itself could not read.
+    /// unreadable. Two synthetic non-`None` values are produced:
+    /// `Some("[kernel]")` for `PID 4` on the Windows `PDH` path (the
+    /// kernel pseudo-process has no executable image, but is
+    /// special-cased so it doesn't pollute the "unresolvable even
+    /// elevated" set); `Some("?")` for protected processes on the
+    /// Windows `nvidia-smi` fallback path, where `nvidia-smi` itself
+    /// writes a literal `?` rather than failing the row.
     pub name: Option<String>,
     /// GPU memory used by this process in bytes.
     pub used_bytes: u64,

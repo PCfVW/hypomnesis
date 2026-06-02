@@ -78,9 +78,11 @@ fn gpu_processes_returns_result_or_no_gpu_source() {
     // On a runner without NVIDIA / nvidia-smi, gpu_processes(0) typically
     // returns Err(NoGpuSource) (or DeviceIndexOutOfRange when bounds_check
     // catches a count source). Either is acceptable. On a host with
-    // NVIDIA, returns Ok(Vec) — possibly empty if no CUDA processes are
-    // active. We assert on shape only so the test passes on hosted
-    // runners and on hardware alike.
+    // NVIDIA, returns Ok(Vec) — possibly empty on Linux (NVML compute-only,
+    // no CUDA process active) or essentially never empty on Windows (PDH
+    // surfaces every GPU memory holder, compositor included). We assert
+    // on shape only so the test passes on hosted runners and on hardware
+    // alike.
     match hypomnesis::gpu_processes(0) {
         Ok(rows) => {
             for row in &rows {

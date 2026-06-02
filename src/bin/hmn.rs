@@ -271,9 +271,11 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
 ///   the actionable hint that Administrator-level access would
 ///   resolve those names — most are system services or other-user
 ///   processes the calling user can't `OpenProcess` against. PID 4
-///   (the Windows kernel pseudo-process) remains unresolvable even
-///   elevated, but it's the only one in practice on a typical
-///   machine.
+///   (the Windows kernel pseudo-process) is special-cased to render
+///   as `[kernel]` rather than `?` and therefore does **not**
+///   contribute to this count; the remaining count is genuinely
+///   foreign-user / `SYSTEM` / `PPL`-protected / transient-race
+///   processes that elevation can actually help with.
 ///
 /// "GPU process" / "GPU processes" (not the previous-release
 /// "compute process" / "compute processes") because on the `PDH`

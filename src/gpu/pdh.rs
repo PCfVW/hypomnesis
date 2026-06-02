@@ -622,12 +622,12 @@ pub(super) fn name_from_pid_windows(pid: u32) -> Option<String> {
     let mut size: u32 = NAME_BUF_LEN as u32;
 
     // SAFETY: guard.handle is valid (RAII invariant). buf is a stack
-    // array sized to BUF_LEN; the PWSTR wrapper points into it. `size`
-    // is initialised to the buffer capacity and rewritten by the call
-    // to the actual length written (excluding the trailing NUL on
-    // success). PROCESS_NAME_WIN32 (= 0) requests Win32-namespace path
-    // format (drive-letter `C:\...`), not the NT namespace
-    // (`\Device\HarddiskVolume...`).
+    // array sized to NAME_BUF_LEN; the PWSTR wrapper points into it.
+    // `size` is initialised to the buffer capacity and rewritten by
+    // the call to the actual length written (excluding the trailing
+    // NUL on success). PROCESS_NAME_WIN32 (= 0) requests Win32-
+    // namespace path format (drive-letter `C:\...`), not the NT
+    // namespace (`\Device\HarddiskVolume...`).
     let result = unsafe {
         QueryFullProcessImageNameW(
             guard.handle,
@@ -638,9 +638,9 @@ pub(super) fn name_from_pid_windows(pid: u32) -> Option<String> {
     };
 
     if result.is_err() {
-        // BORROW: explicit `drop(guard)` not needed — Drop runs at end
-        // of scope. Documenting the cleanup invariant here keeps the
-        // happy path symmetrical.
+        // Drop runs at end of scope; explicit `drop(guard)` not
+        // needed. Naming the cleanup invariant here keeps the
+        // error-path and happy-path symmetrical for readers.
         return None;
     }
 
@@ -678,7 +678,7 @@ fn basename_from_path(path: &str) -> String {
 
 // -----------------------------------------------------------------------
 // Inline tests (pure helpers only — FFI exercised via live tests in
-// tests/live_pdh.rs in Wave B)
+// `tests/live_pdh.rs`)
 // -----------------------------------------------------------------------
 
 #[cfg(test)]

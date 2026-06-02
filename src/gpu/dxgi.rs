@@ -149,6 +149,13 @@ pub(super) fn query(idx: u32) -> Option<DxgiQueryResult> {
 /// the friendlier `DXGI` `Description` string without paying for a full
 /// `query`. Returns `None` if `idx` is past the NVIDIA-adapter count or
 /// any DXGI call fails.
+///
+/// Gated `cfg(feature = "nvml")` to match the sole call site at
+/// [`crate::gpu::device_info`], which only invokes this helper when
+/// `NVML` produced the primary numerics. Without `nvml` the function
+/// would be dead code (relevant only on the unusual `pdh + dxgi`
+/// without `nvml` feature combination).
+#[cfg(feature = "nvml")]
 #[allow(unsafe_code)]
 pub(super) fn adapter_name(idx: u32) -> Option<String> {
     // SAFETY: same justification as in `query`.
@@ -197,6 +204,11 @@ pub(super) fn adapter_name(idx: u32) -> Option<String> {
 /// belonging to the target adapter. The `LUID` is the stable kernel-side
 /// identifier of a `WDDM` adapter — preserved across reboots until
 /// driver-level reconfiguration.
+///
+/// Gated `cfg(feature = "pdh")` to match its sole call site. Without
+/// `pdh` the function is dead code (relevant only on the unusual
+/// `dxgi` without `pdh` feature combination).
+#[cfg(feature = "pdh")]
 #[allow(unsafe_code)]
 pub(super) fn adapter_luid(idx: u32) -> Option<(i32, u32)> {
     // SAFETY: CreateDXGIFactory1 is a documented COM factory function.

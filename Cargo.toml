@@ -22,17 +22,27 @@ libloading = { version = "0.9", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
 
 # Optional: per-process VRAM on Windows via DXGI (IDXGIAdapter3::QueryVideoMemoryInfo)
+# and PDH (Performance Data Helper for `\GPU Process Memory(*)\Dedicated Usage`).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Performance",
 ] }
 
 [features]
-default = ["nvml", "nvidia-smi-fallback", "dxgi"]
+default = ["nvml", "nvidia-smi-fallback", "dxgi", "pdh"]
 nvml = ["dep:libloading"]
 nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
+# `pdh` (Windows-only effect) reads `\GPU Process Memory(*)\Dedicated Usage`
+# via Performance Data Helper for foreign-process per-process VRAM under
+# consumer WDDM, where NVML returns NVML_VALUE_NOT_AVAILABLE. Shares the
+# `windows` crate dep with `dxgi`; target-conditional, no-op off-Windows.
+# Depends on `dxgi` because `pdh` correlates PDH counter instances against
+# the calling adapter's LUID, which is fetched via the DXGI adapter walk
+# already used by the calling-process fast path (`dxgi::adapter_luid`).
+pdh = ["dep:windows", "dxgi"]
 report = []
 debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the

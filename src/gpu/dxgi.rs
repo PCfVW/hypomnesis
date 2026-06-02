@@ -184,6 +184,48 @@ pub(super) fn adapter_name(idx: u32) -> Option<String> {
     }
 }
 
+/// `LUID` of the `idx`-th NVIDIA-filtered adapter, as `(high, low)`.
+///
+/// Walks `EnumAdapters1` with the same NVIDIA-filter rule as [`query`]
+/// (vendor ID `0x10DE` + non-zero `DedicatedVideoMemory`) and returns
+/// the `(HighPart, LowPart)` pair of the adapter's `LUID` from
+/// `DXGI_ADAPTER_DESC.AdapterLuid`. Returns `None` if `idx` is past the
+/// count of qualifying adapters, or if any `DXGI` call fails.
+///
+/// Consumed by [`crate::gpu::pdh`] to filter PDH counter instances of
+/// the form `pid_NNNN_luid_0xHHHHHHHH_0xHHHHHHHH_phys_N` down to those
+/// belonging to the target adapter. The `LUID` is the stable kernel-side
+/// identifier of a `WDDM` adapter — preserved across reboots until
+/// driver-level reconfiguration.
+#[allow(unsafe_code)]
+pub(super) fn adapter_luid(idx: u32) -> Option<(i32, u32)> {
+    // SAFETY: CreateDXGIFactory1 is a documented COM factory function.
+    // It initializes COM internally if needed; the returned IDXGIFactory1
+    // is reference-counted and released when `factory` is dropped.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+
+    let mut raw_idx: u32 = 0;
+    let mut nvidia_count: u32 = 0;
+
+    loop {
+        // SAFETY: EnumAdapters1 returns Err when raw_idx is out of range.
+        let adapter1 = unsafe { factory.EnumAdapters1(raw_idx) }.ok()?;
+        let adapter: IDXGIAdapter = adapter1.cast().ok()?;
+
+        // SAFETY: GetDesc fills DXGI_ADAPTER_DESC. Adapter handle valid.
+        let desc = unsafe { adapter.GetDesc() }.ok()?;
+
+        if desc.VendorId == NVIDIA_VENDOR_ID && desc.DedicatedVideoMemory > 0 {
+            if nvidia_count == idx {
+                return Some((desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart));
+            }
+            nvidia_count += 1;
+        }
+
+        raw_idx += 1;
+    }
+}
+
 /// One non-NVIDIA, non-`MSBR` `DXGI` adapter that exposes some form of GPU memory.
 ///
 /// Returned by [`enumerate_non_nvidia`] for `Snapshot::all()` on Windows

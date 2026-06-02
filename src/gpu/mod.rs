@@ -23,6 +23,9 @@ mod nvml;
 #[cfg(all(windows, feature = "dxgi"))]
 mod dxgi;
 
+#[cfg(all(windows, feature = "pdh"))]
+mod pdh;
+
 #[cfg(feature = "nvidia-smi-fallback")]
 mod nvidia_smi;
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pdh` Cargo feature + `src/gpu/pdh.rs` (PDH FFI bindings and counter enumeration)** — Wave A of the v0.2.2 roadmap. New default-on Cargo feature (Windows-only effect; depends on `dxgi` for the adapter `LUID` walk) gating a new module that reads `\GPU Process Memory(*)\Dedicated Usage` from `pdh.dll`. The module exposes `pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<(u32, u64)>>`, aggregating PDH's per-`(pid, segment)` rows into one entry per process before returning. Closes the per-process-memory visibility gap on consumer Windows / `WDDM`, where `NVML` returns `NVML_VALUE_NOT_AVAILABLE` and `nvidia-smi --query-compute-apps` writes `[N/A]`. Wave A scaffolding only — Wave B wires the module into the `gpu_processes()` dispatcher and adds Win32-native process-name lookup; until then the new code is gated `dead_code`-allowed at module level. Module doc-comment documents the KB 4490156 graphics-cache-flush drift (irrelevant to CUDA / compute workloads). 11 inline unit tests for the pure helpers (`parse_instance_name`, `parse_multi_string`). See [`docs/roadmap-v0.2.2.md`](docs/roadmap-v0.2.2.md) Wave A and the [PDH module doc-comment](src/gpu/pdh.rs) for the data-source rationale and the deferred segmented-API rationale.
+- **`HypomnesisError::Pdh(String)` variant** (`src/error.rs`) — Wave A companion. Patch-safe under `#[non_exhaustive]`. Follows the existing one-variant-per-backend pattern (`Ram`, `Nvml`, `Dxgi`, `NvidiaSmi`); renders as `"PDH error: ..."` via `thiserror` derive. The `Display`-vs-structured-fields contract doc-comment updated to list `Self::Pdh` alongside the other backend-error variants.
+- **`crate::gpu::dxgi::adapter_luid(idx) -> Option<(i32, u32)>` helper** — Wave A companion in `src/gpu/dxgi.rs`. Walks `EnumAdapters1` with the same NVIDIA-filter rule as the existing `query` / `adapter_name` helpers and returns the `(HighPart, LowPart)` pair of the `idx`-th NVIDIA adapter's `LUID`. Consumed by `pdh::query_per_process_vram` to correlate PDH counter instances against a specific adapter.
+
 ## [0.2.1] - 2026-05-13
 
 > *Sharper, not wider. Same surface — easier to test against, kinder to repeat callers.*

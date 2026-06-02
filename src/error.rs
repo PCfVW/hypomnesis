@@ -13,8 +13,8 @@
 /// suitable for logs, library-tier error reporting, and `?`-propagation where
 /// the consumer is content with the default rendering. Structured fields
 /// ([`Self::DeviceIndexOutOfRange`]'s `index` / `count`, the inner `String` of
-/// [`Self::Nvml`] / [`Self::Dxgi`] / [`Self::NvidiaSmi`]) are the **canonical
-/// source** for any consumer that wants to:
+/// [`Self::Nvml`] / [`Self::Dxgi`] / [`Self::Pdh`] / [`Self::NvidiaSmi`]) are
+/// the **canonical source** for any consumer that wants to:
 ///
 /// - Localize the message to a non-English language.
 /// - Restyle for a CLI / GUI / JSON output (column-aligned tables,
@@ -47,6 +47,13 @@ pub enum HypomnesisError {
     /// `IDXGIAdapter3` cast, or interface call).
     #[error("DXGI error: {0}")]
     Dxgi(String),
+
+    /// `PDH` (Windows Performance Data Helper) query failed (counter
+    /// enumeration, counter add, value collection, or instance parsing
+    /// for the `GPU Process Memory` counter set). Includes the case
+    /// where the counter set is unregistered on pre-`WDDM 2.0` systems.
+    #[error("PDH error: {0}")]
+    Pdh(String),
 
     /// `nvidia-smi` subprocess invocation failed or produced unparseable output.
     #[error("nvidia-smi error: {0}")]

@@ -71,19 +71,16 @@
 //! kept private deliberately — see its doc-comment for the deferred
 //! segmented-API rationale.
 
-// Wave-A scaffolding: this module is introduced in v0.2.2 Wave A
-// (FFI bindings, instance parser, query implementation, unit tests).
-// Wave B wires `query_per_process_vram` into `gpu_processes()` and
-// removes this allow. Without it the wave-A commit would fail
-// `-D warnings` since nothing inside the module is reachable yet.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Performance::{
     PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PERF_DETAIL_WIZARD,
     PdhAddCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectItemsW,
     PdhGetFormattedCounterValue, PdhOpenQueryW,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -486,6 +483,137 @@ pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<(u32, u64)
 }
 
 // -----------------------------------------------------------------------
+// Win32 process-name lookup (companion to PDH per-process VRAM)
+// -----------------------------------------------------------------------
+
+/// `RAII` guard for a `Win32` `HANDLE`.
+///
+/// Closes the handle via [`CloseHandle`] on drop. Mirrors the
+/// `QueryGuard` pattern above for the `PDH` query handle: every
+/// successful `OpenProcess` is paired with exactly one `CloseHandle`
+/// regardless of which return path the caller takes.
+struct HandleGuard {
+    /// `Win32` handle returned by [`OpenProcess`]. Treated as an
+    /// opaque kernel-side capability; never read or modified from
+    /// userspace except through `Win32` APIs.
+    handle: HANDLE,
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was obtained from a successful
+        // OpenProcess call (constructor invariant). CloseHandle is
+        // documented as safe to call on any valid handle. The return
+        // status is intentionally discarded — cleanup is best-effort.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Buffer length (in UTF-16 chars) for [`name_from_pid_windows`]'s
+/// path read. ~2 KiB stack. Covers any Win32-namespace executable
+/// path on a real system; the `\\?\` long-path namespace (up to
+/// 32767 chars) is out of scope — no realistic executable uses it.
+const NAME_BUF_LEN: usize = 1024;
+
+/// Resolve a `Windows` `PID` to its executable basename, using
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)` +
+/// `QueryFullProcessImageNameW(PROCESS_NAME_WIN32, ...)` followed by
+/// [`basename_from_path`].
+///
+/// Returns `None` on any of these failure modes:
+///
+/// - The target process exited between enumeration and lookup
+///   (`OpenProcess` fails with `ERROR_INVALID_PARAMETER`).
+/// - Access denied (cross-user or protected processes — Windows
+///   restricts handle acquisition the same way `task_for_pid` does
+///   on macOS). Mirrors the Linux behaviour where unreadable
+///   `/proc/<pid>/comm` yields `None`.
+/// - `QueryFullProcessImageNameW` fails (very short buffer,
+///   pathologically long path, kernel error). Buffer is sized to
+///   [`NAME_BUF_LEN`] UTF-16 chars — covers any reasonable Win32
+///   path; the `\\?\` long-path namespace (up to 32767 chars) is
+///   intentionally not supported because no realistic executable
+///   lives there.
+///
+/// **Privilege model.** No admin or special privilege required for
+/// processes owned by the calling user. Foreign-user PIDs return
+/// `None` without `SeDebugPrivilege`; this is the documented Windows
+/// security gate, not a hypomnesis limitation. Callers wanting
+/// system-wide visibility should run elevated.
+#[allow(unsafe_code)]
+#[must_use]
+pub(super) fn name_from_pid_windows(pid: u32) -> Option<String> {
+    // SAFETY: OpenProcess is a documented Win32 function. Failure modes
+    // (PID exited, access-denied, invalid PID) all surface as Err; the
+    // .ok()? converts that into a None return without leaking any
+    // partially-acquired state.
+    let raw_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let guard = HandleGuard { handle: raw_handle };
+
+    let mut buf = [0_u16; NAME_BUF_LEN];
+    // CAST: usize → u32, NAME_BUF_LEN is a const 1024 → fits trivially.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let mut size: u32 = NAME_BUF_LEN as u32;
+
+    // SAFETY: guard.handle is valid (RAII invariant). buf is a stack
+    // array sized to BUF_LEN; the PWSTR wrapper points into it. `size`
+    // is initialised to the buffer capacity and rewritten by the call
+    // to the actual length written (excluding the trailing NUL on
+    // success). PROCESS_NAME_WIN32 (= 0) requests Win32-namespace path
+    // format (drive-letter `C:\...`), not the NT namespace
+    // (`\Device\HarddiskVolume...`).
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            guard.handle,
+            PROCESS_NAME_WIN32,
+            PWSTR::from_raw(buf.as_mut_ptr()),
+            &raw mut size,
+        )
+    };
+
+    if result.is_err() {
+        // BORROW: explicit `drop(guard)` not needed — Drop runs at end
+        // of scope. Documenting the cleanup invariant here keeps the
+        // happy path symmetrical.
+        return None;
+    }
+
+    // CAST: u32 → usize, `size` was clamped by NAME_BUF_LEN going in
+    // and the kernel rewrites with the actual char count written; fits
+    // in usize.
+    #[allow(clippy::as_conversions)]
+    let written = (size as usize).min(NAME_BUF_LEN);
+
+    // BORROW: explicit slice into the written prefix — UTF-16 decode
+    // must not include the uninitialised tail of the buffer.
+    #[allow(clippy::indexing_slicing)]
+    let full_path = String::from_utf16_lossy(&buf[..written]);
+    let base = basename_from_path(&full_path);
+    if base.is_empty() { None } else { Some(base) }
+}
+
+/// Extract the basename (final path component) from a `Windows` path.
+///
+/// Handles both `\` and `/` separators (`Windows` accepts both in many
+/// API contexts; some processes register their image path with mixed
+/// separators). Returns an owned `String`; the input path is borrowed
+/// only for the split.
+///
+/// Edge cases:
+/// - Empty input → empty output.
+/// - Path with no separator → whole path returned (e.g., bare image
+///   names that some kernel-mode processes register with).
+/// - Trailing separator → empty basename (e.g., `"C:\\Windows\\"`).
+#[must_use]
+fn basename_from_path(path: &str) -> String {
+    path.rsplit_once(['\\', '/'])
+        .map_or_else(|| path.to_owned(), |(_, base)| base.to_owned())
+}
+
+// -----------------------------------------------------------------------
 // Inline tests (pure helpers only — FFI exercised via live tests in
 // tests/live_pdh.rs in Wave B)
 // -----------------------------------------------------------------------
@@ -497,7 +625,7 @@ pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<(u32, u64)
     clippy::missing_docs_in_private_items
 )]
 mod tests {
-    use super::{parse_instance_name, parse_multi_string};
+    use super::{basename_from_path, parse_instance_name, parse_multi_string};
 
     #[test]
     fn parse_instance_name_basic() {
@@ -577,5 +705,63 @@ mod tests {
         let buf: Vec<u16> = "only\0\0".encode_utf16().collect();
         let parsed = parse_multi_string(&buf);
         assert_eq!(parsed, vec!["only".to_owned()]);
+    }
+
+    // -------------------------------------------------------------------
+    // basename_from_path tests (Win32 process-name lookup support)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn basename_from_path_windows_backslashes() {
+        assert_eq!(
+            basename_from_path("C:\\Program Files\\Mozilla Firefox\\firefox.exe"),
+            "firefox.exe"
+        );
+    }
+
+    #[test]
+    fn basename_from_path_forward_slashes() {
+        // Some Win32 APIs accept forward slashes; processes may register
+        // their image path with them.
+        assert_eq!(
+            basename_from_path("C:/Users/Eric/AppData/ollama.exe"),
+            "ollama.exe"
+        );
+    }
+
+    #[test]
+    fn basename_from_path_mixed_separators() {
+        assert_eq!(
+            basename_from_path("C:\\Users/Eric\\AppData/ollama.exe"),
+            "ollama.exe"
+        );
+    }
+
+    #[test]
+    fn basename_from_path_no_separator() {
+        // Some kernel-mode processes register a bare image name.
+        assert_eq!(basename_from_path("System"), "System");
+        assert_eq!(basename_from_path("idle.exe"), "idle.exe");
+    }
+
+    #[test]
+    fn basename_from_path_empty_input() {
+        assert_eq!(basename_from_path(""), "");
+    }
+
+    #[test]
+    fn basename_from_path_trailing_separator() {
+        // Pathological but possible — defensive coverage. Trailing
+        // separator yields empty basename; the caller treats empty as
+        // "no name available" and returns None.
+        assert_eq!(basename_from_path("C:\\Windows\\"), "");
+        assert_eq!(basename_from_path("/tmp/"), "");
+    }
+
+    #[test]
+    fn basename_from_path_single_separator() {
+        // Just a separator → empty basename.
+        assert_eq!(basename_from_path("\\"), "");
+        assert_eq!(basename_from_path("/"), "");
     }
 }

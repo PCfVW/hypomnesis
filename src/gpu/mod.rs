@@ -13,6 +13,7 @@ use crate::{GpuDeviceInfo, GpuProcessEntry, HypomnesisError, ProcessGpuInfo, Res
 #[cfg(any(
     feature = "nvml",
     all(windows, feature = "dxgi"),
+    all(windows, feature = "pdh"),
     feature = "nvidia-smi-fallback"
 ))]
 use crate::GpuQuerySource;
@@ -235,11 +236,11 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
         .collect()
 }
 
-/// List every compute process holding GPU memory on the given device.
+/// List every process holding GPU memory on the given device.
 ///
-/// Returns one [`GpuProcessEntry`] per running process that has an
-/// active `CUDA` context. Empty `Vec` when the device exists but no
-/// compute processes are using it.
+/// Returns one [`GpuProcessEntry`] per running process visible to the
+/// active backend. Empty `Vec` when the device exists but no processes
+/// are using it.
 ///
 /// # Source priority
 ///
@@ -248,25 +249,45 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
 ///    Linux. Capped at 64 processes per device — the existing `NVML`
 ///    stack-buffer size. Per-row sentinel and `used > total` checks
 ///    mirror the library's other `NVML` consumers; offending rows are
-///    dropped rather than reported as garbage.
-/// 2. `nvidia-smi` (Windows primary, Linux fallback) — subprocess
+///    dropped rather than reported as garbage. Returns compute-only
+///    processes (active `CUDA` context).
+/// 2. `PDH` (Windows primary, consumer `WDDM`). Reads
+///    `\GPU Process Memory(<instance>)\Dedicated Usage` via
+///    Performance Data Helper; names come from `Win32`'s
+///    `OpenProcess` + `QueryFullProcessImageNameW` (cross-platform
+///    consistent with the Linux `/proc/<pid>/comm` and macOS
+///    `proc_pidpath` patterns). Returns **every** process holding GPU
+///    memory — compositor, browsers, games, compute alike — because
+///    `VidMm`'s accounting is not compute-only. See
+///    [`GpuQuerySource::Pdh`] doc-comment for the semantics shift.
+/// 3. `nvidia-smi` (fallback) — subprocess
 ///    `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits --id=N`.
-///    On Windows under `WDDM`, `NVML`'s per-process call returns
-///    `NVML_VALUE_NOT_AVAILABLE`, so `nvidia-smi` is the only path that
-///    surfaces other-PID names.
-/// 3. `DXGI` is **not** used — `IDXGIAdapter3::QueryVideoMemoryInfo`
+///    Reached on `Linux` when `NVML` is missing, or on `Windows` when
+///    the `PDH` `GPU Process Memory` counter set is unregistered (e.g.
+///    pre-`WDDM 2.0` drivers — vanishingly rare in 2026). Compute-only
+///    semantics; under `WDDM` typically returns rows with `[N/A]`
+///    memory that the parser drops, so the list often appears empty.
+/// 4. `DXGI` is **not** used — `IDXGIAdapter3::QueryVideoMemoryInfo`
 ///    only answers for the calling process and cannot enumerate other
 ///    PIDs.
 ///
 /// # Limitations
 ///
-/// **Compute-only.** Both backends only see processes with an active
-/// `CUDA` context. Browsers using GPU compositing, games, and
-/// pure-graphics apps do not appear here.
+/// **Per-backend compute-only semantics.** `NVML` and `nvidia-smi`
+/// rows are compute-only — browsers using GPU compositing, games, and
+/// pure-graphics apps do not appear. `PDH` rows are **not**
+/// compute-only — they surface every GPU user. Callers comparing
+/// across platforms should check `source` before assuming.
 ///
-/// **Windows process names may be `?`.** `nvidia-smi` writes a literal
-/// `?` for processes whose image name it cannot read (protected
-/// processes); preserved as `Some("?")` in the returned entry.
+/// **Windows process names may be `None` (`PDH` path) or `Some("?")`
+/// (`nvidia-smi` fallback path).** On the `PDH` path, names are
+/// resolved via `OpenProcess` + `QueryFullProcessImageNameW`;
+/// access-denied for cross-user or protected processes yields
+/// `name: None` (mirroring the Linux `/proc/<pid>/comm`-unreadable
+/// case). On the `nvidia-smi` fallback path, `nvidia-smi` writes a
+/// literal `?` for protected processes, preserved as `Some("?")`.
+/// Calling user's own processes always have names available on either
+/// path.
 ///
 /// # Errors
 ///
@@ -277,21 +298,47 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
 #[allow(unused_variables)] // `device_index` unused when no GPU backend feature is enabled
 #[allow(clippy::missing_const_for_fn)] // const only when no features are enabled
 pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
-    #[cfg(feature = "nvml")]
+    // NVML is the primary source on Linux: it answers cleanly there
+    // (compute-only, per-process bytes from `nvmlDeviceGetComputeRunningProcesses_v3`,
+    // names via `/proc/<pid>/comm`). On Windows under `WDDM`, NVML's
+    // per-process query returns rows with the `u64::MAX` sentinel for
+    // every row (R570-driver-class bug); the sentinel filter then
+    // produces `Some(vec![])` — an "I succeeded, here's nothing"
+    // response that would block PDH from running. Gating NVML's
+    // compute-process branch to Linux side-steps that — PDH owns the
+    // Windows primary path below.
+    #[cfg(all(target_os = "linux", feature = "nvml"))]
     if let Some(rows) = nvml::list_compute_processes(device_index) {
         let entries: Vec<GpuProcessEntry> = rows
             .into_iter()
             .map(|(pid, used_bytes)| {
-                #[cfg(target_os = "linux")]
                 let name = read_proc_comm(pid);
-                #[cfg(not(target_os = "linux"))]
-                let name = None;
                 GpuProcessEntry {
                     pid,
                     name,
                     used_bytes,
                     source: GpuQuerySource::Nvml,
                 }
+            })
+            .collect();
+        return Ok(entries);
+    }
+
+    // PDH primary path on Windows / WDDM 2.0+. Reads VidMm-tracked
+    // bytes via `\GPU Process Memory(*)\Dedicated Usage`; the only
+    // path that gives real per-process numbers on consumer Windows.
+    // Falls through to nvidia-smi on any PDH error — including the
+    // pre-WDDM-2.0 case where the GPU Process Memory counter set
+    // isn't registered.
+    #[cfg(all(windows, feature = "pdh"))]
+    if let Ok(rows) = pdh::query_per_process_vram(device_index) {
+        let entries: Vec<GpuProcessEntry> = rows
+            .into_iter()
+            .map(|(pid, used_bytes)| GpuProcessEntry {
+                pid,
+                name: pdh::name_from_pid_windows(pid),
+                used_bytes,
+                source: GpuQuerySource::Pdh,
             })
             .collect();
         return Ok(entries);

@@ -65,6 +65,20 @@ pub enum GpuQuerySource {
     Dxgi,
     /// `NVML` per-process query (`nvmlDeviceGetComputeRunningProcesses`).
     Nvml,
+    /// Windows `PDH` (Performance Data Helper) per-process query of
+    /// `\GPU Process Memory(<instance>)\Dedicated Usage`. The
+    /// foreign-process per-process backend on consumer `WDDM`, where
+    /// `NVML` returns `NVML_VALUE_NOT_AVAILABLE` and
+    /// `IDXGIAdapter3::QueryVideoMemoryInfo` answers only for the
+    /// calling process. Rows produced via this path memorialise that
+    /// the bytes came directly from `VidMm` via `PDH` rather than
+    /// being inferred via subprocess parsing.
+    ///
+    /// Unlike `Nvml` / `NvidiaSmi`, `Pdh` rows are **not** compute-only
+    /// — `PDH` surfaces every process holding GPU memory under `WDDM`
+    /// (compositor, browsers, games, compute alike). The semantics
+    /// difference is documented on [`GpuProcessEntry`].
+    Pdh,
     /// `nvidia-smi` subprocess. In [`ProcessGpuInfo`] this is the
     /// device-wide fallback (the subprocess cannot break the figure
     /// down per-process for the *calling* process). In
@@ -73,17 +87,28 @@ pub enum GpuQuerySource {
     NvidiaSmi,
 }
 
-/// One compute process holding GPU memory on a given device.
+/// One process holding GPU memory on a given device.
 ///
 /// Distinct from [`ProcessGpuInfo`]: that type describes the *calling*
 /// process's own usage; `GpuProcessEntry` is one row of an enumeration
-/// over **all** compute processes on the device, returned by
-/// [`crate::gpu_processes`].
+/// over processes on the device, returned by [`crate::gpu_processes`].
 ///
-/// **Compute-only.** Both backends ([`GpuQuerySource::Nvml`] and
-/// [`GpuQuerySource::NvidiaSmi`]) only see processes with an active
-/// `CUDA` context. Browsers using GPU compositing, games, and
-/// pure-graphics apps do not appear here.
+/// # Semantics per-backend
+///
+/// What "processes on the device" *means* depends on which backend
+/// produced the row:
+///
+/// - [`GpuQuerySource::Nvml`] and [`GpuQuerySource::NvidiaSmi`] are
+///   **compute-only**. They only see processes with an active `CUDA`
+///   context — browsers using GPU compositing, games, and
+///   pure-graphics apps do not appear.
+/// - [`GpuQuerySource::Pdh`] (Windows-only, consumer `WDDM`) reports
+///   **every** process holding GPU memory: the desktop compositor,
+///   browsers using GPU rendering, games, and compute processes all
+///   appear with their `Dedicated Usage` byte count. This is more
+///   information than the compute-only sources but a different
+///   denominator — callers comparing across platforms or backends
+///   should check `source` before assuming compute-only semantics.
 ///
 /// `#[non_exhaustive]`: fields may be added in future releases.
 #[non_exhaustive]
@@ -91,16 +116,21 @@ pub enum GpuQuerySource {
 pub struct GpuProcessEntry {
     /// OS process ID.
     pub pid: u32,
-    /// Process name. `None` when no name source is available; on Windows,
-    /// `Some("?")` when `nvidia-smi` reports a protected process whose
-    /// image name could not be read.
+    /// Process name. `None` when no name source is available — `PDH`
+    /// rows whose `OpenProcess` was access-denied (cross-user, protected
+    /// processes), or `NVML` rows whose `/proc/<pid>/comm` was
+    /// unreadable. On Windows under the `nvidia-smi` fallback,
+    /// `Some("?")` for protected processes whose image name `nvidia-smi`
+    /// itself could not read.
     pub name: Option<String>,
     /// GPU memory used by this process in bytes.
     pub used_bytes: u64,
-    /// Which backend produced this row. Always [`GpuQuerySource::Nvml`]
-    /// or [`GpuQuerySource::NvidiaSmi`] — `DXGI`'s `QueryVideoMemoryInfo`
-    /// only answers for the calling process and cannot enumerate other
-    /// PIDs, so it is never the source of a `GpuProcessEntry`.
+    /// Which backend produced this row. One of [`GpuQuerySource::Nvml`],
+    /// [`GpuQuerySource::Pdh`], or [`GpuQuerySource::NvidiaSmi`].
+    /// `DXGI`'s `QueryVideoMemoryInfo` only answers for the calling
+    /// process and cannot enumerate other PIDs, so
+    /// [`GpuQuerySource::Dxgi`] is never the source of a
+    /// `GpuProcessEntry`.
     pub source: GpuQuerySource,
 }
 

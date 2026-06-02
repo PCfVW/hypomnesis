@@ -382,6 +382,14 @@ fn read_process_used(
 /// Caps at 64 processes per device — the existing `NVML_MAX_PROCESSES`
 /// stack-buffer size. Documented limit; sufficient for any realistic
 /// machine.
+///
+/// Gated `cfg(target_os = "linux")` to match its sole call site in
+/// [`crate::gpu::gpu_processes`]. On Windows under `WDDM`, `NVML`'s
+/// per-process query returns 64 rows with `used_gpu_memory ==
+/// u64::MAX` (the `R570`-driver-class sentinel) for every entry; the
+/// dispatcher uses the [`crate::gpu::pdh`] backend instead, so this
+/// helper is dead code on Windows.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 #[must_use]
 pub(super) fn list_compute_processes(idx: u32) -> Option<Vec<(u32, u64)>> {

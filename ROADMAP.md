@@ -40,6 +40,11 @@ Motivated by the dogfooding finding on a maintainer's RTX 5060 Ti under `WDDM` d
 - Device-wide GPU budget via `MTLDevice.recommendedMaxWorkingSetSize` through a minimal `objc2-metal` dependency (two symbols only: `MTLCreateSystemDefaultDevice` + the property).
 - Independent of v0.2.2: both releases deliver real `u64` bytes for foreign processes through different kernel-level accounting mechanisms (PDH on Windows, ledger on macOS).
 
+Two dogfooding-driven UX additions ride along with this release:
+
+- **`hmn ps` stderr summary gains a "committed total" figure** (`src/bin/hmn.rs`) — `format_ps_summary` computes the sum of `used_bytes` across listed rows; the wording becomes `hmn: N GPU processes found (X.Y GiB committed total; M protected — re-run elevated for names).`. The word "committed" hints at the `WDDM` commit-vs-resident distinction Wave C documented — summing across processes can exceed physical `VRAM` under `WDDM`, and the wording prevents that from reading as a bug. One new unit test pins the wording shape.
+- **`README.md` "Composable workflows" section** — documents `hmn ps --json` beyond what `--help` covers, with two `jq`-based recipes: (a) filter-then-act (`hmn ps --json | jq -r '.[] | select(.used_bytes > 1e9) | .pid' | xargs -I{} taskkill /F /PID {}`) for terminating high-consumer processes via the platform's native kill command — the `hmn kill` subcommand was considered for v0.2.3 and rejected to preserve hypomnesis's "measurement, not control" scope discipline; (b) top-N consumers (`hmn ps --json | jq 'sort_by(-.used_bytes) | .[:5]'`). Motivated by the dogfooding observation that the maintainer had forgotten `--json` existed — discoverability gap that documentation solves without expanding the CLI surface.
+
 Pre-merge ask of the contributor: a user-facing "cross-user PIDs need `sudo`" note in `hmn --help` Limitations (currently only in code comments and module-level `//!` docs).
 
 ---

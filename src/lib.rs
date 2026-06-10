@@ -15,7 +15,7 @@
 //! | Process `RSS` | `K32GetProcessMemoryInfo` | `/proc/self/status` | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
 //! | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
 //! | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
-//! | Compute-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage`) + `OpenProcess`/`QueryFullProcessImageNameW`; `nvidia-smi --query-compute-apps` fallback | `NVML` + `/proc/<pid>/comm` | `proc_listpids` + per-PID `ledger` + `proc_pidpath` |
+//! | GPU-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage`) + `OpenProcess`/`QueryFullProcessImageNameW`; `nvidia-smi --query-compute-apps` fallback (NB: Windows `PDH` is **not** compute-only — it surfaces every GPU memory holder, including the compositor and browsers) | `NVML` + `/proc/<pid>/comm` (compute-only) | `proc_listpids` + per-PID `ledger` + `proc_pidpath` (same-user PIDs only; cross-user requires `sudo`) |
 //! | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 //!
 //! ## Quick start
@@ -38,9 +38,9 @@
 //! | `dxgi` | yes | Windows per-process `VRAM` via `IDXGIAdapter3` (no-op on non-Windows) |
 //! | `pdh` | yes | Windows foreign-process `VRAM` listing via `PDH` `\GPU Process Memory(*)\Dedicated Usage` under `WDDM 2.0`+ (no-op on non-Windows; depends on `dxgi` for adapter `LUID` lookup) |
 //! | `metal` | yes | macOS device-wide GPU budget via `objc2-metal` (`MTLDevice.recommendedMaxWorkingSetSize`) (no-op on non-macOS) |
-//! | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail |
+//! | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` / `PDH` fail or are otherwise unavailable (e.g. pre-`WDDM 2.0` Windows) |
 //! | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
-//! | `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |
+//! | `debug-output` | no | Print raw values from `NVML` / `DXGI` / `PDH` / `Metal` backends to stderr (diagnostic) |
 //! | `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli` |
 //! | `test-helpers` | no | Expose `GpuDeviceInfoBuilder` for downstream tests that need synthetic `GpuDeviceInfo` fixtures. Default-off, additive — production code must never enable it. |
 

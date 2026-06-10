@@ -87,7 +87,10 @@ fn gpu_processes_returns_result_or_no_gpu_source() {
     match hypomnesis::gpu_processes(0) {
         Ok(rows) => {
             for row in &rows {
-                // PIDs of 0 would be impossible on Linux/Windows; sanity-check.
+                // PID 0 is reserved on every platform we support — the
+                // Linux/Windows scheduler "swapper" and the macOS `kernel_task`
+                // entry would never surface through a userland enumerator like
+                // NVML, PDH, nvidia-smi, or the macOS ledger. Sanity-check.
                 assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
                 // Source must be one of the enumerable backends —
                 // DXGI cannot enumerate other PIDs; NVML / nvidia-smi

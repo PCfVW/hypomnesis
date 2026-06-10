@@ -272,22 +272,39 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
 }
 
 /// Build the stderr summary string for `hmn ps`. Format:
-/// `<N> GPU process[es] found[ matching <filters>][ (<M> protected — re-run elevated for names)].`
+/// `<N> GPU process[es] found[ matching <filters>][ (<X.Y> <unit> committed total[; <M> protected — re-run elevated for names)].`
 ///
-/// Three appendices, each elided when not applicable:
+/// Two appendices after the noun, each elided when not applicable:
 ///
 /// - **Filter clause** (` matching pid=N device=M`): appended only
-///   when at least one filter is active.
-/// - **Protected clause** (` (<M> protected — re-run elevated for names)`):
-///   appended only when at least one row has `name: None`. Surfaces
-///   the actionable hint that Administrator-level access would
-///   resolve those names — most are system services or other-user
-///   processes the calling user can't `OpenProcess` against. PID 4
-///   (the Windows kernel pseudo-process) is special-cased to render
-///   as `[kernel]` rather than `?` and therefore does **not**
-///   contribute to this count; the remaining count is genuinely
-///   foreign-user / `SYSTEM` / `PPL`-protected / transient-race
-///   processes that elevation can actually help with.
+///   when at least one filter is active. Supports any combination of
+///   `--pid` and `--device`.
+/// - **Committed-total parenthetical** (` (X.Y unit committed total)`,
+///   formatted via [`format_vram`] so it renders as `MiB` below 1
+///   `GiB` and `GiB` to one decimal place otherwise): appended only
+///   when `count > 0`. The word "committed" hints at the `WDDM`
+///   commit-vs-resident distinction the Windows `PDH` backend
+///   exposes — summing `used_bytes` across processes can exceed
+///   physical `VRAM` under `WDDM` (a real `WDDM` property, not a
+///   bug), so naming the figure "committed total" prevents that from
+///   reading as broken when a Windows user sees, say, 32 `GiB`
+///   committed on a 16 `GiB` card. Elided entirely when `count == 0`
+///   because a zero-bytes total carries no information.
+///
+///   When at least one row has `name: None`, the parenthetical
+///   carries a **protected continuation**
+///   (`; M protected — re-run elevated for names`) joined by `; `.
+///   Surfaces the actionable hint that Administrator-level access
+///   would resolve those names — most are system services or
+///   other-user processes the calling user can't `OpenProcess`
+///   against. `PID 4` (the Windows kernel pseudo-process) is
+///   special-cased to render as `[kernel]` rather than `?` and
+///   therefore does **not** contribute to this count; the remaining
+///   count is genuinely foreign-user / `SYSTEM` / `PPL`-protected /
+///   transient-race processes that elevation can actually help with.
+///   On macOS, "protected" maps to cross-user PIDs whose `ledger`
+///   syscall returned `EPERM` — `sudo hmn ps` is the equivalent
+///   elevation.
 ///
 /// "GPU process" / "GPU processes" (not the previous-release
 /// "compute process" / "compute processes") because on the `PDH`

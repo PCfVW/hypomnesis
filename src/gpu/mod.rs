@@ -411,9 +411,10 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
 ///
 /// Deterministic across calls — the same input state produces the
 /// same output order, regardless of whether the underlying backend
-/// (NVML, PDH, nvidia-smi) emits its rows in PID order, allocation
-/// order, or hash-iteration order. Matches the convention every
-/// other process-listing API uses (Unix `ps`, `top -p`, `NVML`'s
+/// (`NVML`, `PDH`, `nvidia-smi`, or macOS `Metal` via the ledger
+/// syscall) emits its rows in PID order, allocation order, or
+/// hash-iteration order. Matches the convention every other
+/// process-listing API uses (Unix `ps`, `top -p`, `NVML`'s
 /// `nvmlDeviceGetComputeRunningProcesses`). Library consumers can
 /// re-sort as they please without fighting an opinionated default —
 /// the CLI's `hmn ps`, for instance, re-sorts by `used_bytes`

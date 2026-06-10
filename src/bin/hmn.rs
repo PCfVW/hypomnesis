@@ -300,6 +300,7 @@ fn format_ps_summary(
 ) -> String {
     let count = rows.len();
     let protected = rows.iter().filter(|r| r.name.is_none()).count();
+    let committed_total: u64 = rows.iter().map(|r| r.used_bytes).sum();
 
     let noun = if count == 1 {
         "GPU process"
@@ -319,8 +320,25 @@ fn format_ps_summary(
         let _ = write!(out, " matching {clause}");
     }
 
-    if protected > 0 {
-        let _ = write!(out, " ({protected} protected — re-run elevated for names)");
+    // Committed-total + protected parenthetical. The word "committed"
+    // hints at the WDDM commit-vs-resident distinction the Windows
+    // backend exposes — summing `used_bytes` across processes can
+    // exceed physical VRAM under WDDM (a real WDDM property, not a
+    // bug), so naming the figure "committed total" prevents that from
+    // reading as broken. Elided entirely when `count == 0` because
+    // "0 MiB committed total" carries no information.
+    match (count, protected) {
+        (0, _) => {}
+        (_, 0) => {
+            let _ = write!(out, " ({} committed total)", format_vram(committed_total));
+        }
+        (_, p) => {
+            let _ = write!(
+                out,
+                " ({} committed total; {p} protected — re-run elevated for names)",
+                format_vram(committed_total)
+            );
+        }
     }
 
     out.push('.');
@@ -699,10 +717,12 @@ mod tests {
 
     #[test]
     fn format_ps_summary_one_no_filters() {
-        // "1 GPU process found." — singular noun, no filter clause.
+        // Singular noun, no filter clause. `used_bytes: 0` rows still
+        // get a committed-total parenthetical (the figure is 0 MiB —
+        // honest, even when uninteresting).
         assert_eq!(
             format_ps_summary(&unprotected_rows(1), None, None),
-            "1 GPU process found."
+            "1 GPU process found (0 MiB committed total)."
         );
     }
 
@@ -710,12 +730,14 @@ mod tests {
     fn format_ps_summary_many_no_filters() {
         assert_eq!(
             format_ps_summary(&unprotected_rows(7), None, None),
-            "7 GPU processes found."
+            "7 GPU processes found (0 MiB committed total)."
         );
     }
 
     #[test]
     fn format_ps_summary_with_pid_filter() {
+        // Zero rows → no parenthetical at all (committed-total
+        // elides; the filter clause still appears).
         assert_eq!(
             format_ps_summary(&unprotected_rows(0), Some(12345), None),
             "0 GPU processes found matching pid=12345."
@@ -726,7 +748,7 @@ mod tests {
     fn format_ps_summary_with_device_filter() {
         assert_eq!(
             format_ps_summary(&unprotected_rows(2), None, Some(0)),
-            "2 GPU processes found matching device=0."
+            "2 GPU processes found matching device=0 (0 MiB committed total)."
         );
     }
 
@@ -734,7 +756,40 @@ mod tests {
     fn format_ps_summary_with_both_filters() {
         assert_eq!(
             format_ps_summary(&unprotected_rows(1), Some(99), Some(1)),
-            "1 GPU process found matching pid=99 device=1."
+            "1 GPU process found matching pid=99 device=1 (0 MiB committed total)."
+        );
+    }
+
+    // -- committed-total parenthetical (non-zero VRAM) --
+
+    #[test]
+    fn format_ps_summary_with_committed_total_gib() {
+        // 3 rows at 4 GiB each → 12 GiB committed total, formatted
+        // with one decimal place to match `format_vram`'s GiB output.
+        const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+        let rows = vec![
+            row(1001, Some("a.exe"), FOUR_GIB, 0, None),
+            row(1002, Some("b.exe"), FOUR_GIB, 0, None),
+            row(1003, Some("c.exe"), FOUR_GIB, 0, None),
+        ];
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (12.0 GiB committed total)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_with_committed_total_mib() {
+        // 2 rows at 256 MiB each → 512 MiB, below 1 GiB threshold,
+        // formatter renders as MiB.
+        const QUARTER_GIB: u64 = 256 * 1024 * 1024;
+        let rows = vec![
+            row(1001, Some("a.exe"), QUARTER_GIB, 0, None),
+            row(1002, Some("b.exe"), QUARTER_GIB, 0, None),
+        ];
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "2 GPU processes found (512 MiB committed total)."
         );
     }
 
@@ -746,7 +801,7 @@ mod tests {
         rows.extend(protected_rows(1));
         assert_eq!(
             format_ps_summary(&rows, None, None),
-            "4 GPU processes found (1 protected — re-run elevated for names)."
+            "4 GPU processes found (0 MiB committed total; 1 protected — re-run elevated for names)."
         );
     }
 
@@ -756,7 +811,7 @@ mod tests {
         rows.extend(protected_rows(4));
         assert_eq!(
             format_ps_summary(&rows, None, None),
-            "32 GPU processes found (4 protected — re-run elevated for names)."
+            "32 GPU processes found (0 MiB committed total; 4 protected — re-run elevated for names)."
         );
     }
 
@@ -765,17 +820,17 @@ mod tests {
         let rows = protected_rows(3);
         assert_eq!(
             format_ps_summary(&rows, None, None),
-            "3 GPU processes found (3 protected — re-run elevated for names)."
+            "3 GPU processes found (0 MiB committed total; 3 protected — re-run elevated for names)."
         );
     }
 
     #[test]
-    fn format_ps_summary_zero_protected_elides_parenthetical() {
-        // No protected rows → no parenthetical, matching the
-        // filter-clause "only when active" convention.
+    fn format_ps_summary_zero_protected_elides_protected_part_keeps_total() {
+        // No protected rows → no `M protected …` clause, but the
+        // committed-total parenthetical still appears.
         assert_eq!(
             format_ps_summary(&unprotected_rows(5), None, None),
-            "5 GPU processes found."
+            "5 GPU processes found (0 MiB committed total)."
         );
     }
 
@@ -785,7 +840,7 @@ mod tests {
         rows.extend(protected_rows(1));
         assert_eq!(
             format_ps_summary(&rows, Some(42), Some(0)),
-            "3 GPU processes found matching pid=42 device=0 (1 protected — re-run elevated for names)."
+            "3 GPU processes found matching pid=42 device=0 (0 MiB committed total; 1 protected — re-run elevated for names)."
         );
     }
 }

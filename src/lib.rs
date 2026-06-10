@@ -2,7 +2,7 @@
 
 //! # hypomnesis
 //!
-//! External measurement of a Rust process's `RAM` and `VRAM` state, on Windows and Linux.
+//! External measurement of a Rust process's `RAM` and `VRAM` state, on Windows, Linux, and macOS.
 //!
 //! `hypomnesis` reports what's currently in a process's memory — process `RSS`,
 //! device-wide GPU memory, and per-process GPU `VRAM` — without depending on
@@ -10,13 +10,13 @@
 //!
 //! ## Capabilities
 //!
-//! | Metric | Windows | Linux |
-//! |--------|---------|-------|
-//! | Process `RSS` | `K32GetProcessMemoryInfo` | `/proc/self/status` |
-//! | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) |
-//! | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) |
-//! | Compute-process listing (other PIDs) | `nvidia-smi --query-compute-apps` | `NVML` + `/proc/<pid>/comm` |
-//! | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess |
+//! | Metric | Windows | Linux | macOS |
+//! |--------|---------|-------|-------|
+//! | Process `RSS` | `K32GetProcessMemoryInfo` | `/proc/self/status` | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
+//! | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
+//! | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
+//! | Compute-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage`) + `OpenProcess`/`QueryFullProcessImageNameW`; `nvidia-smi --query-compute-apps` fallback | `NVML` + `/proc/<pid>/comm` | `proc_listpids` + per-PID `ledger` + `proc_pidpath` |
+//! | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 //!
 //! ## Quick start
 //!
@@ -36,6 +36,8 @@
 //! |---------|---------|-------------|
 //! | `nvml` | yes | `NVML` dynamic load via `libloading` (Linux + Windows-`WDDM` device-wide) |
 //! | `dxgi` | yes | Windows per-process `VRAM` via `IDXGIAdapter3` (no-op on non-Windows) |
+//! | `pdh` | yes | Windows foreign-process `VRAM` listing via `PDH` `\GPU Process Memory(*)\Dedicated Usage` under `WDDM 2.0`+ (no-op on non-Windows; depends on `dxgi` for adapter `LUID` lookup) |
+//! | `metal` | yes | macOS device-wide GPU budget via `objc2-metal` (`MTLDevice.recommendedMaxWorkingSetSize`) (no-op on non-macOS) |
 //! | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` fail |
 //! | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
 //! | `debug-output` | no | Print raw `NVML` / `DXGI` values to stderr (diagnostic) |

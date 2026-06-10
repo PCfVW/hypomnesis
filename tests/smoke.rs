@@ -23,6 +23,7 @@ fn public_types_are_reachable_via_crate_root() {
     let _: GpuQuerySource = GpuQuerySource::Dxgi;
     let _: GpuQuerySource = GpuQuerySource::Nvml;
     let _: GpuQuerySource = GpuQuerySource::NvidiaSmi;
+    let _: GpuQuerySource = GpuQuerySource::Metal;
     let _: HypomnesisError = HypomnesisError::NoGpuSource;
 }
 
@@ -89,11 +90,17 @@ fn gpu_processes_returns_result_or_no_gpu_source() {
                 // PIDs of 0 would be impossible on Linux/Windows; sanity-check.
                 assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
                 // Source must be one of the enumerable backends —
-                // DXGI cannot enumerate other PIDs.
+                // DXGI cannot enumerate other PIDs; NVML / nvidia-smi
+                // enumerate NVIDIA processes; PDH enumerates Windows
+                // VidMm-tracked GPU memory holders; Metal enumerates
+                // same-user PIDs via the macOS kernel ledger.
                 assert!(
                     matches!(
                         row.source,
-                        GpuQuerySource::Nvml | GpuQuerySource::Pdh | GpuQuerySource::NvidiaSmi
+                        GpuQuerySource::Nvml
+                            | GpuQuerySource::Pdh
+                            | GpuQuerySource::NvidiaSmi
+                            | GpuQuerySource::Metal
                     ),
                     "unexpected source {:?} on a gpu_processes row",
                     row.source

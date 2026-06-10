@@ -3,7 +3,7 @@ name = "hypomnesis"
 version = "0.2.2"
 edition = "2024"
 authors = ["Eric Jacopin"]
-description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML, Linux NVML, with nvidia-smi fallback)."
+description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML + PDH, Linux NVML, macOS libSystem + Metal, with nvidia-smi fallback)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/PCfVW/hypomnesis"
 homepage = "https://github.com/PCfVW/hypomnesis"
@@ -31,8 +31,20 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_System_Threading",
 ] }
 
+# Optional: MTLDevice.recommendedMaxWorkingSetSize for device-wide free-bytes
+# on Apple Silicon UMA. Minimal feature set — only `MTLDevice` is enabled,
+# which gates both `MTLCreateSystemDefaultDevice` and the device-property
+# reads we need; default features (every other MTL* type) are deliberately
+# disabled. `objc2` is already a transitive of `objc2-metal`, but the static
+# OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> declaration in
+# `src/gpu/metal.rs` names types from `objc2::rc` and `objc2::runtime`, so
+# the crate must be a direct dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = { version = "0.3", optional = true, default-features = false, features = ["MTLDevice"] }
+objc2 = { version = "0.6", optional = true }
+
 [features]
-default = ["nvml", "nvidia-smi-fallback", "dxgi", "pdh"]
+default = ["nvml", "nvidia-smi-fallback", "dxgi", "pdh", "metal"]
 nvml = ["dep:libloading"]
 nvidia-smi-fallback = []
 dxgi = ["dep:windows"]
@@ -44,6 +56,12 @@ dxgi = ["dep:windows"]
 # the calling adapter's LUID, which is fetched via the DXGI adapter walk
 # already used by the calling-process fast path (`dxgi::adapter_luid`).
 pdh = ["dep:windows", "dxgi"]
+# `metal` (macOS-only effect) reads `MTLDevice.recommendedMaxWorkingSetSize`
+# for device-wide free-bytes on Apple Silicon UMA via a minimal `objc2-metal`
+# binding. Per-process accounting comes from libSystem (`ledger` syscall);
+# only the device-wide free-bytes figure needs the Metal API. Target-conditional,
+# no-op off-macOS.
+metal = ["dep:objc2-metal", "dep:objc2"]
 report = []
 debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the
@@ -114,9 +132,10 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
-# docs.rs builds the full feature set on both Linux and Windows targets so
-# the rendered documentation includes the Windows-only `dxgi` module
-# alongside the cross-platform `nvml` and `nvidia_smi` backends.
+# docs.rs builds the full feature set on Linux, Windows, and macOS targets
+# so the rendered documentation includes the Windows-only `dxgi` / `pdh`
+# modules and the macOS-only `metal` module alongside the cross-platform
+# `nvml` and `nvidia_smi` backends.
 [package.metadata.docs.rs]
 all-features = true
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]

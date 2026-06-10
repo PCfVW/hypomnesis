@@ -7,13 +7,16 @@
 //!
 //! - `hmn` (default) — one line per visible GPU with free / total `VRAM`.
 //!   Uses [`hypomnesis::Snapshot::all`], so on Windows the AMD / Intel
-//!   `iGPU` surfaces alongside the NVIDIA dGPU(s).
+//!   `iGPU` surfaces alongside the NVIDIA dGPU(s); on macOS the Apple
+//!   Silicon `SoC` surfaces as a single `UMA` device.
 //! - `hmn ps` — list processes holding GPU memory across one or all
-//!   visible NVIDIA devices. On Linux (`NVML`) the list is
-//!   compute-only; on Windows (`PDH`, `WDDM 2.0`+) the list includes
-//!   every GPU memory holder (compositor, browsers, games, compute).
-//!   See the `--help` Limitations text and the rustdoc for
-//!   [`hypomnesis::gpu_processes`] for the per-platform breakdown.
+//!   visible devices. On Linux (`NVML`) the list is compute-only; on
+//!   Windows (`PDH`, `WDDM 2.0`+) the list includes every GPU memory
+//!   holder (compositor, browsers, games, compute); on macOS (Metal
+//!   ledger) the list enumerates every same-user PID holding
+//!   `graphics_footprint` bytes. See the `--help` Limitations text and
+//!   the rustdoc for [`hypomnesis::gpu_processes`] for the
+//!   per-platform breakdown.
 //!
 //! Install with `cargo install hypomnesis --features cli`.
 
@@ -30,8 +33,7 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
     about = "GPU memory CLI: device summary (default) + GPU-process listing (`hmn ps`).",
     long_about = "GPU memory CLI for hypomnesis.\n\
                   \n\
-                  Default subcommand: prints one line per visible GPU with free / total VRAM \
-                  (NVIDIA dGPUs, plus AMD / Intel iGPUs on Windows).\n\
+                  Default subcommand: prints one line per visible GPU with free / total VRAM.\n\
                   \n\
                   `hmn ps`: lists processes holding GPU memory.\n\
                   \n\
@@ -48,14 +50,14 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
                   the kernel pages them via the shared system memory budget. Numbers \
                   exceeding the device's total VRAM are real, not bugs; they match Task \
                   Manager's `Dedicated GPU memory` column.\n\
-                  - `?` in the NAME column means the calling user cannot resolve the process's \
-                  name via `OpenProcess`. Most cases (system services, other-user processes \
-                  like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` is run as Administrator. \
-                  The Windows kernel itself (PID 4) is rendered as `[kernel]`, not `?`, so \
-                  it does not pollute the suspicious-`?` set. PPL-protected processes \
-                  (Windows Defender, anti-cheat engines) would remain `?` even elevated, but \
-                  typically do not appear in `hmn ps` output unless they are actively \
-                  holding GPU memory.\n\
+                  - `?` in the NAME column on Windows means the calling user cannot resolve \
+                  the process's name via `OpenProcess`. Most cases (system services, \
+                  other-user processes like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` \
+                  is run as Administrator. The Windows kernel itself (PID 4) is rendered \
+                  as `[kernel]`, not `?`, so it does not pollute the suspicious-`?` set. \
+                  PPL-protected processes (Windows Defender, anti-cheat engines) would \
+                  remain `?` even elevated, but typically do not appear in `hmn ps` output \
+                  unless they are actively holding GPU memory.\n\
                   - Security note: a `?` row holding substantial VRAM that does not resolve \
                   under elevation is worth investigating — by construction it is either a \
                   process owned by another user / running as SYSTEM, a PPL-protected process, \
@@ -66,8 +68,16 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
                   - Pre-WDDM-2.0 Windows falls back to `nvidia-smi --query-compute-apps`, \
                   which is compute-only and may show `[N/A]` memory under consumer WDDM \
                   (parser drops those rows).\n\
-                  - The R570 u64::MAX sentinel and used > total checks are applied per-row; \
-                  affected rows are dropped rather than reported as garbage."
+                  - The R570 u64::MAX sentinel and used > total checks are applied per-row \
+                  on NVIDIA backends; affected rows are dropped rather than reported as \
+                  garbage.\n\
+                  - macOS: `used_bytes` reflects currently-resident GPU pages \
+                  (`graphics_footprint` ledger entry); the kernel evicts idle Metal pages, \
+                  so the same PID may report different values across calls. Same \
+                  resident-bytes semantics as Windows `WorkingSetSize` and Linux `VmRSS`.\n\
+                  - macOS: cross-user PIDs are silently skipped — the per-PID `ledger` \
+                  syscall returns `EPERM` for processes owned by another user. To list \
+                  every PID on the system, run elevated (`sudo hmn ps`)."
 )]
 struct Cli {
     /// Subcommand. Omitted for the default device-summary view.
@@ -80,14 +90,16 @@ struct Cli {
 enum Commands {
     /// List processes holding GPU memory. On Linux: compute-only via
     /// NVML. On Windows / WDDM 2.0+: every GPU memory holder via PDH
-    /// (compositor, browsers, compute, etc.). See `hmn --help`
+    /// (compositor, browsers, compute, etc.). On macOS: every
+    /// same-user PID holding `graphics_footprint` ledger bytes; run
+    /// elevated (`sudo`) to include cross-user PIDs. See `hmn --help`
     /// Limitations for the full per-platform breakdown.
     Ps {
         /// Filter to processes whose PID matches.
         #[arg(long, value_name = "PID")]
         pid: Option<u32>,
-        /// Filter to a single GPU index. Default: every NVIDIA device
-        /// reported by `device_count()`.
+        /// Filter to a single GPU index. Default: every device reported
+        /// by `device_count()`.
         #[arg(long, value_name = "INDEX")]
         device: Option<u32>,
         /// Emit a JSON array (one object per row) instead of the

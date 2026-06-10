@@ -153,6 +153,38 @@ The stderr summary is always printed, even when the table is empty, so interacti
 
 5. **`R570`-class driver-bug filtering.** The `u64::MAX` sentinel (`R570` driver bug on `RTX 5060 Ti` and similar consumer GeForce cards) and the `used > total` corruption checks are applied per-row in `hmn ps`; affected rows are dropped rather than reported as garbage.
 
+6. **macOS `used_bytes` reflects currently-resident GPU pages.** The kernel evicts idle Metal pages from a process's `graphics_footprint`, so the same PID may report different values across successive `hmn ps` calls when its working set has cooled. This is the same resident-bytes semantics as Windows `WorkingSetSize` and Linux `VmRSS` — not a macOS quirk, the cross-platform contract.
+
+7. **macOS cross-user PIDs are silently skipped.** The per-PID `ledger` syscall returns `EPERM` for processes owned by another user. `hmn ps` enumerates same-user PIDs only by default; run elevated (`sudo hmn ps`) to include cross-user PIDs such as `WindowServer`, `kernel_task`, and other-user-owned applications.
+
+### Composable workflows
+
+`hmn ps --json` exists for scripting and survives across platforms (same JSON shape on Windows, Linux, and macOS). Two recipes that have come up in dogfooding:
+
+**Top-5 GPU consumers** (any platform with `jq` installed):
+
+```sh
+hmn ps --json | jq 'sort_by(-.used_bytes) | .[:5]'
+```
+
+**Terminate any process holding more than 1 GiB of `VRAM`** — the JSON output composes with the platform's native kill command. Windows (PowerShell or cmd):
+
+```sh
+hmn ps --json | jq -r '.[] | select(.used_bytes > 1073741824) | .pid' | ForEach-Object { taskkill /F /PID $_ }
+```
+
+Linux / macOS:
+
+```sh
+hmn ps --json | jq -r '.[] | select(.used_bytes > 1073741824) | .pid' | xargs -r kill -TERM
+```
+
+(Use `kill -KILL` instead of `-TERM` if you want the hard variant; `-r` skips empty input.)
+
+#### Why no `hmn kill`?
+
+A `hmn kill <pid>` subcommand was considered for v0.2.3 and rejected to preserve `hypomnesis`'s "measurement, not control" scope discipline. Process termination is not a *measurement* operation — it's a control operation, and one with platform-specific permission models (`taskkill` vs `kill -SIGNAL` vs `sudo kill`) that `hmn` would inevitably get wrong on at least one platform. Piping JSON to the platform's native killer is more honest about what's happening, more flexible (filter on any field, not just PID), and keeps `hypomnesis`'s API surface small.
+
 ## Capabilities
 
 | Metric | Windows | Linux | macOS |

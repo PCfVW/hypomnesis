@@ -159,12 +159,22 @@ fn format_summary(snaps: &[Snapshot]) -> String {
             .name
             .as_deref()
             .map_or(String::new(), |n| format!(" [{n}]"));
+        // Driver/firmware carve-out, when the backend surfaced it (NVML
+        // R510+). It is a *subset* of `total_mib` (NVML's
+        // `total = reserved + free + used`), so the parenthetical reads as
+        // "of which N is reserved", not an addition on top — matching
+        // `nvidia-smi -q -d MEMORY`'s separate `Total` / `Reserved` lines.
+        // Elided on backends that report `None` (DXGI, nvidia-smi, Metal,
+        // pre-R510).
+        let reserved_suffix = dev.reserved_bytes.map_or(String::new(), |r| {
+            format!(" ({} MiB reserved)", bytes_to_mib(r))
+        });
         // `writeln!` into a String never fails — the writes-to-String
         // impl returns Ok(()). Same for every other write!/writeln! in
         // this file.
         let _ = writeln!(
             out,
-            "GPU {}{name_suffix}: free {free_mib} MiB / {total_mib} MiB",
+            "GPU {}{name_suffix}: free {free_mib} MiB / {total_mib} MiB{reserved_suffix}",
             dev.index,
         );
     }

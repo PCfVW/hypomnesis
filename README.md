@@ -10,6 +10,8 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
+> 🆕 **`0.2.4` surfaces NVIDIA's driver/firmware *reserved* memory.** A new additive `GpuDeviceInfo::reserved_bytes: Option<u64>` exposes the carve-out NVML holds *within* its reported `total` (`total = reserved + free + used`) — **live-measured at 259 MiB** on an `RTX 5060 Ti`, exactly matching `nvidia-smi -q -d MEMORY`'s `Reserved` line next to `Total: 16311 MiB`. It is a subset of `total_bytes`, so allocation headroom is `total_bytes − reserved_bytes` (which `free_bytes` already reflects). Sourced from NVML's v2 memory query (`nvmlDeviceGetMemoryInfo_v2`, R510+) with a graceful pre-R510 fallback to `None`; `total_bytes` is unchanged. Driven by a [`candle-mi`](https://github.com/PCfVW/candle-mi) `v0.1.16` dogfooding report. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md).
+
 > 🚀 **`0.2.3` adds first-class macOS support on Apple Silicon.** Three platforms now share one contract — `Windows`, `Linux`, and `macOS` all expose process `RSS`, device-wide GPU memory, per-process GPU memory, and a `hmn ps` listing with the same JSON shape on every platform. The macOS backend is libSystem-only (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`) for everything except the device-wide GPU budget, which reads `MTLDevice.recommendedMaxWorkingSetSize` through a minimal `objc2-metal` binding. Cross-platform `used_bytes` semantics are preserved — the macOS `graphics_footprint` ledger entry behaves the same way Windows `WorkingSetSize` and Linux `VmRSS` do under memory pressure. Authored by contributor [@LittleCoinCoin](https://github.com/LittleCoinCoin) ([PR #1](https://github.com/PCfVW/hypomnesis/pull/1)); daily-driven on M3 Pro / 36 GiB. All additive under the `#[non_exhaustive]` policy carried over from v0.2.0–v0.2.2. See [`CHANGELOG.md`](CHANGELOG.md) for the v0.2.3 entry and [`ROADMAP.md`](ROADMAP.md) for the rationale.
 
 ## Table of Contents
@@ -63,6 +65,14 @@ fn main() -> Result<(), hypomnesis::HypomnesisError> {
             dev.name.as_deref().unwrap_or("unknown"),
             used_gib, total_gib,
         );
+        // `total_bytes` is the full NVML framebuffer (= `nvidia-smi` Total).
+        // `reserved_bytes` is the driver/firmware carve-out *within* it
+        // (NVML R510+); allocation headroom is `total - reserved`, which
+        // `free_bytes` already reflects.
+        if let Some(reserved) = dev.reserved_bytes {
+            let reserved_mib = reserved as f64 / (1u64 << 20) as f64;
+            println!("  ({:.0} MiB reserved)", reserved_mib);
+        }
     }
 
     if let Some(proc_gpu) = snap.gpu {
@@ -79,7 +89,8 @@ Expected output (RTX 5060 Ti, Windows, idle process):
 
 ```
 RAM: 142475264 bytes
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 16.0 GiB used
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 15.9 GiB used
+  (259 MiB reserved)
 This process: 119 MiB (per-process)
 ```
 
@@ -104,8 +115,10 @@ hmn ps --json          # scriptable output
 Example default output (single NVIDIA dGPU, the maintainer's reference machine — Ryzen 9 5950X has no iGPU, so only one adapter surfaces):
 
 ```
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16384 MiB
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
 ```
+
+The `(259 MiB reserved)` parenthetical (NVML R510+) is the driver/firmware carve-out *within* the 16311 MiB total — matching `nvidia-smi -q -d MEMORY`'s `Reserved` line. It is elided on backends that don't expose it (DXGI, `nvidia-smi`, Metal, pre-R510).
 
 Apple Silicon, idle process (Apple M3 Pro, 36 GiB unified memory):
 
@@ -118,9 +131,11 @@ The `free` figure here is `MTLDevice.recommendedMaxWorkingSetSize` — the kerne
 Illustrative output on a *heterogeneous* machine (NVIDIA dGPU + Intel/AMD iGPU on Windows). Not yet verified end-to-end on real hardware — see [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) "Verification plan":
 
 ```
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16384 MiB
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
 GPU 1 [Intel Iris Xe Graphics]: free 32768 MiB / 32768 MiB
 ```
+
+(The Intel iGPU line has no reserved parenthetical — `DXGI` does not expose the NVML carve-out, so `reserved_bytes` is `None` there.)
 
 `hmn ps` (illustrative — empty on machines with no active CUDA workload):
 
@@ -191,6 +206,7 @@ A `hmn kill <pid>` subcommand was considered for v0.2.3 and rejected to preserve
 |--------|---------|-------|-------|
 | Process RSS | `K32GetProcessMemoryInfo` | `/proc/self/status` (no `unsafe`) | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
 | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
+| Device reserved memory | `NVML` v2 (`nvmlDeviceGetMemoryInfo_v2`, R510+) | `NVML` v2 (R510+) | n/a (`None` — UMA has no carve-out) |
 | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
 | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 
@@ -225,9 +241,8 @@ Two consequences worth noting:
 
 ## Used by
 
+- [candle-mi](https://github.com/PCfVW/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove this release's `reserved_bytes` addition.
 - [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
-
-_Forthcoming: [candle-mi](https://github.com/PCfVW/candle-mi) is expected to migrate its in-tree memory module to `hypomnesis` (`features = ["report"]`) after v0.2.1 lands._
 
 ## License
 

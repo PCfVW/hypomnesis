@@ -50,6 +50,35 @@ fn device_info_returns_plausible_total_bytes() {
 }
 
 #[test]
+#[ignore = "requires NVIDIA GPU + driver (R510+ for a populated reserved figure)"]
+#[allow(clippy::expect_used)]
+fn device_info_reserved_bytes_is_plausible_when_present() {
+    let info = device_info(0).expect("device_info(0) requires NVIDIA GPU + driver");
+    // `reserved_bytes` is `Some` only on the NVML path with an R510+
+    // driver (where `nvmlDeviceGetMemoryInfo_v2` succeeds). When present,
+    // the driver/firmware carve-out is a *subset* of `total_bytes` (NVML's
+    // `total = reserved + free + used`): non-zero in practice on consumer
+    // NVIDIA hardware, and a small slice of the card — strictly less than
+    // `total_bytes`, which itself stays within the 1 TiB sanity bound.
+    if let Some(reserved) = info.reserved_bytes {
+        assert!(
+            reserved > 0,
+            "reserved_bytes={reserved} (expected a non-zero carve-out on R510+ NVML)"
+        );
+        assert!(
+            reserved < info.total_bytes,
+            "reserved_bytes={reserved} >= total_bytes={} (carve-out is a subset of total)",
+            info.total_bytes
+        );
+        assert!(
+            info.total_bytes <= 1024_u64.pow(4),
+            "total_bytes={} (expected ≤ 1 TiB)",
+            info.total_bytes
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires NVIDIA GPU + driver"]
 #[allow(clippy::expect_used)]
 fn snapshot_now_returns_ram_and_gpu_device() {
@@ -197,21 +226,37 @@ fn gpu_processes_succeeds_on_live_host() {
 
     for row in &rows {
         assert!(row.pid > 0, "expected positive PID, got {}", row.pid);
-        // Source on a live host is `Nvml` (Linux) or `NvidiaSmi`
-        // (Windows under WDDM). DXGI is never the source for an
-        // enumeration — it only answers for the calling process.
+        // Source on a live host is `Nvml` (Linux primary), `Pdh`
+        // (Windows / WDDM 2.0+ primary, since v0.2.2), `Metal` (macOS
+        // primary, since v0.2.3), or `NvidiaSmi` (fallback on any
+        // platform). DXGI is never the source for an enumeration — it
+        // only answers for the calling process. Mirrors the allow-list in
+        // `tests/smoke.rs::gpu_processes_returns_result_or_no_gpu_source`.
         assert!(
             matches!(
                 row.source,
-                hypomnesis::GpuQuerySource::Nvml | hypomnesis::GpuQuerySource::NvidiaSmi
+                hypomnesis::GpuQuerySource::Nvml
+                    | hypomnesis::GpuQuerySource::Pdh
+                    | hypomnesis::GpuQuerySource::Metal
+                    | hypomnesis::GpuQuerySource::NvidiaSmi
             ),
             "unexpected source {:?} for gpu_processes row",
             row.source
         );
-        assert!(
-            row.used_bytes > 0,
-            "compute process pid {} should have positive used_bytes",
-            row.pid
-        );
+        // PDH is *not* compute-only — it enumerates every process in the
+        // Windows `GPU Process Memory` counter set, including ones holding
+        // 0 dedicated bytes at the sampling instant (shared-only or
+        // transient instances), so a 0 is legitimate on that path. The
+        // compute-only sources (`Nvml`, `NvidiaSmi`) and macOS `Metal`
+        // (which filters to footprint > 0) only surface rows with memory
+        // actually held, so `used_bytes` stays positive there.
+        if !matches!(row.source, hypomnesis::GpuQuerySource::Pdh) {
+            assert!(
+                row.used_bytes > 0,
+                "process pid {} ({:?}) should have positive used_bytes",
+                row.pid,
+                row.source
+            );
+        }
     }
 }

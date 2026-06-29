@@ -106,6 +106,57 @@ struct NvmlMemoryInfo {
     used: u64,
 }
 
+/// `NVML` v2 memory info for a device.
+///
+/// Matches the C struct `nvmlMemory_v2_t`. Unlike `nvmlMemory_t` (v1) it
+/// carries a leading `version` tag (set by the caller before the call)
+/// and breaks out `reserved` — the driver/firmware carve-out.
+///
+/// Both v1 and v2 report the **same** `total` — the full framebuffer NVML
+/// exposes, satisfying `total = reserved + free + used`. The difference is
+/// only that v2 surfaces `reserved` as its own field, whereas v1 folds it
+/// into `used`. So `reserved` is carved out **within** `total`, never added
+/// on top of it: memory available for allocation is `total - reserved`
+/// (and `free` already reflects that). Verified live on an `RTX 5060 Ti`
+/// (driver 591.86): v1 `total` == v2 `total` == 16311 MiB, `reserved` ==
+/// 259 MiB — byte-identical to `nvidia-smi -q -d MEMORY` (`Total` /
+/// `Reserved`).
+///
+/// hypomnesis reads only `reserved` from this struct and keeps the v1
+/// `total` / `free` / `used` as the device triplet, so `total_bytes` stays
+/// `nvidia-smi`-consistent. The `total` / `free` / `used` fields here are
+/// populated by the FFI call but intentionally unread for that reason;
+/// they are named (not padding) so the layout matches `nvmlMemory_v2_t`
+/// exactly.
+/// See: <https://docs.nvidia.com/deploy/nvml-api/structnvmlMemory__v2__t.html>
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NvmlMemoryInfoV2 {
+    /// Struct version tag; must equal [`NVML_MEMORY_V2_VERSION`] before the call.
+    version: u32,
+    /// Total physical GPU memory in bytes (`reserved + free + used`).
+    total: u64,
+    /// Device memory reserved for system use (driver or firmware), in bytes.
+    reserved: u64,
+    /// Free GPU memory in bytes.
+    free: u64,
+    /// Used GPU memory in bytes.
+    used: u64,
+}
+
+/// `version` field value for `nvmlMemory_v2_t`, required by
+/// `nvmlDeviceGetMemoryInfo_v2`.
+///
+/// Mirrors NVML's `NVML_STRUCT_VERSION(Memory, 2)` macro: the struct size
+/// in the low bytes OR'd with the version number in bits 24+
+/// (`size | (2 << 24)`). The call returns `NVML_ERROR_INVALID_ARGUMENT`
+/// when this field is unset or wrong, so it must be written before every
+/// v2 query.
+// CAST: usize → u32, `size_of::<NvmlMemoryInfoV2>()` is a fixed 40 (the
+// `repr(C)` layout: u32 version + 4 bytes padding + 4×u64); far below u32::MAX.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+const NVML_MEMORY_V2_VERSION: u32 = (std::mem::size_of::<NvmlMemoryInfoV2>() as u32) | (2 << 24);
+
 /// Opaque `NVML` device handle.
 type NvmlDevice = *mut std::ffi::c_void;
 
@@ -120,6 +171,9 @@ type NvmlDeviceGetHandleByIndexFn = unsafe extern "C" fn(u32, *mut NvmlDevice) -
 
 /// Function signature: `nvmlDeviceGetMemoryInfo(device, *info)`.
 type NvmlDeviceGetMemoryInfoFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfo) -> u32;
+
+/// Function signature: `nvmlDeviceGetMemoryInfo_v2(device, *info)`.
+type NvmlDeviceGetMemoryInfoV2Fn = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryInfoV2) -> u32;
 
 /// Function signature: `nvmlDeviceGetComputeRunningProcesses_v3(device, *count, *infos)`.
 type NvmlDeviceGetComputeRunningProcessesFn =
@@ -148,6 +202,13 @@ pub(super) struct NvmlQueryResult {
     pub device_free: u64,
     /// Device-wide used memory in bytes (sum across processes).
     pub device_used: u64,
+    /// Device-wide memory reserved for system use (driver or firmware),
+    /// in bytes, from `nvmlDeviceGetMemoryInfo_v2`.
+    ///
+    /// `None` when the running driver predates R510 (the v2 symbol is
+    /// absent) or the v2 query failed; the v1 device triplet above is
+    /// unaffected and stays `nvidia-smi`-consistent.
+    pub reserved_bytes: Option<u64>,
     /// Adapter name as reported by `nvmlDeviceGetName`,
     /// e.g. `"NVIDIA GeForce RTX 5060 Ti"`.
     /// `None` when the name query fails.
@@ -157,10 +218,11 @@ pub(super) struct NvmlQueryResult {
 /// Run a single `NVML` query session for the given device index.
 ///
 /// Loads `NVML`, runs init, queries the device handle, device-wide memory
-/// info, adapter name, and per-process info, then shuts `NVML` down before
-/// returning. Per-process query failures are tolerated
-/// (`process_used_bytes = None`) since the device-wide info is still
-/// useful. If the library load, init, handle, or device memory query
+/// info (v1), adapter name, the best-effort v2 `reserved` carve-out, and
+/// per-process info, then shuts `NVML` down before returning. Per-process
+/// and v2-reserved query failures are tolerated (`process_used_bytes` /
+/// `reserved_bytes` set to `None`) since the v1 device-wide info is still
+/// useful. If the library load, init, handle, or v1 device memory query
 /// fails, the function returns `None`.
 #[allow(unsafe_code)]
 pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
@@ -229,6 +291,12 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
     // Adapter name (best-effort; failure is non-fatal for the rest of the result).
     let device_name = read_device_name(&get_name, device);
 
+    // Reserved memory (best-effort, additive). Sourced from the v2 query;
+    // `None` on pre-R510 drivers (the `_v2` symbol is absent) or any v2
+    // failure. The v1 total/free/used above remain the source of truth and
+    // stay `nvidia-smi`-consistent regardless.
+    let reserved_bytes = read_device_reserved(&lib, device);
+
     // Per-process query (best-effort; can fail under WDDM as NVML_VALUE_NOT_AVAILABLE).
     let process_used_bytes = read_process_used(&get_processes, device, mem_info.total);
 
@@ -237,8 +305,13 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
 
     #[cfg(feature = "debug-output")]
     eprintln!(
-        "[NVML debug] device {idx}: total={} free={} used={} per_process={:?} name={:?}",
-        mem_info.total, mem_info.free, mem_info.used, process_used_bytes, device_name
+        "[NVML debug] device {idx}: total={} free={} used={} reserved={:?} per_process={:?} name={:?}",
+        mem_info.total,
+        mem_info.free,
+        mem_info.used,
+        reserved_bytes,
+        process_used_bytes,
+        device_name
     );
 
     Some(NvmlQueryResult {
@@ -246,6 +319,7 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
         device_total: mem_info.total,
         device_free: mem_info.free,
         device_used: mem_info.used,
+        reserved_bytes,
         device_name,
     })
 }
@@ -288,6 +362,54 @@ fn read_device_name(
         .get(..nul_pos)
         .map(|slice| String::from_utf8_lossy(slice).into_owned())
         .filter(|s| !s.is_empty())
+}
+
+/// Read device-wide `reserved` memory via `nvmlDeviceGetMemoryInfo_v2`.
+///
+/// Best-effort and additive: this is the only `NVML` call that breaks out
+/// the driver/firmware reservation (the v1 `nvmlDeviceGetMemoryInfo`
+/// reports the same `total` but folds `reserved` into `used`, never
+/// surfacing it separately). Callers keep the v1 triplet; only the
+/// `reserved_bytes` figure depends on this.
+///
+/// Returns `None` when the running driver predates R510 — the
+/// `nvmlDeviceGetMemoryInfo_v2` symbol is simply absent from older
+/// `nvml.dll` / `libnvidia-ml.so.1`, so the symbol lookup fails (mapped to
+/// `None` via `.ok()?`) rather than the runtime `NVML_ERROR_FUNCTION_NOT_FOUND`
+/// the versioned-pointer dispatch would surface — or when the call itself
+/// returns a non-success code. Caller must already hold an initialized
+/// `NVML` and a valid device handle.
+#[allow(unsafe_code)]
+fn read_device_reserved(lib: &libloading::Library, device: NvmlDevice) -> Option<u64> {
+    // SAFETY: symbol lookup for nvmlDeviceGetMemoryInfo_v2. The name matches
+    // the documented NVML C API and the signature alias matches the header.
+    // On pre-R510 drivers the symbol is absent and `lib.get` returns Err
+    // (mapped to None via `.ok()?`), which the caller treats as "no
+    // reserved figure available".
+    let get_memory_v2: libloading::Symbol<'_, NvmlDeviceGetMemoryInfoV2Fn> =
+        unsafe { lib.get(b"nvmlDeviceGetMemoryInfo_v2\0") }.ok()?;
+
+    let mut mem_v2 = NvmlMemoryInfoV2 {
+        version: NVML_MEMORY_V2_VERSION,
+        total: 0,
+        reserved: 0,
+        free: 0,
+        used: 0,
+    };
+
+    // SAFETY: nvmlDeviceGetMemoryInfo_v2 writes into the caller-provided
+    // NvmlMemoryInfoV2 struct, whose `version` field we set to
+    // NVML_MEMORY_V2_VERSION as the API requires (an unset or mismatched
+    // version yields NVML_ERROR_INVALID_ARGUMENT). The device handle is
+    // valid (acquired by the caller with NVML_SUCCESS).
+    let ret = unsafe { get_memory_v2(device, &raw mut mem_v2) };
+    if ret != NVML_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!("[NVML debug] nvmlDeviceGetMemoryInfo_v2 returned {ret} (no reserved figure)");
+        return None;
+    }
+
+    Some(mem_v2.reserved)
 }
 
 /// Read this process's per-process VRAM via

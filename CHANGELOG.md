@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-29
+
+> *The same total. Now with the carve-out shown.*
+
+Surfaces NVIDIA's driver/firmware **reserved** memory — the carve-out NVML holds *within* its reported `total` (the `nvmlMemory.total = reserved + free + used` identity). On the reference RTX 5060 Ti, `nvidia-smi -q -d MEMORY` prints `Total: 16311 MiB` and `Reserved: 259 MiB`, and hypomnesis now exposes the same **live-measured 259 MiB** via NVML's **v2** query (`nvmlDeviceGetMemoryInfo_v2`, R510+) as a new additive `GpuDeviceInfo::reserved_bytes: Option<u64>`. `reserved_bytes` is a *subset* of `total_bytes`, not an addition to it (memory available for allocation is `total - reserved`, which `free_bytes` already reflects). Driven by a candle-mi v0.1.16 dogfooding report (Principle 1 — every patch is informed by a real consumer's adoption experience); the report *inferred* a 73 MiB carve-out from `DXGI nominal − NVML total`, but that gap is board/ECC overhead sitting *below* NVML's `total` — a different quantity from the v2 `reserved` field (259 MiB), which the live query reports directly. Fully additive under `#[non_exhaustive]`; no breaking change.
+
+### Added
+
+- **`GpuDeviceInfo::reserved_bytes: Option<u64>`** (`src/snapshot.rs`) — device memory reserved for system use (driver or firmware): page tables, context/channel structures, ECC parity. `Some` only on the NVML path with an R510+ driver; `None` on older drivers and on every non-NVML backend (DXGI, nvidia-smi, Metal). It is a *subset* of `total_bytes` (NVML's `total = reserved + free + used`), so allocation headroom is `total_bytes - reserved_bytes`, which `free_bytes` already nets out. `total_bytes` is unchanged — the v1 figure, identical to `nvidia-smi`'s `Total` — preserving existing behaviour byte-for-byte.
+- **NVML v2 memory query** (`src/gpu/nvml.rs`) — new `#[repr(C)] NvmlMemoryInfoV2` (`nvmlMemory_v2_t`: `version`, `total`, `reserved`, `free`, `used`) plus the `NVML_MEMORY_V2_VERSION` struct-version tag (`size_of | (2 << 24)`, required by the API or the call returns `NVML_ERROR_INVALID_ARGUMENT`). A best-effort `read_device_reserved` helper loads `nvmlDeviceGetMemoryInfo_v2` via `libloading`; on pre-R510 drivers the symbol is simply absent and the lookup fails gracefully (`reserved_bytes = None`). The v1 `nvmlDeviceGetMemoryInfo` total/free/used path is untouched — zero regression risk to the existing triplet.
+- **`GpuDeviceInfoBuilder::reserved_bytes`** setter (`src/snapshot.rs`, `test-helpers` feature) — defaults to `None`, mirroring the other byte setters.
+- **`hmn` device summary renders the carve-out** — `GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free N MiB / 16311 MiB (259 MiB reserved)`. The reserved figure is a subset of the reported total (matching `nvidia-smi -q`'s `Total` / `Reserved` lines), and the parenthetical is elided on backends that report `None`, so the line is unchanged where no reserved figure exists.
+- **`tests/live_gpu.rs::device_info_reserved_bytes_is_plausible_when_present`** — live integration test asserting the carve-out is non-zero and a subset of the reported total (`reserved < total`), with `total` within the 1 TiB sanity bound. `#[ignore]`-gated like the other live-GPU tests.
+
 ## [0.2.3] - 2026-06-10
 
 > *Three platforms. Same contract. Resident-bytes everywhere.*

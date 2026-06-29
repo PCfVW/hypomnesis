@@ -109,6 +109,8 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             used_bytes: d
                 .dedicated_video_memory
                 .saturating_sub(d.recommended_max_working_set),
+            // Apple UMA exposes no driver/firmware carve-out figure.
+            reserved_bytes: None,
         });
     }
 
@@ -125,6 +127,10 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             total_bytes: snap.device_total,
             free_bytes: snap.device_free,
             used_bytes: snap.device_used,
+            // Best-effort v2 carve-out; `None` on pre-R510 drivers. The
+            // total/free/used above stay the v1, `nvidia-smi`-consistent
+            // figures regardless.
+            reserved_bytes: snap.reserved_bytes,
         });
     }
 
@@ -138,6 +144,8 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             total_bytes: d.dedicated_video_memory,
             free_bytes: d.dedicated_video_memory.saturating_sub(d.current_usage),
             used_bytes: d.current_usage,
+            // DXGI does not expose the NVML driver/firmware reservation.
+            reserved_bytes: None,
         });
     }
 
@@ -150,6 +158,9 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             total_bytes: result.total_bytes,
             free_bytes: result.total_bytes.saturating_sub(result.used_bytes),
             used_bytes: result.used_bytes,
+            // `nvidia-smi --query-gpu=memory.total` already reports the
+            // usable figure; it has no separate reserved column.
+            reserved_bytes: None,
         });
     }
 
@@ -258,6 +269,8 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
                     total_bytes,
                     free_bytes,
                     used_bytes,
+                    // Non-NVIDIA DXGI adapters have no NVML reserved figure.
+                    reserved_bytes: None,
                 },
                 ProcessGpuInfo {
                     used_bytes,

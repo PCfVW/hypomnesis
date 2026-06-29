@@ -34,6 +34,25 @@ pub struct GpuDeviceInfo {
     pub free_bytes: u64,
     /// Used GPU memory in bytes (device-wide; sum across all processes).
     pub used_bytes: u64,
+    /// Device memory reserved for system use (driver or firmware), in
+    /// bytes — the `nvmlMemory_v2_t.reserved` carve-out (page tables,
+    /// context/channel structures, ECC parity).
+    ///
+    /// `Some` only on the `NVML` path with an R510+ driver (where
+    /// `nvmlDeviceGetMemoryInfo_v2` succeeds). `None` on older drivers and
+    /// on every non-`NVML` backend (`DXGI`, `nvidia-smi`, Metal).
+    ///
+    /// When `Some`, this is a **subset of** [`Self::total_bytes`], not an
+    /// addition to it: NVML's `total` already satisfies
+    /// `total = reserved + free + used`, so memory available for allocation
+    /// is `total_bytes - reserved_bytes` (and [`Self::free_bytes`] already
+    /// nets it out). `total_bytes` is the full framebuffer NVML reports —
+    /// identical to what `nvidia-smi -q -d MEMORY` prints as `Total`, with
+    /// `reserved_bytes` matching its `Reserved` line. (Do **not** confuse
+    /// this with the smaller board/ECC overhead between a card's nominal
+    /// capacity and NVML's `total` — that gap sits *below* `total_bytes`
+    /// and NVML does not expose it.)
+    pub reserved_bytes: Option<u64>,
 }
 
 /// Per-process GPU memory information.
@@ -449,7 +468,8 @@ impl GpuDeviceInfo {
 /// Each setter consumes `self` and returns `Self`, enabling a chained
 /// construction (`GpuDeviceInfo::builder().index(1).total_bytes(N).build()`).
 /// Unset fields take the documented defaults: `index = 0`, `name = None`,
-/// `total_bytes = 0`, `free_bytes = 0`, `used_bytes = 0`.
+/// `total_bytes = 0`, `free_bytes = 0`, `used_bytes = 0`,
+/// `reserved_bytes = None`.
 ///
 /// # Semver
 ///
@@ -489,6 +509,8 @@ pub struct GpuDeviceInfoBuilder {
     free_bytes: u64,
     /// Pending [`GpuDeviceInfo::used_bytes`] value, defaults to `0`.
     used_bytes: u64,
+    /// Pending [`GpuDeviceInfo::reserved_bytes`] value, defaults to `None`.
+    reserved_bytes: Option<u64>,
 }
 
 #[cfg(feature = "test-helpers")]
@@ -541,6 +563,14 @@ impl GpuDeviceInfoBuilder {
         self
     }
 
+    /// Set the device memory reserved for system use, in bytes
+    /// (`None` to leave unset).
+    #[must_use]
+    pub const fn reserved_bytes(mut self, reserved: Option<u64>) -> Self {
+        self.reserved_bytes = reserved;
+        self
+    }
+
     /// Consume the builder and produce the configured `GpuDeviceInfo`.
     ///
     /// Unset fields take the documented defaults.
@@ -552,6 +582,7 @@ impl GpuDeviceInfoBuilder {
             total_bytes: self.total_bytes,
             free_bytes: self.free_bytes,
             used_bytes: self.used_bytes,
+            reserved_bytes: self.reserved_bytes,
         }
     }
 }
@@ -591,6 +622,7 @@ mod tests {
                     total_bytes: total,
                     free_bytes: total.saturating_sub(vram_used.unwrap_or(0)),
                     used_bytes: vram_used.unwrap_or(0),
+                    reserved_bytes: None,
                 })
             } else {
                 None
@@ -660,6 +692,7 @@ mod tests {
             total_bytes: 16_384 * 1_048_576,
             free_bytes: 13_284 * 1_048_576,
             used_bytes: 3_100 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(
             dev.format_free(),
@@ -676,6 +709,7 @@ mod tests {
             total_bytes: 8_192 * 1_048_576,
             free_bytes: 4_096 * 1_048_576,
             used_bytes: 4_096 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(dev.format_free(), "  GPU 1: free 4096 MB / 8192 MB\n");
     }
@@ -690,6 +724,7 @@ mod tests {
             total_bytes: 4_096 * 1_048_576,
             free_bytes: 0,
             used_bytes: 4_096 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(
             dev.format_free(),
@@ -706,6 +741,7 @@ mod tests {
             total_bytes: 1_000,
             free_bytes: 500,
             used_bytes: 500,
+            reserved_bytes: None,
         };
         dev.print_free();
     }
@@ -723,6 +759,7 @@ mod tests {
             total_bytes: 16_384 * 1_048_576,
             free_bytes: 13_284 * 1_048_576,
             used_bytes: 3_100 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(
             dev.format_total(),
@@ -739,6 +776,7 @@ mod tests {
             total_bytes: 8_192 * 1_048_576,
             free_bytes: 4_096 * 1_048_576,
             used_bytes: 4_096 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(dev.format_total(), "  GPU 1: total 8192 MB\n");
     }
@@ -753,6 +791,7 @@ mod tests {
             total_bytes: 4_096 * 1_048_576,
             free_bytes: 0,
             used_bytes: 4_096 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(
             dev.format_total(),
@@ -769,6 +808,7 @@ mod tests {
             total_bytes: 16_384 * 1_048_576,
             free_bytes: 13_284 * 1_048_576,
             used_bytes: 3_100 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(
             dev.format_used(),
@@ -785,6 +825,7 @@ mod tests {
             total_bytes: 8_192 * 1_048_576,
             free_bytes: 4_096 * 1_048_576,
             used_bytes: 4_096 * 1_048_576,
+            reserved_bytes: None,
         };
         assert_eq!(dev.format_used(), "  GPU 1: used 4096 MB\n");
     }
@@ -799,6 +840,7 @@ mod tests {
             total_bytes: 4_096 * 1_048_576,
             free_bytes: 4_096 * 1_048_576,
             used_bytes: 0,
+            reserved_bytes: None,
         };
         assert_eq!(dev.format_used(), "  GPU 2: used 0 MB [Idle GPU]\n");
     }
@@ -815,6 +857,7 @@ mod tests {
             total_bytes: 0,
             free_bytes: 0,
             used_bytes: 0,
+            reserved_bytes: None,
         };
         assert_eq!(dev.name_or_unknown(), "NVIDIA Test GPU");
     }
@@ -827,6 +870,7 @@ mod tests {
             total_bytes: 0,
             free_bytes: 0,
             used_bytes: 0,
+            reserved_bytes: None,
         };
         assert_eq!(dev.name_or_unknown(), "unknown GPU");
     }
@@ -844,6 +888,7 @@ mod tests {
         assert_eq!(dev.total_bytes, 0);
         assert_eq!(dev.free_bytes, 0);
         assert_eq!(dev.used_bytes, 0);
+        assert!(dev.reserved_bytes.is_none());
     }
 
     #[cfg(feature = "test-helpers")]
@@ -891,11 +936,21 @@ mod tests {
             .total_bytes(17_179_869_184)
             .free_bytes(15_246_684_160)
             .used_bytes(1_933_185_024)
+            .reserved_bytes(Some(76_546_048))
             .build();
         assert_eq!(dev.index, 1);
         assert_eq!(dev.name.as_deref(), Some("Round-Trip GPU"));
         assert_eq!(dev.total_bytes, 17_179_869_184);
         assert_eq!(dev.free_bytes, 15_246_684_160);
         assert_eq!(dev.used_bytes, 1_933_185_024);
+        assert_eq!(dev.reserved_bytes, Some(76_546_048));
+        // `reserved_bytes` is a subset of `total_bytes` (NVML's
+        // `total = reserved + free + used`), so memory available for
+        // allocation is `total - reserved`, never `total + reserved`.
+        assert!(dev.reserved_bytes.unwrap() < dev.total_bytes);
+        assert_eq!(
+            dev.total_bytes - dev.reserved_bytes.unwrap(),
+            17_179_869_184 - 76_546_048
+        );
     }
 }

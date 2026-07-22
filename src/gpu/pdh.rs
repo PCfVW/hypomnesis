@@ -3,9 +3,9 @@
 //! Windows `PDH` (Performance Data Helper) per-process `VRAM` backend.
 //!
 //! Closes the per-process-memory gap on consumer Windows / `WDDM` by
-//! reading `\GPU Process Memory(*)\Dedicated Usage` through `pdh.dll`.
-//! Same `VidMm` data Task Manager surfaces, accessed through a stable
-//! and documented C API.
+//! reading `\GPU Process Memory(*)\Dedicated Usage` and its sibling
+//! `Shared Usage` counter through `pdh.dll`. Same `VidMm` data Task
+//! Manager surfaces, accessed through a stable and documented C API.
 //!
 //! # Background
 //!
@@ -43,6 +43,27 @@
 //! ledger. Consumers wanting "resident bytes only" must look
 //! elsewhere (there is no public `WDDM` API for it; ETW provides it
 //! at the cost of a heavy session setup, out of scope here).
+//!
+//! # `shared_used_bytes` semantics: resident shared, the spill signal
+//!
+//! The `Shared Usage` sibling counter (v0.2.5) is a different animal:
+//! it reports the process's **resident** shared-system-memory bytes —
+//! the same quantity Task Manager's per-process *Shared GPU memory*
+//! column shows. This — not the commit figure above — is the `WDDM`
+//! spill signal: when `VidMm` pages GPU allocations out of dedicated
+//! `VRAM`, the evicted pages become resident in shared system memory
+//! and this counter grows. A compute-bound process routinely shows
+//! `used_bytes` (commit) far above dedicated `VRAM` while
+//! `shared_used_bytes` stays ≈ 0 — that is reservation headroom, not
+//! spill (rhyme-mdlm dogfooding report, 2026-07-19). The
+//! [`KB 4490156`] drift below afflicts the commit accounting, not
+//! this residency gauge.
+//!
+//! Counter presence verified live on the reference `RTX 5060 Ti`
+//! (2026-07-22, `typeperf -q "GPU Process Memory"`): `Shared Usage`
+//! is enumerated alongside `Dedicated Usage`, `Local Usage`,
+//! `Non Local Usage`, and `Total Committed`, with the identical
+//! `pid_NNNN_luid_0xHHHHHHHH_0xHHHHHHHH_phys_N` instance mangling.
 //!
 //! # Adapter targeting
 //!
@@ -146,7 +167,31 @@ struct SegmentRow {
     /// Dedicated `VRAM` bytes for this `(pid, segment)` row, read from
     /// `\GPU Process Memory(<instance>)\Dedicated Usage` via
     /// [`PdhGetFormattedCounterValue`] with `PDH_FMT_LARGE`.
+    /// `VidMm` dedicated **commit** semantics — see the module docs.
     used_bytes: u64,
+    /// Resident shared-system-memory bytes for this `(pid, segment)`
+    /// row, read from `\GPU Process Memory(<instance>)\Shared Usage` —
+    /// the `WDDM` spill signal (see the module docs). `0` when the
+    /// shared counter could not be added or read for this instance
+    /// (best-effort degradation, the row itself is kept).
+    shared_used_bytes: u64,
+}
+
+/// Counter handles for one enumerated `(pid, segment)` instance,
+/// correlating sampled values back to their source row after the
+/// single [`PdhCollectQueryData`] call.
+struct InstanceCounters {
+    /// OS process ID parsed from the instance name.
+    pid: u32,
+    /// Memory partition index parsed from the instance name.
+    segment_idx: u32,
+    /// `Dedicated Usage` counter handle. Always present — instances
+    /// whose dedicated counter fails to add are skipped entirely.
+    dedicated: PDH_HCOUNTER,
+    /// `Shared Usage` counter handle. `None` when [`PdhAddCounterW`]
+    /// failed for the shared path — best-effort: the row survives with
+    /// `shared_used_bytes: 0` rather than being dropped.
+    shared: Option<PDH_HCOUNTER>,
 }
 
 /// `RAII` guard for a `PDH` query handle.
@@ -179,21 +224,17 @@ impl Drop for QueryGuard {
 // Pure helpers (unit-testable without FFI)
 // -----------------------------------------------------------------------
 
-/// Parse a `PDH` `\GPU Process Memory` instance name into
-/// `(pid, (luid_high, luid_low), segment_idx)`.
+/// Parse the shared `luid_0xHHHHHHHH_0xHHHHHHHH_phys_N` tail of a
+/// `PDH` GPU counter instance name into
+/// `((luid_high, luid_low), segment_idx)`.
 ///
-/// Format: `pid_NNNN_luid_0xHHHHHHHH_0xHHHHHHHH_phys_N`. The `LUID`
+/// Common to both counter sets this module reads: `GPU Process
+/// Memory` instances carry a `pid_NNNN_` prefix before this tail,
+/// `GPU Adapter Memory` instances are the bare tail. The `LUID`
 /// `HighPart` is a Windows `LONG` (`i32`); `PDH` writes its bit
 /// pattern as unsigned hex, so we parse as `u32` then bit-reinterpret.
-/// Returns `None` for malformed or non-`GPU Process Memory` instance
-/// names (e.g., the `_Total` instance, or instances from an unrelated
-/// counter set if the API ever reuses them).
 #[must_use]
-fn parse_instance_name(name: &str) -> Option<(u32, (i32, u32), u32)> {
-    let rest = name.strip_prefix("pid_")?;
-    let (pid_str, rest) = rest.split_once('_')?;
-    let pid: u32 = pid_str.parse().ok()?;
-
+fn parse_luid_tail(rest: &str) -> Option<((i32, u32), u32)> {
     let rest = rest.strip_prefix("luid_0x")?;
     let (high_str, rest) = rest.split_once("_0x")?;
     let high_u32: u32 = u32::from_str_radix(high_str, 16).ok()?;
@@ -208,7 +249,39 @@ fn parse_instance_name(name: &str) -> Option<(u32, (i32, u32), u32)> {
 
     let segment_idx: u32 = seg_str.parse().ok()?;
 
-    Some((pid, (high, low), segment_idx))
+    Some(((high, low), segment_idx))
+}
+
+/// Parse a `PDH` `\GPU Process Memory` instance name into
+/// `(pid, (luid_high, luid_low), segment_idx)`.
+///
+/// Format: `pid_NNNN_luid_0xHHHHHHHH_0xHHHHHHHH_phys_N` (the shared
+/// tail is delegated to [`parse_luid_tail`]). Returns `None` for
+/// malformed or non-`GPU Process Memory` instance names (e.g., the
+/// `_Total` instance, or instances from an unrelated counter set if
+/// the API ever reuses them).
+#[must_use]
+fn parse_instance_name(name: &str) -> Option<(u32, (i32, u32), u32)> {
+    let rest = name.strip_prefix("pid_")?;
+    let (pid_str, rest) = rest.split_once('_')?;
+    let pid: u32 = pid_str.parse().ok()?;
+    let (luid, segment_idx) = parse_luid_tail(rest)?;
+    Some((pid, luid, segment_idx))
+}
+
+/// Parse a `PDH` `\GPU Adapter Memory` instance name into
+/// `((luid_high, luid_low), segment_idx)`.
+///
+/// Format: `luid_0xHHHHHHHH_0xHHHHHHHH_phys_N` — the bare `LUID`
+/// tail, with no `pid_` prefix (adapter instances are
+/// per-adapter-segment, not per-process). Verified live on the
+/// reference `RTX 5060 Ti` (2026-07-22,
+/// `typeperf -qx "GPU Adapter Memory"`). Returns `None` for
+/// `pid_`-prefixed process instances, the `_Total` instance, and
+/// anything else not matching the tail format.
+#[must_use]
+fn parse_adapter_instance_name(name: &str) -> Option<((i32, u32), u32)> {
+    parse_luid_tail(name)
 }
 
 /// Parse `PDH`'s multi-string buffer into individual instance names.
@@ -228,6 +301,174 @@ fn parse_multi_string(buf: &[u16]) -> Vec<String> {
 // -----------------------------------------------------------------------
 // PDH FFI: counter enumeration + value collection
 // -----------------------------------------------------------------------
+
+/// Add one counter path to an open `PDH` query, returning the counter
+/// handle on success.
+///
+/// Failures are best-effort by design: callers skip or degrade the
+/// affected row rather than aborting the whole query (matching the
+/// per-instance error policy documented on [`collect_segmented_rows`]).
+/// The failed status code is debug-traced with the offending path.
+#[allow(unsafe_code)]
+fn add_counter(query: PDH_HQUERY, counter_path: &str) -> Option<PDH_HCOUNTER> {
+    // BORROW: explicit `encode_utf16` + chain(Some(0)) — PdhAddCounterW
+    // requires a NUL-terminated UTF-16 string; the encoded path is
+    // owned for the duration of the call.
+    let counter_path_wide: Vec<u16> = counter_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut h_counter = PDH_HCOUNTER::default();
+    // SAFETY: `query` is a valid open query handle (caller invariant —
+    // every call site owns a live QueryGuard). counter_path_wide is
+    // NUL-terminated and lives until the call returns. h_counter is a
+    // valid stack-allocated out-parameter (zero-initialised).
+    let status = unsafe {
+        PdhAddCounterW(
+            query,
+            PCWSTR::from_raw(counter_path_wide.as_ptr()),
+            0,
+            &raw mut h_counter,
+        )
+    };
+
+    if status != PDH_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!("[PDH debug] PdhAddCounterW failed for path {counter_path:?}: 0x{status:08X}");
+        return None;
+    }
+    Some(h_counter)
+}
+
+/// Enumerate the instance names of one `PDH` counter object (the
+/// two-call size-query / data-fetch protocol).
+///
+/// Returns `Ok(None)` when the counter set is not registered on the
+/// system (`PDH_CSTATUS_NO_OBJECT`) — a capability absence the caller
+/// maps to its own semantics: a hard error with a pre-`WDDM 2.0` hint
+/// for `GPU Process Memory`, a graceful "spill not measurable" for
+/// `GPU Adapter Memory`. Returns `Ok(Some(vec))` (possibly empty)
+/// when the set exists. `object` and `object_label` must name the
+/// same counter set — the former as the `w!` UTF-16 literal `PDH`
+/// consumes, the latter for error messages.
+///
+/// # Errors
+///
+/// Returns [`HypomnesisError::Pdh`] when either [`PdhEnumObjectItemsW`]
+/// call fails with a status other than `PDH_MORE_DATA` (size query) or
+/// [`PDH_SUCCESS`] (data fetch).
+#[allow(unsafe_code)]
+fn enum_object_instances(object: PCWSTR, object_label: &str) -> Result<Option<Vec<String>>> {
+    // ---- Size query -------------------------------------------------------
+    let mut counter_size: u32 = 0;
+    let mut instance_size: u32 = 0;
+    // SAFETY: PdhEnumObjectItemsW called with None buffers is the documented
+    // "tell me the required buffer sizes" mode. The two pcch* parameters are
+    // valid mutable references; `object` is a static UTF-16 string from `w!`
+    // (caller invariant). PDH writes only into the size out-parameters on
+    // this call and returns PDH_MORE_DATA on success.
+    let status = unsafe {
+        PdhEnumObjectItemsW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            object,
+            None,
+            &raw mut counter_size,
+            None,
+            &raw mut instance_size,
+            PERF_DETAIL_WIZARD,
+            0,
+        )
+    };
+
+    if status == PDH_CSTATUS_NO_OBJECT {
+        return Ok(None);
+    }
+
+    // No instances at all → empty list (the counter set itself exists).
+    if status == PDH_SUCCESS && instance_size <= 1 {
+        return Ok(Some(Vec::new()));
+    }
+
+    if status != PDH_MORE_DATA {
+        return Err(HypomnesisError::Pdh(format!(
+            "PdhEnumObjectItemsW (size query, {object_label}) failed: 0x{status:08X}"
+        )));
+    }
+
+    // ---- Data fetch -------------------------------------------------------
+    // CAST: u32 → usize, sizes are PDH-reported buffer lengths in u16
+    // chars; fit trivially in usize on every supported platform.
+    #[allow(clippy::as_conversions)]
+    let mut counter_buffer: Vec<u16> = vec![0; counter_size as usize];
+    #[allow(clippy::as_conversions)]
+    let mut instance_buffer: Vec<u16> = vec![0; instance_size as usize];
+
+    // SAFETY: PdhEnumObjectItemsW now called with PWSTR-wrapped buffers
+    // sized per the previous PDH_MORE_DATA response. Buffer pointers are
+    // valid for the full `counter_size` / `instance_size` UTF-16 chars (Vec
+    // allocation matches). The size out-parameters get rewritten with the
+    // actual written length. PWSTR (mutable wide) is the right wrapper here
+    // because PDH writes into the buffers.
+    let status = unsafe {
+        PdhEnumObjectItemsW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            object,
+            Some(PWSTR::from_raw(counter_buffer.as_mut_ptr())),
+            &raw mut counter_size,
+            Some(PWSTR::from_raw(instance_buffer.as_mut_ptr())),
+            &raw mut instance_size,
+            PERF_DETAIL_WIZARD,
+            0,
+        )
+    };
+
+    if status != PDH_SUCCESS {
+        return Err(HypomnesisError::Pdh(format!(
+            "PdhEnumObjectItemsW (data fetch, {object_label}) failed: 0x{status:08X}"
+        )));
+    }
+
+    Ok(Some(parse_multi_string(&instance_buffer)))
+}
+
+/// Read a sampled counter's formatted value as a non-negative byte
+/// count.
+///
+/// Returns `None` when [`PdhGetFormattedCounterValue`] fails or when
+/// the counter reports a negative value (which would indicate a
+/// counter-implementation bug / sentinel — rejected rather than
+/// bit-wrapped). Callers skip or zero the affected row.
+#[allow(unsafe_code)]
+#[must_use]
+fn read_counter_bytes(h_counter: PDH_HCOUNTER) -> Option<u64> {
+    let mut value = PDH_FMT_COUNTERVALUE::default();
+    // SAFETY: h_counter was returned by a successful PdhAddCounterW on
+    // a query that has since been sampled via PdhCollectQueryData
+    // (caller invariant). `value` is a valid stack-allocated
+    // out-parameter. PDH_FMT_LARGE selects the `largeValue` (i64)
+    // union arm, set on success.
+    let status =
+        unsafe { PdhGetFormattedCounterValue(h_counter, PDH_FMT_LARGE, None, &raw mut value) };
+    if status != PDH_SUCCESS {
+        return None;
+    }
+
+    // SAFETY: PDH_FMT_LARGE was passed to PdhGetFormattedCounterValue
+    // and the call succeeded; per Microsoft docs that sets the
+    // `largeValue` arm of the union. Reading any other arm would be
+    // unsound, but we read exactly the arm we requested.
+    let raw_value: i64 = unsafe { value.Anonymous.largeValue };
+    if raw_value < 0 {
+        return None;
+    }
+    // CAST: i64 → u64, non-negative just checked; byte counts are
+    // documented non-negative.
+    #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+    Some(raw_value as u64)
+}
 
 /// Open a `PDH` query, enumerate `GPU Process Memory` instances,
 /// filter to those matching `target_luid`, sample each, and return one
@@ -271,88 +512,26 @@ fn collect_segmented_rows(target_luid: (i32, u32)) -> Result<Vec<SegmentRow>> {
     }
     let query = QueryGuard { handle: raw_handle };
 
-    // ---- 2. Enumerate instances (size query) ------------------------------
-    let mut counter_size: u32 = 0;
-    let mut instance_size: u32 = 0;
-    // SAFETY: PdhEnumObjectItemsW called with None buffers is the documented
-    // "tell me the required buffer sizes" mode. The two pcch* parameters are
-    // valid mutable references; the object-name literal is a static UTF-16
-    // string from `w!`. PDH writes only into the size out-parameters on this
-    // call and returns PDH_MORE_DATA on success.
-    let status = unsafe {
-        PdhEnumObjectItemsW(
-            PCWSTR::null(),
-            PCWSTR::null(),
-            w!("GPU Process Memory"),
-            None,
-            &raw mut counter_size,
-            None,
-            &raw mut instance_size,
-            PERF_DETAIL_WIZARD,
-            0,
-        )
-    };
-
-    if status == PDH_CSTATUS_NO_OBJECT {
+    // ---- 2. Enumerate instances -------------------------------------------
+    // On absence of the counter set, the query closes via Drop.
+    let Some(instances) = enum_object_instances(w!("GPU Process Memory"), "GPU Process Memory")?
+    else {
         return Err(HypomnesisError::Pdh(
             "GPU Process Memory counter set not registered (pre-WDDM 2.0?)".to_owned(),
         ));
-    }
-
-    // No instances at all → return empty. The query closes via Drop.
-    if status == PDH_SUCCESS && instance_size <= 1 {
-        return Ok(Vec::new());
-    }
-
-    if status != PDH_MORE_DATA {
-        return Err(HypomnesisError::Pdh(format!(
-            "PdhEnumObjectItemsW (size query) failed: 0x{status:08X}"
-        )));
-    }
-
-    // ---- 3. Enumerate instances (data fetch) ------------------------------
-    // CAST: u32 → usize, sizes are PDH-reported buffer lengths in u16
-    // chars; fit trivially in usize on every supported platform.
-    #[allow(clippy::as_conversions)]
-    let mut counter_buffer: Vec<u16> = vec![0; counter_size as usize];
-    #[allow(clippy::as_conversions)]
-    let mut instance_buffer: Vec<u16> = vec![0; instance_size as usize];
-
-    // SAFETY: PdhEnumObjectItemsW now called with PWSTR-wrapped buffers
-    // sized per the previous PDH_MORE_DATA response. Buffer pointers are
-    // valid for the full `counter_size` / `instance_size` UTF-16 chars (Vec
-    // allocation matches). The size out-parameters get rewritten with the
-    // actual written length. PWSTR (mutable wide) is the right wrapper here
-    // because PDH writes into the buffers.
-    let status = unsafe {
-        PdhEnumObjectItemsW(
-            PCWSTR::null(),
-            PCWSTR::null(),
-            w!("GPU Process Memory"),
-            Some(PWSTR::from_raw(counter_buffer.as_mut_ptr())),
-            &raw mut counter_size,
-            Some(PWSTR::from_raw(instance_buffer.as_mut_ptr())),
-            &raw mut instance_size,
-            PERF_DETAIL_WIZARD,
-            0,
-        )
     };
-
-    if status != PDH_SUCCESS {
-        return Err(HypomnesisError::Pdh(format!(
-            "PdhEnumObjectItemsW (data fetch) failed: 0x{status:08X}"
-        )));
-    }
-
-    let instances = parse_multi_string(&instance_buffer);
 
     #[cfg(feature = "debug-output")]
     eprintln!("[PDH debug] enumerated {} instance(s)", instances.len());
 
-    // ---- 4. Add a counter per matching instance ---------------------------
-    // Stores (pid, segment_idx, counter handle) so we can correlate values
-    // back to their source row after PdhCollectQueryData.
-    let mut counter_handles: Vec<(u32, u32, PDH_HCOUNTER)> = Vec::new();
+    // ---- 3. Add counters per matching instance ----------------------------
+    // Stores per-instance handles so we can correlate values back to
+    // their source row after PdhCollectQueryData. Two counters per
+    // instance: `Dedicated Usage` (mandatory — skip the row without it)
+    // and its `Shared Usage` sibling (best-effort — the row degrades to
+    // shared_used_bytes = 0 without it). Both attach to the same query,
+    // so the single collect in step 5 samples both at once.
+    let mut counter_handles: Vec<InstanceCounters> = Vec::new();
 
     for instance in &instances {
         let Some((pid, luid, segment_idx)) = parse_instance_name(instance) else {
@@ -362,48 +541,33 @@ fn collect_segmented_rows(target_luid: (i32, u32)) -> Result<Vec<SegmentRow>> {
             continue;
         }
 
-        // BORROW: explicit `encode_utf16` + chain(Some(0)) — PdhAddCounterW
-        // requires a NUL-terminated UTF-16 string; the encoded path is
-        // owned for the duration of the call.
-        let counter_path = format!("\\GPU Process Memory({instance})\\Dedicated Usage");
-        let counter_path_wide: Vec<u16> = counter_path
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut h_counter = PDH_HCOUNTER::default();
-        // SAFETY: query.handle is valid (RAII invariant). counter_path_wide
-        // is NUL-terminated and lives until end of iteration. h_counter is a
-        // valid stack-allocated out-parameter (zero-initialised). Per-instance
-        // failure is best-effort: skip the row rather than abort the whole
-        // enumeration.
-        let status = unsafe {
-            PdhAddCounterW(
-                query.handle,
-                PCWSTR::from_raw(counter_path_wide.as_ptr()),
-                0,
-                &raw mut h_counter,
-            )
+        let dedicated_path = format!("\\GPU Process Memory({instance})\\Dedicated Usage");
+        let Some(dedicated) = add_counter(query.handle, &dedicated_path) else {
+            #[cfg(feature = "debug-output")]
+            eprintln!("[PDH debug] instance {instance:?} skipped (no Dedicated Usage counter)");
+            continue;
         };
 
-        if status == PDH_SUCCESS {
-            counter_handles.push((pid, segment_idx, h_counter));
-        } else {
-            #[cfg(feature = "debug-output")]
-            eprintln!(
-                "[PDH debug] PdhAddCounterW failed for instance {instance:?}: 0x{status:08X} (skipped)"
-            );
-        }
+        let shared_path = format!("\\GPU Process Memory({instance})\\Shared Usage");
+        let shared = add_counter(query.handle, &shared_path);
+
+        counter_handles.push(InstanceCounters {
+            pid,
+            segment_idx,
+            dedicated,
+            shared,
+        });
     }
 
     if counter_handles.is_empty() {
         return Ok(Vec::new());
     }
 
-    // ---- 5. Collect one sample for the whole query ------------------------
+    // ---- 4. Collect one sample for the whole query ------------------------
     // SAFETY: query.handle is valid; PdhCollectQueryData samples every
-    // counter added to the query in a single call. `Dedicated Usage` is an
-    // instantaneous gauge (not a rate), so one sample suffices.
+    // counter added to the query in a single call. `Dedicated Usage` and
+    // `Shared Usage` are instantaneous gauges (not rates), so one sample
+    // suffices for both.
     let status = unsafe { PdhCollectQueryData(query.handle) };
     if status != PDH_SUCCESS {
         return Err(HypomnesisError::Pdh(format!(
@@ -411,48 +575,29 @@ fn collect_segmented_rows(target_luid: (i32, u32)) -> Result<Vec<SegmentRow>> {
         )));
     }
 
-    // ---- 6. Read each counter's formatted value ---------------------------
+    // ---- 5. Read each counter's formatted value ---------------------------
     let mut rows: Vec<SegmentRow> = Vec::with_capacity(counter_handles.len());
-    for (pid, segment_idx, h_counter) in counter_handles {
-        let mut value = PDH_FMT_COUNTERVALUE::default();
-        // SAFETY: h_counter was returned by a successful PdhAddCounterW
-        // within this query; the query has been sampled (step 5). value is
-        // a valid stack-allocated out-parameter. PDH_FMT_LARGE selects the
-        // `largeValue` (i64) union arm, set on success.
-        let status =
-            unsafe { PdhGetFormattedCounterValue(h_counter, PDH_FMT_LARGE, None, &raw mut value) };
-
-        if status != PDH_SUCCESS {
+    for ic in counter_handles {
+        // Dedicated read failure (or negative sentinel) drops the row —
+        // same policy as before v0.2.5.
+        let Some(used_bytes) = read_counter_bytes(ic.dedicated) else {
             #[cfg(feature = "debug-output")]
             eprintln!(
-                "[PDH debug] PdhGetFormattedCounterValue failed for pid={pid} seg={segment_idx}: 0x{status:08X} (skipped)"
+                "[PDH debug] Dedicated Usage read failed for pid={} seg={} (skipped)",
+                ic.pid, ic.segment_idx
             );
             continue;
-        }
+        };
 
-        // SAFETY: PDH_FMT_LARGE was passed to PdhGetFormattedCounterValue
-        // and the call succeeded; per Microsoft docs that sets the
-        // `largeValue` arm of the union. Reading any other arm would be
-        // unsound, but we read exactly the arm we requested.
-        let raw_value: i64 = unsafe { value.Anonymous.largeValue };
-
-        // CAST: i64 → u64, `Dedicated Usage` is a byte count and is
-        // documented non-negative. Negative values would indicate a
-        // counter-implementation bug (sentinel) — skip with debug trace.
-        if raw_value < 0 {
-            #[cfg(feature = "debug-output")]
-            eprintln!(
-                "[PDH debug] negative Dedicated Usage for pid={pid} seg={segment_idx}: {raw_value} (skipped)"
-            );
-            continue;
-        }
-        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
-        let used_bytes = raw_value as u64;
+        // Shared read failure degrades to 0 — the dedicated figure is
+        // still valuable on its own.
+        let shared_used_bytes = ic.shared.and_then(read_counter_bytes).unwrap_or(0);
 
         rows.push(SegmentRow {
-            pid,
-            segment_idx,
+            pid: ic.pid,
+            segment_idx: ic.segment_idx,
             used_bytes,
+            shared_used_bytes,
         });
     }
 
@@ -464,8 +609,33 @@ fn collect_segmented_rows(target_luid: (i32, u32)) -> Result<Vec<SegmentRow>> {
 // Public entry point
 // -----------------------------------------------------------------------
 
-/// Per-process dedicated `VRAM` for every process holding memory on
-/// the adapter at `device_index`, aggregated across memory segments.
+/// One aggregated per-process memory row from the `PDH` walk.
+///
+/// `dedicated_committed_bytes` carries the v0.2.2 `Dedicated Usage`
+/// semantics unchanged (`VidMm` dedicated **commit** — the name spells
+/// it out at the hand-off point, where `GpuProcessEntry` flattens it
+/// back into `used_bytes`); `shared_used_bytes` is the resident
+/// shared-system-memory figure from `Shared Usage` — the `WDDM` spill
+/// signal, named identically to its [`SegmentRow`] source and its
+/// `GpuProcessEntry` destination. Named fields rather than a tuple
+/// because the two byte counts are trivially easy to transpose
+/// silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcessMemoryRow {
+    /// OS process ID.
+    pub(super) pid: u32,
+    /// Dedicated commit bytes (`Dedicated Usage`), aggregated across
+    /// memory segments. See the module docs for the commit-vs-resident
+    /// distinction.
+    pub(super) dedicated_committed_bytes: u64,
+    /// Resident shared bytes (`Shared Usage`), aggregated across
+    /// memory segments — the `WDDM` spill signal.
+    pub(super) shared_used_bytes: u64,
+}
+
+/// Per-process dedicated `VRAM` commit plus resident shared bytes for
+/// every process holding memory on the adapter at `device_index`,
+/// aggregated across memory segments.
 ///
 /// Returned vector has **at most one entry per `pid`** — segmented
 /// `PDH` rows for the same process on the target adapter are summed
@@ -479,7 +649,7 @@ fn collect_segmented_rows(target_luid: (i32, u32)) -> Result<Vec<SegmentRow>> {
 /// unregistered (pre-`WDDM 2.0`) surfaces as a specific `PDH` error
 /// message naming the cause, so [`crate::gpu::gpu_processes`] can
 /// pattern-match and fall back to `nvidia-smi` if desired.
-pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<(u32, u64)>> {
+pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<ProcessMemoryRow>> {
     let target_luid = super::dxgi::adapter_luid(device_index).ok_or_else(|| {
         HypomnesisError::Pdh(format!(
             "no NVIDIA adapter at device_index {device_index} via DXGI walk"
@@ -488,15 +658,242 @@ pub(super) fn query_per_process_vram(device_index: u32) -> Result<Vec<(u32, u64)
 
     let segments = collect_segmented_rows(target_luid)?;
 
-    let mut by_pid: HashMap<u32, u64> = HashMap::with_capacity(segments.len());
+    let mut by_pid: HashMap<u32, (u64, u64)> = HashMap::with_capacity(segments.len());
     for row in segments {
-        by_pid
-            .entry(row.pid)
-            .and_modify(|acc| *acc = acc.saturating_add(row.used_bytes))
-            .or_insert(row.used_bytes);
+        let acc = by_pid.entry(row.pid).or_insert((0, 0));
+        acc.0 = acc.0.saturating_add(row.used_bytes);
+        acc.1 = acc.1.saturating_add(row.shared_used_bytes);
     }
 
-    Ok(by_pid.into_iter().collect())
+    Ok(by_pid
+        .into_iter()
+        .map(
+            |(pid, (dedicated_committed_bytes, shared_used_bytes))| ProcessMemoryRow {
+                pid,
+                dedicated_committed_bytes,
+                shared_used_bytes,
+            },
+        )
+        .collect())
+}
+
+// -----------------------------------------------------------------------
+// Adapter-wide memory query (spill-detection support, v0.2.5)
+// -----------------------------------------------------------------------
+
+/// One sampled adapter-wide memory reading, summed across the `phys_N`
+/// segments of the target adapter.
+///
+/// Crate-internal (the module is `pub(crate)`), constructed only by
+/// [`AdapterMemQuery::sample`] — deliberately not `#[non_exhaustive]`;
+/// field additions are same-crate refactors, not API evolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Field names deliberately keep the `_bytes` unit suffix used across
+// the crate's public types (`used_bytes`, `total_bytes`, ...).
+#[allow(clippy::struct_field_names)]
+pub struct AdapterMemSample {
+    /// Resident dedicated `VRAM` bytes, adapter-wide
+    /// (`\GPU Adapter Memory(<instance>)\Dedicated Usage`).
+    pub dedicated_bytes: u64,
+    /// Dedicated `VRAM` capacity in bytes, from `DXGI`'s static
+    /// `DedicatedVideoMemory`. No `Dedicated Limit` counter exists in
+    /// the `GPU Adapter Memory` set (verified live on the reference
+    /// `RTX 5060 Ti`, 2026-07-22 — the set carries only
+    /// `Dedicated Usage`, `Shared Usage`, `Total Committed`), so the
+    /// capacity is captured once at [`AdapterMemQuery::open`] time.
+    /// `0` when the `DXGI` walk could not resolve the adapter —
+    /// consumers must treat `0` as "limit unknown", never as a real
+    /// capacity.
+    pub limit_bytes: u64,
+    /// Resident shared-system-memory bytes, adapter-wide
+    /// (`\GPU Adapter Memory(<instance>)\Shared Usage`).
+    pub shared_bytes: u64,
+}
+
+/// Counter-handle pair for one `GPU Adapter Memory` segment instance.
+struct AdapterSegmentCounters {
+    /// `Dedicated Usage` counter handle.
+    dedicated: PDH_HCOUNTER,
+    /// `Shared Usage` counter handle.
+    shared: PDH_HCOUNTER,
+}
+
+/// Long-lived adapter-wide memory query — the Windows data source
+/// behind `SpillTracker` (see `crate::spill`).
+///
+/// Unlike [`collect_segmented_rows`], which opens and closes a query
+/// per call because `GPU Process Memory` instances churn with process
+/// lifetimes, this type holds one open `PDH` query with the target
+/// adapter's counters added once: `GPU Adapter Memory` instances are
+/// stable for the adapter's lifetime, and spill polling at ~100 ms
+/// would waste real work re-running the open / enumerate / add / close
+/// cycle on every sample.
+///
+/// Holds raw `PDH` handles, so the type is `!Send` / `!Sync` —
+/// construct and poll it on one thread (surfaced to consumers in the
+/// `SpillTracker` rustdoc).
+pub struct AdapterMemQuery {
+    /// RAII guard owning the query handle; closes the query (and every
+    /// counter added to it) on drop.
+    guard: QueryGuard,
+    /// Per-segment counter-handle pairs for the target adapter.
+    counters: Vec<AdapterSegmentCounters>,
+    /// Static dedicated capacity from `DXGI` — see
+    /// [`AdapterMemSample::limit_bytes`]. `0` = unknown.
+    limit_bytes: u64,
+}
+
+impl AdapterMemQuery {
+    /// Open the adapter-wide query for `device_index`: resolve the
+    /// adapter's `LUID` and dedicated capacity via the `DXGI` walk,
+    /// enumerate `GPU Adapter Memory` instances, and add the
+    /// `Dedicated Usage` + `Shared Usage` counter pair for each
+    /// segment matching the adapter's `LUID`.
+    ///
+    /// Returns `Ok(None)` — "spill not measurable", deliberately not
+    /// an error — when the `GPU Adapter Memory` counter set is not
+    /// registered (pre-`WDDM 2.0`), when no enumerated instance
+    /// matches the target adapter's `LUID` (unexpected instance-name
+    /// format, adapter invisible to the provider), or when every
+    /// matching instance rejects one of the two counters. Degrading
+    /// keeps the caller's contract symmetric with Linux / macOS
+    /// ("this platform cannot measure spill").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HypomnesisError::Pdh`] if the `DXGI` walk cannot
+    /// locate `device_index`, if [`PdhOpenQueryW`] fails, or if
+    /// instance enumeration fails fatally.
+    #[allow(unsafe_code)]
+    pub fn open(device_index: u32) -> Result<Option<Self>> {
+        let target_luid = super::dxgi::adapter_luid(device_index).ok_or_else(|| {
+            HypomnesisError::Pdh(format!(
+                "no NVIDIA adapter at device_index {device_index} via DXGI walk"
+            ))
+        })?;
+        let limit_bytes = super::dxgi::adapter_dedicated_video_memory(device_index).unwrap_or(0);
+
+        let Some(instances) =
+            enum_object_instances(w!("GPU Adapter Memory"), "GPU Adapter Memory")?
+        else {
+            return Ok(None);
+        };
+
+        let mut raw_handle = PDH_HQUERY::default();
+        // SAFETY: same documented "open a new realtime query against the
+        // local performance data source" form as collect_segmented_rows.
+        // `phquery` is a valid out-parameter pointer to a stack-allocated
+        // PDH_HQUERY (zero-initialised). Status is checked below; on
+        // success the handle moves into the RAII guard immediately.
+        let status = unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut raw_handle) };
+        if status != PDH_SUCCESS {
+            return Err(HypomnesisError::Pdh(format!(
+                "PdhOpenQueryW failed: 0x{status:08X}"
+            )));
+        }
+        let guard = QueryGuard { handle: raw_handle };
+
+        let mut counters: Vec<AdapterSegmentCounters> = Vec::new();
+        for instance in &instances {
+            let Some((luid, _segment_idx)) = parse_adapter_instance_name(instance) else {
+                continue;
+            };
+            if luid != target_luid {
+                continue;
+            }
+
+            let dedicated_path = format!("\\GPU Adapter Memory({instance})\\Dedicated Usage");
+            let shared_path = format!("\\GPU Adapter Memory({instance})\\Shared Usage");
+            // Both counters are mandatory here — the spill condition
+            // needs dedicated saturation AND shared growth, so a
+            // segment with only half the pair is skipped outright.
+            let (Some(dedicated), Some(shared)) = (
+                add_counter(guard.handle, &dedicated_path),
+                add_counter(guard.handle, &shared_path),
+            ) else {
+                continue;
+            };
+            counters.push(AdapterSegmentCounters { dedicated, shared });
+        }
+
+        if counters.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            guard,
+            counters,
+            limit_bytes,
+        }))
+    }
+
+    /// Collect one sample and read every counter, summing segments
+    /// with saturating adds.
+    ///
+    /// Takes `&mut self` because [`PdhCollectQueryData`] advances the
+    /// query's kernel-side sample state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HypomnesisError::Pdh`] when [`PdhCollectQueryData`]
+    /// fails (e.g. after a driver reset / `TDR` invalidates the
+    /// query), **or when any per-counter read fails** — the whole
+    /// sample fails so the consumer's `observe()` takes its
+    /// skip-this-observation path. Degrading a failed read to `0`
+    /// instead would fabricate an observation that can falsely seal an
+    /// open spill episode (a zero dedicated reading looks like a
+    /// falling edge) or, on the first observation, poison the shared
+    /// baseline at `0` and over-detect for the rest of the run.
+    #[allow(unsafe_code)]
+    pub fn sample(&mut self) -> Result<AdapterMemSample> {
+        // SAFETY: guard.handle is valid (RAII invariant);
+        // PdhCollectQueryData samples every counter added to this query
+        // in a single call. Both gauges are instantaneous (not rates),
+        // so one sample suffices.
+        let status = unsafe { PdhCollectQueryData(self.guard.handle) };
+        if status != PDH_SUCCESS {
+            return Err(HypomnesisError::Pdh(format!(
+                "PdhCollectQueryData (adapter query) failed: 0x{status:08X}"
+            )));
+        }
+
+        let mut dedicated_bytes: u64 = 0;
+        let mut shared_bytes: u64 = 0;
+        for c in &self.counters {
+            let (Some(dedicated), Some(shared)) = (
+                read_counter_bytes(c.dedicated),
+                read_counter_bytes(c.shared),
+            ) else {
+                return Err(HypomnesisError::Pdh(
+                    "PdhGetFormattedCounterValue failed for an adapter counter (sample skipped)"
+                        .to_owned(),
+                ));
+            };
+            dedicated_bytes = dedicated_bytes.saturating_add(dedicated);
+            shared_bytes = shared_bytes.saturating_add(shared);
+        }
+
+        Ok(AdapterMemSample {
+            dedicated_bytes,
+            limit_bytes: self.limit_bytes,
+            shared_bytes,
+        })
+    }
+}
+
+/// Cheap capability probe backing `is_spill_measurable` (see
+/// `crate::spill`): does this system register the `GPU Adapter
+/// Memory` counter set **with at least one instance**? Returns
+/// `false` on enumeration failure of any kind — capability probes
+/// never error. The non-empty requirement keeps the probe honest on
+/// systems where the set is registered but no adapter surfaces
+/// through it (a registered-but-empty set can never yield a
+/// measurable [`AdapterMemQuery`]).
+#[must_use]
+pub fn adapter_counter_set_available() -> bool {
+    matches!(
+        enum_object_instances(w!("GPU Adapter Memory"), "GPU Adapter Memory"),
+        Ok(Some(instances)) if !instances.is_empty()
+    )
 }
 
 // -----------------------------------------------------------------------
@@ -688,7 +1085,10 @@ fn basename_from_path(path: &str) -> String {
     clippy::missing_docs_in_private_items
 )]
 mod tests {
-    use super::{basename_from_path, kernel_name_for_pid, parse_instance_name, parse_multi_string};
+    use super::{
+        basename_from_path, kernel_name_for_pid, parse_adapter_instance_name, parse_instance_name,
+        parse_multi_string,
+    };
 
     #[test]
     fn parse_instance_name_basic() {
@@ -746,6 +1146,49 @@ mod tests {
     fn parse_instance_name_rejects_missing_phys_suffix() {
         assert!(parse_instance_name("pid_1_luid_0x00000000_0x00000001").is_none());
         assert!(parse_instance_name("pid_1_luid_0x00000000_0x00000001_phys_").is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // parse_adapter_instance_name tests (v0.2.5 spill support)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_adapter_instance_name_basic() {
+        // Live format from the reference RTX 5060 Ti (2026-07-22).
+        let (luid, seg) = parse_adapter_instance_name("luid_0x00000000_0x0000F391_phys_0").unwrap();
+        assert_eq!(luid, (0, 0x0000_F391));
+        assert_eq!(seg, 0);
+    }
+
+    #[test]
+    fn parse_adapter_instance_name_high_bit_luid() {
+        // PDH writes LUID HighPart as unsigned hex; bit pattern must
+        // round-trip through the i32 reinterpretation.
+        let (luid, _seg) =
+            parse_adapter_instance_name("luid_0xFFFFFFFF_0x00000001_phys_2").unwrap();
+        assert_eq!(luid.0, -1_i32);
+        assert_eq!(luid.1, 1);
+    }
+
+    #[test]
+    fn parse_adapter_instance_name_rejects_total() {
+        assert!(parse_adapter_instance_name("_Total").is_none());
+        assert!(parse_adapter_instance_name("").is_none());
+    }
+
+    #[test]
+    fn parse_adapter_instance_name_rejects_pid_prefixed() {
+        // Process instances must NOT parse as adapter instances — the
+        // pid_ prefix breaks the required luid_0x lead.
+        assert!(
+            parse_adapter_instance_name("pid_1234_luid_0x00000000_0x0000F391_phys_0").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_adapter_instance_name_rejects_missing_phys() {
+        assert!(parse_adapter_instance_name("luid_0x00000000_0x0000F391").is_none());
+        assert!(parse_adapter_instance_name("luid_0x00000000_0x0000F391_phys_").is_none());
     }
 
     #[test]

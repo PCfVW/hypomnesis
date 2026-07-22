@@ -12,6 +12,7 @@
 
 use hypomnesis::{
     GpuDeviceInfo, GpuProcessEntry, GpuQuerySource, HypomnesisError, ProcessGpuInfo, Snapshot,
+    SpillEpisode, SpillReport, SpillTracker,
 };
 
 #[test]
@@ -20,6 +21,9 @@ fn public_types_are_reachable_via_crate_root() {
     let _: Option<ProcessGpuInfo> = None;
     let _: Option<GpuProcessEntry> = None;
     let _: Option<Snapshot> = None;
+    let _: Option<SpillEpisode> = None;
+    let _: Option<SpillReport> = None;
+    let _: Option<SpillTracker> = None;
     let _: GpuQuerySource = GpuQuerySource::Dxgi;
     let _: GpuQuerySource = GpuQuerySource::Nvml;
     let _: GpuQuerySource = GpuQuerySource::NvidiaSmi;
@@ -71,6 +75,77 @@ fn snapshot_all_returns_ok_and_carries_ram() {
             "every Snapshot::all entry should carry positive RAM, got {}",
             snap.ram_bytes
         );
+    }
+}
+
+#[test]
+fn is_spill_measurable_is_callable_everywhere() {
+    // The capability probe must be callable on every platform. Its
+    // value is platform-dependent (true only on Windows / WDDM 2.0+
+    // with the pdh feature), so the only universal assertion is the
+    // off-Windows one.
+    let measurable = hypomnesis::is_spill_measurable();
+    #[cfg(not(windows))]
+    assert!(
+        !measurable,
+        "is_spill_measurable() must be false off-Windows"
+    );
+    #[cfg(windows)]
+    let _ = measurable; // true or false depending on the runner's GPU stack
+}
+
+#[test]
+fn spill_tracker_constructs_or_errs_cleanly() {
+    // Portable-consumer contract: SpillTracker::new must either
+    // construct (possibly non-measurable) or return the documented Pdh
+    // error — on ANY host, GPU or not. Shape-only assertions so this
+    // passes on hosted CI runners and on hardware alike.
+    match SpillTracker::new(0) {
+        Ok(mut tracker) => {
+            tracker.observe("smoke");
+            // Cheap queries must be callable regardless of measurability.
+            let _ = tracker.is_spilling();
+            let _ = tracker.has_spilled();
+            let measurable = tracker.is_measurable();
+            let report = tracker.into_report();
+            assert_eq!(report.measurable, measurable);
+            assert!(
+                report.observations <= 1,
+                "one observe() call cannot yield more than one observation, got {}",
+                report.observations
+            );
+            if !measurable {
+                assert_eq!(
+                    report.observations, 0,
+                    "a non-measurable tracker must record no observations"
+                );
+                assert!(!report.spilled());
+            }
+        }
+        Err(e) => {
+            // Windows hard-failure path (no adapter at index 0 /
+            // query open failure) — must be the documented variant.
+            assert!(
+                matches!(e, HypomnesisError::Pdh(_)),
+                "unexpected error from SpillTracker::new(0): {e:?}"
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gpu_process_entry_shared_bytes_zero_off_windows() {
+    // The shared_used_bytes contract: populated only on the Windows
+    // PDH path, 0 everywhere else.
+    if let Ok(rows) = hypomnesis::gpu_processes(0) {
+        for row in &rows {
+            assert_eq!(
+                row.shared_used_bytes, 0,
+                "shared_used_bytes must be 0 off-Windows, got {} for pid {}",
+                row.shared_used_bytes, row.pid
+            );
+        }
     }
 }
 

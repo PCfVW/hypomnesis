@@ -148,10 +148,28 @@ pub struct GpuProcessEntry {
     /// Windows `nvidia-smi` fallback path, where `nvidia-smi` itself
     /// writes a literal `?` rather than failing the row.
     pub name: Option<String>,
-    /// GPU memory used by this process in bytes.
+    /// GPU memory used by this process in bytes. On the Windows
+    /// [`GpuQuerySource::Pdh`] path this is `VidMm`'s dedicated
+    /// **commit** (reservation) figure, not the resident set — it can
+    /// legitimately exceed physical `VRAM`; see the sibling
+    /// `shared_used_bytes` for the residency-based spill signal. On
+    /// `NVML` / `nvidia-smi` / `Metal` rows it carries those
+    /// backends' documented per-process semantics.
     pub used_bytes: u64,
+    /// Resident shared-system-memory bytes for this process — the
+    /// `WDDM` spill signal (`\GPU Process Memory(*)\Shared Usage`, the
+    /// same quantity Task Manager's per-process *Shared GPU memory*
+    /// column shows). This — not `used_bytes`, which on the `PDH` path
+    /// is `VidMm`'s dedicated **commit** — is the number that grows
+    /// when the kernel pages GPU allocations out of dedicated `VRAM`
+    /// into shared system memory. Populated only on the Windows
+    /// [`GpuQuerySource::Pdh`] path; `0` on `NVML`, `nvidia-smi`, and
+    /// `Metal` rows (no shared-residency counter exists on those
+    /// backends).
+    pub shared_used_bytes: u64,
     /// Which backend produced this row. One of [`GpuQuerySource::Nvml`],
-    /// [`GpuQuerySource::Pdh`], or [`GpuQuerySource::NvidiaSmi`].
+    /// [`GpuQuerySource::Pdh`], [`GpuQuerySource::NvidiaSmi`], or
+    /// [`GpuQuerySource::Metal`].
     /// `DXGI`'s `QueryVideoMemoryInfo` only answers for the calling
     /// process and cannot enumerate other PIDs, so
     /// [`GpuQuerySource::Dxgi`] is never the source of a

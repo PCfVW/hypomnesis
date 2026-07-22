@@ -683,6 +683,10 @@ pub(super) fn list_compute_processes(device_index: u32) -> Option<Vec<crate::Gpu
             pid: pid_u32,
             name,
             used_bytes: used,
+            // Apple Silicon UMA is a single physical pool — there is
+            // no separate shared budget to spill into (see
+            // GpuProcessEntry docs).
+            shared_used_bytes: 0,
             source: crate::GpuQuerySource::Metal,
         });
     }

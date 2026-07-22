@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Live-PDH integration tests for the v0.2.2 Windows `PDH` per-process
-//! `VRAM` backend. Every test is `#[ignore]`-gated and requires:
+//! `VRAM` backend and the v0.2.5 spill-detection path (`SpillTracker`,
+//! `GpuProcessEntry::shared_used_bytes`). The spill tests live here —
+//! not in `tests/live_gpu.rs`, as `docs/roadmap-v0.2.5.md` first
+//! sketched — because this file's `#![cfg(all(windows, feature =
+//! "pdh"))]` gate is exactly the spill-measurability precondition.
+//! Every test is `#[ignore]`-gated and requires:
 //!
 //! - A Windows host with `WDDM 2.0`+ drivers (basically any modern
 //!   Windows 10 / 11 / 12 system with an NVIDIA / AMD / Intel GPU).
@@ -37,7 +42,7 @@
 
 #![cfg(all(windows, feature = "pdh"))]
 
-use hypomnesis::{GpuQuerySource, gpu_processes};
+use hypomnesis::{GpuQuerySource, SpillTracker, gpu_processes, is_spill_measurable};
 
 /// `gpu_processes(0)` on Windows / `WDDM` with `pdh` enabled returns a
 /// non-empty list of rows whose `source` is [`GpuQuerySource::Pdh`].
@@ -118,4 +123,104 @@ fn gpu_processes_resolves_at_least_one_name() {
          Win32 name lookup may be broken",
         rows.len()
     );
+}
+
+// -----------------------------------------------------------------------
+// v0.2.5 spill-detection live tests
+// -----------------------------------------------------------------------
+
+/// On a live `WDDM 2.0`+ host the `GPU Adapter Memory` counter set is
+/// registered, so the capability probe answers `true`.
+#[test]
+#[ignore = "requires Windows + WDDM 2.0+ GPU"]
+fn live_is_spill_measurable_true_on_wddm() {
+    assert!(
+        is_spill_measurable(),
+        "is_spill_measurable() should be true on a live WDDM 2.0+ host — \
+         GPU Adapter Memory counter set may be unregistered"
+    );
+}
+
+/// The automated benign-baseline acceptance test (the rhyme-mdlm
+/// dogfooding regression, idle-desktop form): ~5 s of 100 ms polling
+/// on a desktop that is *not* running a VRAM-saturating workload must
+/// report **zero** spill episodes, even though shared usage sits at
+/// its benign baseline (staging/upload heaps — ~134 MiB live on the
+/// reference `RTX 5060 Ti`) and dedicated commit may exceed dedicated
+/// `VRAM` elsewhere in the system. Run this on an idle-ish desktop;
+/// a genuinely spilling workload running concurrently would rightly
+/// fail it.
+#[test]
+#[ignore = "requires Windows + WDDM 2.0+ GPU"]
+#[allow(clippy::expect_used)]
+fn live_spill_tracker_idle_desktop_no_false_positive() {
+    const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+    const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
+
+    let mut tracker = SpillTracker::new(0).expect("SpillTracker::new(0) failed on live host");
+    assert!(
+        tracker.is_measurable(),
+        "tracker should be measurable on a live WDDM host"
+    );
+    for i in 0..50 {
+        tracker.observe(format!("poll_{i}"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let report = tracker.into_report();
+
+    assert!(report.measurable);
+    assert!(
+        report.observations >= 50,
+        "expected ≥ 50 successful observations, got {}",
+        report.observations
+    );
+    assert!(
+        report.episodes.is_empty(),
+        "idle desktop must not report spill episodes, got {} (baseline {} B, peak shared {} B)",
+        report.episodes.len(),
+        report.baseline_shared_bytes,
+        report.peak_shared_bytes
+    );
+    assert!(
+        report.baseline_shared_bytes < TWO_GIB,
+        "benign shared baseline should be well under 2 GiB, got {} B",
+        report.baseline_shared_bytes
+    );
+    assert!(
+        report.dedicated_limit_bytes > 0,
+        "DXGI dedicated capacity should resolve on a live NVIDIA host"
+    );
+    assert!(
+        report.peak_dedicated_bytes <= ONE_TIB,
+        "peak dedicated {} B exceeds the 1 TiB sanity bound",
+        report.peak_dedicated_bytes
+    );
+}
+
+/// Every per-process row's new `shared_used_bytes` is within the same
+/// 1 TiB sanity bound as `used_bytes`, and the rows print for a
+/// manual cross-check against Task Manager's *Shared GPU memory*
+/// column (`cargo test ... -- --ignored --nocapture`).
+#[test]
+#[ignore = "requires Windows + WDDM 2.0+ GPU"]
+#[allow(clippy::expect_used)]
+fn live_process_shared_bytes_surface() {
+    const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    let rows = gpu_processes(0).expect("gpu_processes(0) failed");
+    assert!(!rows.is_empty(), "expected PDH rows on a live WDDM host");
+    for row in &rows {
+        assert!(
+            row.shared_used_bytes <= ONE_TIB,
+            "row for pid {} reports {} shared bytes — exceeds 1 TiB sanity bound",
+            row.pid,
+            row.shared_used_bytes,
+        );
+        println!(
+            "pid {:>6}  committed {:>14} B  shared {:>12} B  {}",
+            row.pid,
+            row.used_bytes,
+            row.shared_used_bytes,
+            row.name.as_deref().unwrap_or("?"),
+        );
+    }
 }

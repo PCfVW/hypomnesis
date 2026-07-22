@@ -243,8 +243,11 @@ Every `unsafe` block must be **scoped, annotated, and feature-gated**.
 | Feature gate | Accepted `unsafe` scope |
 |---|---|
 | (always, on `target_os = "windows"`) | `K32GetProcessMemoryInfo` extern via `unsafe extern "system"` block in `src/ram.rs` |
+| (always, on `target_os = "macos"`) | libSystem syscalls (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`) in `src/ram.rs` + `src/gpu/metal.rs` |
 | `nvml` | NVML dynamic load and FFI in `src/gpu/nvml.rs` |
 | `dxgi` | DXGI COM calls in `src/gpu/dxgi.rs` (Windows-only) |
+| `pdh` | PDH counter API (`PdhOpenQueryW` / `PdhEnumObjectItemsW` / `PdhAddCounterW` / `PdhCollectQueryData` / `PdhGetFormattedCounterValue`) for the `GPU Process Memory` and `GPU Adapter Memory` counter sets, plus `OpenProcess` + `QueryFullProcessImageNameW` name lookup, in `src/gpu/pdh.rs` (Windows-only). The v0.2.5 spill module (`src/spill.rs`) contains **no** `unsafe` of its own — it delegates to this backend. |
+| `metal` | `objc2-metal` `MTLDevice` calls in `src/gpu/metal.rs` (macOS-only) |
 
 Each accepted use must satisfy all of:
 
@@ -369,15 +372,18 @@ Rules:
 hypomnesis's GPU backends are independent units of code, each gated by a
 Cargo feature:
 
-| Feature | Module | In v0.1 | Adds dep |
+| Feature | Module | Since | Adds dep |
 |---|---|---|---|
-| `nvml` | `src/gpu/nvml.rs` | yes | `libloading` |
-| `dxgi` | `src/gpu/dxgi.rs` (Windows only) | yes | `windows` |
-| `nvidia-smi-fallback` | `src/gpu/nvidia_smi.rs` | yes | none (stdlib) |
-| `report` | `src/report.rs` | yes | none |
-| `debug-output` | (cross-cutting) | yes | none |
-| `rocm` (future) | `src/gpu/rocm.rs` | no | TBD |
-| `metal` (future) | `src/gpu/metal.rs` (macOS) | no | TBD |
+| `nvml` | `src/gpu/nvml.rs` | v0.1 | `libloading` |
+| `dxgi` | `src/gpu/dxgi.rs` (Windows only) | v0.1 | `windows` |
+| `pdh` | `src/gpu/pdh.rs` (Windows only; also feeds the always-compiled `src/spill.rs`) | v0.2.2 (adapter counters v0.2.5) | `windows` (shared with `dxgi`) |
+| `metal` | `src/gpu/metal.rs` (macOS only) | v0.2.3 | `objc2-metal`, `objc2` |
+| `nvidia-smi-fallback` | `src/gpu/nvidia_smi.rs` | v0.1 | none (stdlib) |
+| `report` | `src/report.rs` | v0.1 | none |
+| `debug-output` | (cross-cutting) | v0.1 | none |
+| `test-helpers` | (builders in `src/snapshot.rs`, `src/spill.rs`) | v0.2.1 | none |
+| `cli` | `src/bin/hmn.rs` | v0.2.0 | `clap` |
+| `rocm` (future) | `src/gpu/rocm.rs` | — | TBD |
 
 Adding a new backend (for a new GPU vendor or new measurement source) is
 a five-step recipe:

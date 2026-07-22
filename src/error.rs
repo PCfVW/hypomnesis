@@ -50,8 +50,10 @@ pub enum HypomnesisError {
 
     /// `PDH` (Windows Performance Data Helper) query failed (counter
     /// enumeration, counter add, value collection, or instance parsing
-    /// for the `GPU Process Memory` counter set). Includes the case
-    /// where the counter set is unregistered on pre-`WDDM 2.0` systems.
+    /// for the `GPU Process Memory` or `GPU Adapter Memory` counter
+    /// sets — the latter backs the v0.2.5 spill-detection path).
+    /// Includes the case where the counter set is unregistered on
+    /// pre-`WDDM 2.0` systems.
     #[error("PDH error: {0}")]
     Pdh(String),
 

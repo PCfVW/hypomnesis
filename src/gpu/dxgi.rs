@@ -238,6 +238,59 @@ pub(super) fn adapter_luid(idx: u32) -> Option<(i32, u32)> {
     }
 }
 
+/// Dedicated `VRAM` capacity in bytes of the `idx`-th NVIDIA-filtered
+/// adapter (`DXGI_ADAPTER_DESC.DedicatedVideoMemory`).
+///
+/// Walks `EnumAdapters1` with the same NVIDIA-filter rule as
+/// [`adapter_luid`]. Returns `None` if `idx` is past the count of
+/// qualifying adapters, or if any `DXGI` call fails.
+///
+/// Consumed by `crate::gpu::pdh`'s adapter-wide spill query
+/// (v0.2.5) as the dedicated-capacity figure: the `PDH`
+/// `GPU Adapter Memory` counter set carries no `Dedicated Limit`
+/// counter (verified live 2026-07-22), so the static `DXGI` capacity
+/// stands in. Note this is the `DXGI` nominal figure — on the
+/// reference card it differs slightly from `NVML`'s `total` (see
+/// `docs/roadmap-v0.2.4.md` for the three-source capacity
+/// comparison); for the 85% saturation threshold
+/// (`DEFAULT_DEDICATED_THRESHOLD_PCT` in `crate::spill`) the
+/// difference is immaterial.
+///
+/// Gated `cfg(feature = "pdh")` to match its sole call site, like
+/// [`adapter_luid`].
+#[cfg(feature = "pdh")]
+#[allow(unsafe_code)]
+pub(super) fn adapter_dedicated_video_memory(idx: u32) -> Option<u64> {
+    // SAFETY: CreateDXGIFactory1 is a documented COM factory function.
+    // It initializes COM internally if needed; the returned IDXGIFactory1
+    // is reference-counted and released when `factory` is dropped.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+
+    let mut raw_idx: u32 = 0;
+    let mut nvidia_count: u32 = 0;
+
+    loop {
+        // SAFETY: EnumAdapters1 returns Err when raw_idx is out of range.
+        let adapter1 = unsafe { factory.EnumAdapters1(raw_idx) }.ok()?;
+        let adapter: IDXGIAdapter = adapter1.cast().ok()?;
+
+        // SAFETY: GetDesc fills DXGI_ADAPTER_DESC. Adapter handle valid.
+        let desc = unsafe { adapter.GetDesc() }.ok()?;
+
+        if desc.VendorId == NVIDIA_VENDOR_ID && desc.DedicatedVideoMemory > 0 {
+            if nvidia_count == idx {
+                // CAST: usize → u64, DedicatedVideoMemory bounded by GPU
+                // memory; fits in u64 on every supported platform.
+                #[allow(clippy::as_conversions)]
+                return Some(desc.DedicatedVideoMemory as u64);
+            }
+            nvidia_count += 1;
+        }
+
+        raw_idx += 1;
+    }
+}
+
 /// One non-NVIDIA, non-`MSBR` `DXGI` adapter that exposes some form of GPU memory.
 ///
 /// Returned by [`enumerate_non_nvidia`] for `Snapshot::all()` on Windows

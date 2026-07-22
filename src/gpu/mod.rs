@@ -24,8 +24,11 @@ mod nvml;
 #[cfg(all(windows, feature = "dxgi"))]
 mod dxgi;
 
+// `pub(crate)` (not private like the other backends): `crate::spill`'s
+// Windows arm sits on this module's adapter-wide query. Still invisible
+// outside the crate.
 #[cfg(all(windows, feature = "pdh"))]
-mod pdh;
+pub(crate) mod pdh;
 
 #[cfg(feature = "nvidia-smi-fallback")]
 mod nvidia_smi;
@@ -298,8 +301,10 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
 ///    dropped rather than reported as garbage. Returns compute-only
 ///    processes (active `CUDA` context).
 /// 2. `PDH` (Windows primary, consumer `WDDM`). Reads
-///    `\GPU Process Memory(<instance>)\Dedicated Usage` via
-///    Performance Data Helper; names come from `Win32`'s
+///    `\GPU Process Memory(<instance>)\Dedicated Usage` (→
+///    `used_bytes`, dedicated commit) and its `Shared Usage` sibling
+///    (→ `shared_used_bytes`, resident shared — the `WDDM` spill
+///    signal) via Performance Data Helper; names come from `Win32`'s
 ///    `OpenProcess` + `QueryFullProcessImageNameW` (cross-platform
 ///    consistent with the Linux `/proc/<pid>/comm` and macOS
 ///    `proc_pidpath` patterns). Returns **every** process holding GPU
@@ -372,6 +377,9 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
                     pid,
                     name,
                     used_bytes,
+                    // NVML has no shared-residency counter; spill is a
+                    // WDDM concept (see GpuProcessEntry docs).
+                    shared_used_bytes: 0,
                     source: GpuQuerySource::Nvml,
                 }
             })
@@ -390,10 +398,11 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
     if let Ok(rows) = pdh::query_per_process_vram(device_index) {
         let mut entries: Vec<GpuProcessEntry> = rows
             .into_iter()
-            .map(|(pid, used_bytes)| GpuProcessEntry {
-                pid,
-                name: pdh::name_from_pid_windows(pid),
-                used_bytes,
+            .map(|row| GpuProcessEntry {
+                pid: row.pid,
+                name: pdh::name_from_pid_windows(row.pid),
+                used_bytes: row.dedicated_committed_bytes,
+                shared_used_bytes: row.shared_used_bytes,
                 source: GpuQuerySource::Pdh,
             })
             .collect();
@@ -409,6 +418,9 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
                 pid: app.pid,
                 name: app.name,
                 used_bytes: app.used_bytes,
+                // nvidia-smi exposes no shared-residency figure; spill
+                // is a WDDM concept (see GpuProcessEntry docs).
+                shared_used_bytes: 0,
                 source: GpuQuerySource::NvidiaSmi,
             })
             .collect();

@@ -17,13 +17,22 @@
 //!   `graphics_footprint` bytes. See the `--help` Limitations text and
 //!   the rustdoc for [`hypomnesis::gpu_processes`] for the
 //!   per-platform breakdown.
+//! - `hmn spill -- <command>` — run a command while polling
+//!   [`hypomnesis::SpillTracker`] (`time(1)`-style wrapper, default
+//!   100 ms interval), print a `SpillReport` to stderr when the
+//!   command exits, and pass its exit code through. Windows /
+//!   `WDDM`-only measurement; on other platforms the command still
+//!   runs and the report says "spill not measurable".
 //!
 //! Install with `cargo install hypomnesis --features cli`.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
+use hypomnesis::{
+    Result, Snapshot, SpillReport, SpillTracker, device_count, device_info, gpu_processes,
+};
 
 /// `hmn` CLI: device summary plus GPU-process listing.
 #[derive(Parser, Debug)]
@@ -36,6 +45,10 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
                   Default subcommand: prints one line per visible GPU with free / total VRAM.\n\
                   \n\
                   `hmn ps`: lists processes holding GPU memory.\n\
+                  \n\
+                  `hmn spill -- <command>`: runs a command while sampling WDDM spill state \
+                  (resident shared-memory growth under dedicated-VRAM saturation), prints a \
+                  SpillReport to stderr on exit, and passes the command's exit code through.\n\
                   \n\
                   Limitations (per-platform):\n\
                   - Linux / NVML backend is compute-only — only processes with an active CUDA \
@@ -50,6 +63,11 @@ use hypomnesis::{Result, Snapshot, device_count, device_info, gpu_processes};
                   the kernel pages them via the shared system memory budget. Numbers \
                   exceeding the device's total VRAM are real, not bugs; they match Task \
                   Manager's `Dedicated GPU memory` column.\n\
+                  - The SHARED column (Windows / PDH only) shows resident shared-system-memory \
+                  bytes — the WDDM spill signal, matching Task Manager's `Shared GPU memory` \
+                  column. A benign baseline (staging/upload heaps) is normal; growth while \
+                  dedicated VRAM saturates is spill. Always 0 on Linux and macOS (no \
+                  shared-residency counter exists there).\n\
                   - `?` in the NAME column on Windows means the calling user cannot resolve \
                   the process's name via `OpenProcess`. Most cases (system services, \
                   other-user processes like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` \
@@ -105,9 +123,54 @@ enum Commands {
         /// Emit a JSON array (one object per row) instead of the
         /// default text table. Each object has fields `pid` (number),
         /// `name` (string or null), `used_bytes` (number),
-        /// `device_index` (number), `device_name` (string or null).
+        /// `shared_used_bytes` (number — resident shared bytes, the
+        /// WDDM spill signal; 0 off-Windows), `device_index` (number),
+        /// `device_name` (string or null).
         #[arg(long)]
         json: bool,
+    },
+    /// Run a command while sampling WDDM spill state; print a
+    /// `SpillReport` to stderr when it exits (stdout stays the
+    /// wrapped command's). The wrapped command's exit code passes
+    /// through.
+    ///
+    /// Spill = resident shared-system-memory growth while dedicated
+    /// VRAM saturates — measurable on Windows / WDDM 2.0+ only. On
+    /// Linux and macOS the command still runs, and the report is
+    /// replaced by a "spill not measurable on this platform" note.
+    ///
+    /// Ctrl+C reaches the whole process group: hmn dies with the
+    /// wrapped command and the report is lost (recording a partial
+    /// report on interrupt is deliberately out of scope for now).
+    Spill {
+        /// Polling interval in milliseconds (minimum 1). Values below
+        /// ~50 ms add PDH query cost without extra resolution (the
+        /// GPU counters update on driver cadence) — documented, not
+        /// clamped beyond the zero-floor.
+        #[arg(long, value_name = "MS", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+        /// GPU index to watch (NVML-canonical ordering).
+        #[arg(long, value_name = "INDEX", default_value_t = 0)]
+        device: u32,
+        /// Also emit the `SpillReport` as a JSON object on stdout
+        /// (after the wrapped command's own output; stderr keeps the
+        /// human-readable block). Fields: `measurable`, `spilled`,
+        /// `observations`, `baseline_shared_bytes`,
+        /// `peak_shared_bytes`, `peak_dedicated_bytes`,
+        /// `dedicated_limit_bytes`, `total_spill_duration_ms`,
+        /// `episodes[]` (`start_label`, `end_label` or null,
+        /// `peak_shared_bytes`, `observations`, `duration_ms`).
+        /// Check `measurable` before trusting `spilled: false`.
+        #[arg(long)]
+        json: bool,
+        /// The command to run (everything after `--`).
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
     },
 }
 
@@ -116,6 +179,15 @@ fn main() -> std::process::ExitCode {
     let outcome = match cli.command {
         None => run_summary(),
         Some(Commands::Ps { pid, device, json }) => run_ps(pid, device, json),
+        // `spill` bypasses the Ok/Err fold below: its exit code is the
+        // wrapped command's, passed through — not hmn's own
+        // success/failure.
+        Some(Commands::Spill {
+            interval,
+            device,
+            json,
+            command,
+        }) => return run_spill(interval, device, json, &command),
     };
     match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -193,8 +265,12 @@ struct PsRow {
     pid: u32,
     /// Process name. `None` when no name source produced one.
     name: Option<String>,
-    /// GPU memory used by this process in bytes.
+    /// GPU memory used by this process in bytes (`WDDM` dedicated
+    /// commit on the Windows `PDH` path).
     used_bytes: u64,
+    /// Resident shared-system-memory bytes — the `WDDM` spill signal.
+    /// `0` on non-Windows backends (no shared-residency counter).
+    shared_used_bytes: u64,
     /// Zero-based device index (NVML-canonical).
     device_index: u32,
     /// Friendly device name (e.g. `RTX 5060 Ti`); `None` when
@@ -240,6 +316,7 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
                 pid: entry.pid,
                 name: entry.name,
                 used_bytes: entry.used_bytes,
+                shared_used_bytes: entry.shared_used_bytes,
                 device_index: idx,
                 // BORROW: clone — device_name is shared across all
                 // rows for this device.
@@ -379,6 +456,7 @@ fn format_ps_table(rows: &[PsRow]) -> String {
     let pid_header = "PID";
     let name_header = "NAME";
     let vram_header = "VRAM";
+    let shared_header = "SHARED";
     let device_header = "DEVICE";
 
     let pid_cells: Vec<String> = rows.iter().map(|r| r.pid.to_string()).collect();
@@ -387,6 +465,10 @@ fn format_ps_table(rows: &[PsRow]) -> String {
         .map(|r| r.name.as_deref().unwrap_or("?"))
         .collect();
     let vram_cells: Vec<String> = rows.iter().map(|r| format_vram(r.used_bytes)).collect();
+    let shared_cells: Vec<String> = rows
+        .iter()
+        .map(|r| format_vram(r.shared_used_bytes))
+        .collect();
     let device_cells: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -399,22 +481,24 @@ fn format_ps_table(rows: &[PsRow]) -> String {
     let pid_w = column_width(pid_header, pid_cells.iter().map(String::as_str));
     let name_w = column_width(name_header, name_cells.iter().copied());
     let vram_w = column_width(vram_header, vram_cells.iter().map(String::as_str));
+    let shared_w = column_width(shared_header, shared_cells.iter().map(String::as_str));
     let device_w = column_width(device_header, device_cells.iter().map(String::as_str));
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{pid_header:<pid_w$}  {name_header:<name_w$}  {vram_header:<vram_w$}  {device_header:<device_w$}",
+        "{pid_header:<pid_w$}  {name_header:<name_w$}  {vram_header:<vram_w$}  {shared_header:<shared_w$}  {device_header:<device_w$}",
     );
-    for (((pid, name), vram), device) in pid_cells
+    for ((((pid, name), vram), shared), device) in pid_cells
         .iter()
         .zip(&name_cells)
         .zip(&vram_cells)
+        .zip(&shared_cells)
         .zip(&device_cells)
     {
         let _ = writeln!(
             out,
-            "{pid:<pid_w$}  {name:<name_w$}  {vram:<vram_w$}  {device:<device_w$}",
+            "{pid:<pid_w$}  {name:<name_w$}  {vram:<vram_w$}  {shared:<shared_w$}  {device:<device_w$}",
         );
     }
     out
@@ -422,7 +506,7 @@ fn format_ps_table(rows: &[PsRow]) -> String {
 
 /// Format `ps` rows as a JSON array, one object per row. Hand-rolled
 /// (no `serde` dep — keeps the `cli` feature lean for v0.2). Each
-/// object: `{"pid":N,"name":<string|null>,"used_bytes":N,"device_index":N,"device_name":<string|null>}`.
+/// object: `{"pid":N,"name":<string|null>,"used_bytes":N,"shared_used_bytes":N,"device_index":N,"device_name":<string|null>}`.
 /// String values are JSON-escaped via [`json_escape`].
 #[allow(clippy::missing_panics_doc)] // writes to a String; cannot fail in practice
 fn format_ps_json(rows: &[PsRow]) -> String {
@@ -441,11 +525,213 @@ fn format_ps_json(rows: &[PsRow]) -> String {
         );
         let _ = write!(
             out,
-            r#"{{"pid":{},"name":{name_json},"used_bytes":{},"device_index":{},"device_name":{device_name_json}}}"#,
-            row.pid, row.used_bytes, row.device_index,
+            r#"{{"pid":{},"name":{name_json},"used_bytes":{},"shared_used_bytes":{},"device_index":{},"device_name":{device_name_json}}}"#,
+            row.pid, row.used_bytes, row.shared_used_bytes, row.device_index,
         );
     }
     out.push_str("]\n");
+    out
+}
+
+// -----------------------------------------------------------------------------
+// `spill` subcommand
+// -----------------------------------------------------------------------------
+
+/// All-zeros JSON object emitted by `hmn spill --json` when no
+/// `SpillTracker` could be constructed at all (hard error path), so
+/// scripted consumers still receive a parseable object with
+/// `measurable: false` rather than empty stdout.
+const SPILL_JSON_UNMEASURABLE: &str = concat!(
+    r#"{"measurable":false,"spilled":false,"observations":0,"#,
+    r#""baseline_shared_bytes":0,"peak_shared_bytes":0,"#,
+    r#""peak_dedicated_bytes":0,"dedicated_limit_bytes":0,"#,
+    r#""total_spill_duration_ms":0,"episodes":[]}"#,
+    "\n"
+);
+
+/// Run the `spill` subcommand: spawn the wrapped command with
+/// inherited stdio, poll a [`SpillTracker`] every `interval_ms` until
+/// the child exits, print the report (stderr human block; optional
+/// stdout JSON), and pass the child's exit code through.
+///
+/// Measurement failures never stop the workload: a tracker that fails
+/// to construct produces a stderr warning and the child runs
+/// unmeasured. Only spawn/wait failures — where there is no child
+/// outcome to pass through — return `hmn`'s own `FAILURE`.
+fn run_spill(
+    interval_ms: u64,
+    device: u32,
+    json: bool,
+    command: &[String],
+) -> std::process::ExitCode {
+    // clap's `required = true` on the trailing arg makes an empty
+    // command unreachable in practice; belt-and-braces for direct calls.
+    let Some((program, args)) = command.split_first() else {
+        eprintln!("hmn: spill requires a command to run (after `--`)");
+        return std::process::ExitCode::FAILURE;
+    };
+
+    let mut tracker = match SpillTracker::new(device) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("hmn: spill tracking unavailable ({e}); running command unmeasured");
+            None
+        }
+    };
+
+    let mut child = match std::process::Command::new(program).args(args).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hmn: failed to spawn {program:?}: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let run_start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if let Some(t) = tracker.as_mut() {
+                    t.observe(format!("+{:.1}s", run_start.elapsed().as_secs_f64()));
+                }
+                std::thread::sleep(Duration::from_millis(interval_ms));
+            }
+            Err(e) => {
+                eprintln!("hmn: failed to wait on wrapped command: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // One final observation at exit so short-lived commands get at
+    // least one sample, then the report.
+    if let Some(t) = tracker.as_mut() {
+        t.observe(format!("+{:.1}s", run_start.elapsed().as_secs_f64()));
+    }
+    if let Some(report) = tracker.map(SpillTracker::into_report) {
+        if json {
+            print!("{}", format_spill_json(&report));
+        }
+        if report.measurable {
+            eprint!("{}", format_spill_report(&report));
+        } else {
+            eprintln!("hmn spill: spill not measurable on this platform");
+        }
+    } else {
+        // Tracker construction failed (already warned above).
+        if json {
+            print!("{SPILL_JSON_UNMEASURABLE}");
+        }
+        eprintln!("hmn spill: spill not measurable (no tracker)");
+    }
+
+    std::process::ExitCode::from(exit_code_byte(status.code()))
+}
+
+/// Map a child's `ExitStatus::code()` to the byte `hmn` exits with.
+///
+/// `0..=255` passes through exactly. Codes outside that range —
+/// negative Windows `NTSTATUS` values (e.g. `0xC0000005` as `i32`),
+/// or >255 — map to `1` rather than being bit-truncated: truncation
+/// could turn a failure like 256 into a false success. `None` (child
+/// killed by a signal on Unix) also maps to `1`.
+fn exit_code_byte(code: Option<i32>) -> u8 {
+    code.map_or(1, |c| u8::try_from(c).unwrap_or(1))
+}
+
+/// Whole milliseconds of a [`Duration`] for JSON output (`u128`
+/// clamped into `u64` — saturates at `u64::MAX`, unreachable for real
+/// run lengths).
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Seconds with one decimal place (`"3.8s"`) — the human-facing
+/// duration rendering in the spill report.
+fn format_secs(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
+/// Format the human-readable spill report block printed to stderr.
+///
+/// Three aligned lines. The dedicated line elides its `/ capacity`
+/// suffix when the capacity is unknown (`dedicated_limit_bytes == 0`);
+/// the episodes line collapses to `no spill observed` when no episode
+/// was recorded. The `first ... into run` fragment reuses the episode
+/// start label, which `run_spill` stamps as elapsed time (`"+12.4s"`).
+#[allow(clippy::missing_panics_doc)] // writes to a String; cannot fail in practice
+fn format_spill_report(report: &SpillReport) -> String {
+    let mut out = String::new();
+    let limit_suffix = if report.dedicated_limit_bytes > 0 {
+        format!(" / {}", format_vram(report.dedicated_limit_bytes))
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        out,
+        "hmn spill: peak dedicated {}{limit_suffix}",
+        format_vram(report.peak_dedicated_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "           peak shared    {} (baseline {})",
+        format_vram(report.peak_shared_bytes),
+        format_vram(report.baseline_shared_bytes)
+    );
+    if report.spilled() {
+        let total = format_secs(report.total_spill_duration());
+        let longest = report
+            .longest_episode()
+            .map_or_else(String::new, |e| format_secs(e.duration));
+        let first = report.first_spill_label().unwrap_or("?");
+        let _ = writeln!(
+            out,
+            "           episodes       {} — total {total}, longest {longest}, first {first} into run",
+            report.episodes.len()
+        );
+    } else {
+        let _ = writeln!(out, "           episodes       0 — no spill observed");
+    }
+    out
+}
+
+/// Format a [`SpillReport`] as a single JSON object. Hand-rolled (no
+/// `serde` dep — same policy as [`format_ps_json`]); labels are
+/// escaped via [`json_escape`]; durations are integer milliseconds.
+#[allow(clippy::missing_panics_doc)] // writes to a String; cannot fail in practice
+fn format_spill_json(report: &SpillReport) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        r#"{{"measurable":{},"spilled":{},"observations":{},"baseline_shared_bytes":{},"peak_shared_bytes":{},"peak_dedicated_bytes":{},"dedicated_limit_bytes":{},"total_spill_duration_ms":{},"episodes":["#,
+        report.measurable,
+        report.spilled(),
+        report.observations,
+        report.baseline_shared_bytes,
+        report.peak_shared_bytes,
+        report.peak_dedicated_bytes,
+        report.dedicated_limit_bytes,
+        duration_ms(report.total_spill_duration()),
+    );
+    for (i, ep) in report.episodes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let end_label = ep.end_label.as_deref().map_or_else(
+            || String::from("null"),
+            |l| format!("\"{}\"", json_escape(l)),
+        );
+        let _ = write!(
+            out,
+            r#"{{"start_label":"{}","end_label":{end_label},"peak_shared_bytes":{},"observations":{},"duration_ms":{}}}"#,
+            json_escape(&ep.start_label),
+            ep.peak_shared_bytes,
+            ep.observations,
+            duration_ms(ep.duration),
+        );
+    }
+    out.push_str("]}\n");
     out
 }
 
@@ -519,7 +805,10 @@ fn json_escape(s: &str) -> String {
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::missing_docs_in_private_items
+    clippy::missing_docs_in_private_items,
+    // EXPLICIT: panic! is the standard "unreachable pattern in a test"
+    // signal for the spill arg-parse destructuring assertions.
+    clippy::panic
 )]
 mod tests {
     use super::*;
@@ -535,8 +824,22 @@ mod tests {
             pid,
             name: name.map(str::to_owned),
             used_bytes,
+            shared_used_bytes: 0,
             device_index,
             device_name: device_name.map(str::to_owned),
+        }
+    }
+
+    /// Like [`row`] but with a non-zero `shared_used_bytes` — for the
+    /// SHARED-column / spill-signal specific tests.
+    fn row_shared(pid: u32, name: Option<&str>, used_bytes: u64, shared_used_bytes: u64) -> PsRow {
+        PsRow {
+            pid,
+            name: name.map(str::to_owned),
+            used_bytes,
+            shared_used_bytes,
+            device_index: 0,
+            device_name: None,
         }
     }
 
@@ -606,7 +909,7 @@ mod tests {
     fn format_ps_table_empty_prints_header_only() {
         let s = format_ps_table(&[]);
         // Header line ends with newline; widths default to header lengths.
-        assert_eq!(s, "PID  NAME  VRAM  DEVICE\n");
+        assert_eq!(s, "PID  NAME  VRAM  SHARED  DEVICE\n");
     }
 
     #[test]
@@ -619,19 +922,20 @@ mod tests {
             Some("RTX 5060 Ti"),
         );
         let s = format_ps_table(&[r]);
-        let expected = "PID    NAME        VRAM     DEVICE     \n\
-                        12345  python.exe  8.0 GiB  RTX 5060 Ti\n";
+        let expected = "PID    NAME        VRAM     SHARED  DEVICE     \n\
+                        12345  python.exe  8.0 GiB  0 MiB   RTX 5060 Ti\n";
         assert_eq!(s, expected);
     }
 
     #[test]
     fn format_ps_table_protected_name_renders_question_mark() {
         // Column widths: PID=3 (header), NAME=4 (header), VRAM=7
-        // ("256 MiB"), DEVICE=11 ("RTX 5060 Ti"). Two-space separators.
+        // ("256 MiB"), SHARED=6 (header), DEVICE=11 ("RTX 5060 Ti").
+        // Two-space separators.
         let r = row(99, Some("?"), 268_435_456, 0, Some("RTX 5060 Ti"));
         let s = format_ps_table(&[r]);
-        let expected = "PID  NAME  VRAM     DEVICE     \n\
-                        99   ?     256 MiB  RTX 5060 Ti\n";
+        let expected = "PID  NAME  VRAM     SHARED  DEVICE     \n\
+                        99   ?     256 MiB  0 MiB   RTX 5060 Ti\n";
         assert_eq!(s, expected);
     }
 
@@ -641,8 +945,8 @@ mod tests {
         // case — both go through the `unwrap_or("?")` path.
         let r = row(99, None, 268_435_456, 0, Some("RTX 5060 Ti"));
         let s = format_ps_table(&[r]);
-        let expected = "PID  NAME  VRAM     DEVICE     \n\
-                        99   ?     256 MiB  RTX 5060 Ti\n";
+        let expected = "PID  NAME  VRAM     SHARED  DEVICE     \n\
+                        99   ?     256 MiB  0 MiB   RTX 5060 Ti\n";
         assert_eq!(s, expected);
     }
 
@@ -650,7 +954,22 @@ mod tests {
     fn format_ps_table_falls_back_to_gpu_n_when_no_device_name() {
         let r = row(99, Some("python.exe"), 268_435_456, 3, None);
         let s = format_ps_table(&[r]);
-        assert!(s.contains("python.exe  256 MiB  GPU 3"));
+        assert!(s.contains("python.exe  256 MiB  0 MiB   GPU 3"));
+    }
+
+    #[test]
+    fn format_ps_table_shared_column_renders_nonzero_bytes() {
+        // A genuinely spilling row: 16 GiB dedicated commit, 2 GiB
+        // resident shared. The SHARED cell goes through the same
+        // format_vram path as VRAM.
+        let r = row_shared(
+            77,
+            Some("py.exe"),
+            16 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+        );
+        let s = format_ps_table(&[r]);
+        assert!(s.contains("16.0 GiB  2.0 GiB"));
     }
 
     // --- format_ps_json ---
@@ -672,7 +991,7 @@ mod tests {
         let s = format_ps_json(&[r]);
         assert_eq!(
             s,
-            "[{\"pid\":12345,\"name\":\"python.exe\",\"used_bytes\":8388608,\"device_index\":0,\"device_name\":\"RTX 5060 Ti\"}]\n"
+            "[{\"pid\":12345,\"name\":\"python.exe\",\"used_bytes\":8388608,\"shared_used_bytes\":0,\"device_index\":0,\"device_name\":\"RTX 5060 Ti\"}]\n"
         );
     }
 
@@ -682,7 +1001,7 @@ mod tests {
         let s = format_ps_json(&[r]);
         assert_eq!(
             s,
-            "[{\"pid\":42,\"name\":null,\"used_bytes\":0,\"device_index\":0,\"device_name\":null}]\n"
+            "[{\"pid\":42,\"name\":null,\"used_bytes\":0,\"shared_used_bytes\":0,\"device_index\":0,\"device_name\":null}]\n"
         );
     }
 
@@ -693,9 +1012,16 @@ mod tests {
         let s = format_ps_json(&[a, b]);
         assert_eq!(
             s,
-            "[{\"pid\":1,\"name\":\"a.exe\",\"used_bytes\":1048576,\"device_index\":0,\"device_name\":\"GPU\"},\
-             {\"pid\":2,\"name\":\"b.exe\",\"used_bytes\":2097152,\"device_index\":0,\"device_name\":\"GPU\"}]\n"
+            "[{\"pid\":1,\"name\":\"a.exe\",\"used_bytes\":1048576,\"shared_used_bytes\":0,\"device_index\":0,\"device_name\":\"GPU\"},\
+             {\"pid\":2,\"name\":\"b.exe\",\"used_bytes\":2097152,\"shared_used_bytes\":0,\"device_index\":0,\"device_name\":\"GPU\"}]\n"
         );
+    }
+
+    #[test]
+    fn format_ps_json_nonzero_shared_bytes() {
+        let r = row_shared(7, Some("py.exe"), 1_048_576, 424_242);
+        let s = format_ps_json(&[r]);
+        assert!(s.contains("\"used_bytes\":1048576,\"shared_used_bytes\":424242,"));
     }
 
     #[test]
@@ -869,5 +1195,200 @@ mod tests {
             format_ps_summary(&rows, Some(42), Some(0)),
             "3 GPU processes found matching pid=42 device=0 (0 MiB committed total; 1 protected — re-run elevated for names)."
         );
+    }
+
+    // --- exit_code_byte (spill exit-code pass-through) ---
+
+    #[test]
+    fn exit_code_byte_zero_passes_through() {
+        assert_eq!(exit_code_byte(Some(0)), 0);
+    }
+
+    #[test]
+    fn exit_code_byte_passthrough_255() {
+        assert_eq!(exit_code_byte(Some(7)), 7);
+        assert_eq!(exit_code_byte(Some(255)), 255);
+    }
+
+    #[test]
+    fn exit_code_byte_negative_is_one() {
+        // Windows NTSTATUS codes surface as negative i32 (e.g. an
+        // access violation 0xC0000005); never truncate.
+        assert_eq!(exit_code_byte(Some(-1_073_741_819)), 1);
+        assert_eq!(exit_code_byte(Some(-1)), 1);
+    }
+
+    #[test]
+    fn exit_code_byte_overflow_is_one() {
+        // Truncating 256 to u8 would yield 0 — a false success.
+        assert_eq!(exit_code_byte(Some(256)), 1);
+        assert_eq!(exit_code_byte(Some(i32::MAX)), 1);
+    }
+
+    #[test]
+    fn exit_code_byte_none_is_one() {
+        // Signal-killed child on Unix: no exit code.
+        assert_eq!(exit_code_byte(None), 1);
+    }
+
+    // --- duration helpers ---
+
+    #[test]
+    fn duration_ms_and_format_secs() {
+        assert_eq!(duration_ms(Duration::from_millis(3_800)), 3_800);
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+        assert_eq!(format_secs(Duration::from_millis(3_800)), "3.8s");
+        assert_eq!(format_secs(Duration::ZERO), "0.0s");
+    }
+
+    // --- spill argument parsing ---
+
+    #[test]
+    fn spill_args_parse_trailing_command_with_hyphen_values() {
+        let cli = Cli::try_parse_from([
+            "hmn",
+            "spill",
+            "--interval",
+            "50",
+            "--",
+            "python",
+            "train.py",
+            "--lr",
+            "0.1",
+        ])
+        .unwrap();
+        let Some(Commands::Spill {
+            interval,
+            device,
+            json,
+            command,
+        }) = cli.command
+        else {
+            panic!("expected Spill subcommand");
+        };
+        assert_eq!(interval, 50);
+        assert_eq!(device, 0);
+        assert!(!json);
+        assert_eq!(command, ["python", "train.py", "--lr", "0.1"]);
+    }
+
+    #[test]
+    fn spill_args_default_interval_100() {
+        let cli = Cli::try_parse_from(["hmn", "spill", "--", "sleep", "1"]).unwrap();
+        let Some(Commands::Spill { interval, .. }) = cli.command else {
+            panic!("expected Spill subcommand");
+        };
+        assert_eq!(interval, 100);
+    }
+
+    #[test]
+    fn spill_args_requires_command() {
+        assert!(Cli::try_parse_from(["hmn", "spill"]).is_err());
+    }
+
+    #[test]
+    fn spill_args_rejects_zero_interval() {
+        // A 0 ms interval would busy-loop PDH collects against the
+        // wrapped command; floored at 1 by the value_parser range.
+        assert!(Cli::try_parse_from(["hmn", "spill", "--interval", "0", "--", "x"]).is_err());
+        assert!(Cli::try_parse_from(["hmn", "spill", "--interval", "1", "--", "x"]).is_ok());
+    }
+
+    // --- spill report formatting (fixtures via the test-helpers
+    //     builder: SpillReport is #[non_exhaustive], so the binary
+    //     cannot struct-literal one — see SpillReportBuilder docs) ---
+
+    #[cfg(feature = "test-helpers")]
+    fn spilling_report() -> SpillReport {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        SpillReport::builder()
+            .measurable(true)
+            .observations(200)
+            .peak_dedicated_bytes(16 * GIB)
+            .dedicated_limit_bytes(16 * GIB)
+            .peak_shared_bytes(4 * GIB + 200 * 1024 * 1024) // 4.2 GiB
+            .baseline_shared_bytes(300 * 1024 * 1024)
+            .episode(
+                "+12.4s",
+                Some("+15.5s"),
+                3 * GIB,
+                31,
+                Duration::from_millis(3_100),
+            )
+            .episode("+20.0s", None, 4 * GIB, 67, Duration::from_millis(6_700))
+            .build()
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_report_episodes_line() {
+        let s = format_spill_report(&spilling_report());
+        let expected = "hmn spill: peak dedicated 16.0 GiB / 16.0 GiB\n           peak shared    4.2 GiB (baseline 300 MiB)\n           episodes       2 — total 9.8s, longest 6.7s, first +12.4s into run\n";
+        assert_eq!(s, expected);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_report_no_episodes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let report = SpillReport::builder()
+            .measurable(true)
+            .observations(50)
+            .peak_dedicated_bytes(14 * GIB)
+            .dedicated_limit_bytes(16 * GIB)
+            .peak_shared_bytes(140 * 1024 * 1024)
+            .baseline_shared_bytes(134 * 1024 * 1024)
+            .build();
+        let s = format_spill_report(&report);
+        assert!(s.contains("episodes       0 — no spill observed"));
+        assert!(s.contains("peak dedicated 14.0 GiB / 16.0 GiB"));
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_report_unknown_limit_elides_suffix() {
+        let report = SpillReport::builder()
+            .measurable(true)
+            .peak_dedicated_bytes(1024 * 1024 * 1024)
+            .build();
+        let s = format_spill_report(&report);
+        assert!(s.contains("peak dedicated 1.0 GiB\n"));
+        assert!(!s.contains(" / "));
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_json_shape() {
+        let s = format_spill_json(&spilling_report());
+        assert!(s.starts_with("{\"measurable\":true,\"spilled\":true,\"observations\":200,"));
+        assert!(s.contains("\"total_spill_duration_ms\":9800,"));
+        assert!(s.contains("\"episodes\":[{\"start_label\":\"+12.4s\",\"end_label\":\"+15.5s\","));
+        assert!(s.ends_with("]}\n"));
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_json_null_end_label() {
+        let s = format_spill_json(&spilling_report());
+        assert!(s.contains("\"start_label\":\"+20.0s\",\"end_label\":null,"));
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_spill_json_escapes_labels() {
+        let report = SpillReport::builder()
+            .measurable(true)
+            .episode("weird\"label", None, 0, 1, Duration::ZERO)
+            .build();
+        let s = format_spill_json(&report);
+        assert!(s.contains(r#""start_label":"weird\"label""#));
+    }
+
+    #[test]
+    fn spill_json_unmeasurable_constant_is_valid_shape() {
+        // The hard-error fallback object mirrors format_spill_json's
+        // field order so scripted consumers parse one shape.
+        assert!(SPILL_JSON_UNMEASURABLE.starts_with("{\"measurable\":false,\"spilled\":false,"));
+        assert!(SPILL_JSON_UNMEASURABLE.ends_with("\"episodes\":[]}\n"));
     }
 }

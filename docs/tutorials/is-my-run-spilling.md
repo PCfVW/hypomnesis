@@ -39,6 +39,12 @@ No elevation needed — the counters are readable unprivileged. On Linux/macOS
 everything below runs but reports *"spill not measurable on this platform"*;
 see the [FAQ](../FAQ.md#why-is-everything-spill-related-0--false-on-linux-and-macos).
 
+**Already running and can't be restarted under a wrapper?** `hmn spill` only
+wraps a *new* command. For a job that's already hours into its run, see
+[Triage a job that's already running](watching-a-running-job.md) —
+`hmn watch <pid>` attaches to it directly; the episode-pattern and
+per-process-attribution steps below apply identically once attached.
+
 ## Step 1 — Wrap the run
 
 `hmn spill` is a `time(1)`-style wrapper: your command runs unchanged (stdout

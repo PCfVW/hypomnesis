@@ -10,7 +10,47 @@ The crate's *why* lives in [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md
 
 ## Current state
 
-**v0.2.5** shipped 2026-07-22 — `WDDM` spill detection. *Resident, not committed. Episodes, not a boolean.* A `SpillTracker` that compiles on every platform (honest `is_spill_measurable()` returns `false` off-Windows) reads the `PDH` `\GPU Adapter Memory(*)` residency gauges and flags spill only when dedicated-resident saturates **and** shared-resident grows past its benign first-observation baseline — never from the `committed − dedicated` gap, per the rhyme-mdlm dogfooding report's live false-positive ([2026-07-19](docs/dogfooding-feedbacks/dogfooding-wddm-spill-detection.md)). Transient spills are first-class: an instantaneous `is_spilling()` / latched `has_spilled()` split plus an episode-based `SpillReport`. Per-process attribution rides along as additive `GpuProcessEntry::shared_used_bytes` (+ `hmn ps` SHARED column), and `hmn spill -- <command>` wraps any run `time(1)`-style (`--interval` default 100 ms, `--json`, exit-code pass-through). Two live-measured corrections to the design sketch: no `Dedicated Limit` counter exists in `PDH` (capacity comes from `DXGI` `DedicatedVideoMemory`), and the dedicated-saturation default is **85%**, not ~95% — a forced-spill fixture measured `VidMm`'s dedicated-resident ceiling at ≈ 88.6–91.3% of `DXGI` capacity, making 95% unreachable. Release-validated with a real 13.1 s spill episode (3.1 GiB peak shared) on the reference `RTX 5060 Ti`, produced by a forced-spill fixture preserved at [`tools/spillforge`](tools/spillforge/) (repo-only, `publish = false`) for future re-validation on new drivers or contributor hardware. Detailed plan: [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md).
+**v0.2.6** shipped 2026-07-25 — `hmn watch [PID...]`, attach-to-a-running-PID
+spill triage. *Not a TUI. Same tracker, a timer instead of a wrapped child.*
+`hmn spill -- <command>` only wraps a *new* process; a rhyme-mdlm dogfooding
+report ([2026-07-25](docs/dogfooding-feedbacks/dogfooding-spill-triage-watch-mode.md))
+hit that wall three times triaging a 15-hour training campaign, hand-rolling
+"two `hmn ps` samples minutes apart, diff by eye" every time because there
+was no way to attach to a trainer already hours into its run. `hmn watch`
+closes the gap as a pure CLI addition — zero changes to `src/spill.rs` or
+`src/gpu/pdh.rs`: it samples the unchanged `SpillTracker` (adapter-wide
+dedicated-saturation + shared-growth co-condition) and the unchanged
+`gpu_processes()` (per-PID committed/shared bytes) on a timer, printing one
+row per watched PID per interval with per-interval deltas and a live SPILL
+flag. No PID given auto-selects the top `--top` (default 5) by committed
+`VRAM` from the first sample, kept fixed for the run; explicit PIDs are
+watched exactly as given. `--interval` / `--duration` take duration strings
+(`30s`, `5m`, bare seconds — a hand-rolled parser, no new duration-parsing
+dependency) rather than `hmn spill`'s raw milliseconds, tuned for an
+attach-and-leave-running tool rather than a tight wrap. Ctrl+C (via the new
+`ctrlc` dependency, `cli`-feature-only) and a natural `--duration` stop both
+print the same closing summary — the same `SpillReport` shape `hmn spill`
+emits, plus a per-PID peak/baseline table — and set the same exit-code
+contract: `0` no spill observed, `1` spill observed at least once, `2` on a
+hard error, designed for a watchdog script to check directly without parsing
+JSON. `--json` streams JSON Lines (one `"kind":"sample"` object per PID per
+interval, a closing `"kind":"summary"` object) rather than a single blob, to
+match `watch`'s live-tailing character. Two small best-effort robustness
+additions found during an adversarial pre-commit review (the same two-agent
+conventions-plus-correctness pass v0.2.5 used): a watched PID whose resolved
+name changes between samples (OS PID reuse) resets that row's baseline
+rather than mixing two processes' readings, and an unresolved (`?`) watched
+PID that grows past 256 MiB since attach gets a one-shot elevation hint.
+Live-validated against the same `spillforge` forced-spill fixture that
+validated `hmn spill` in v0.2.5 (both an automated `#[ignore]`-gated
+end-to-end test spawning the real compiled binaries, and manual dogfooding
+runs recorded in the roadmap doc) plus a real idle-desktop no-false-positive
+run with auto-selected top-3 PIDs. This resolves the "Carried forward"
+table's `hmn watch (TUI live-refresh)` row below — the rejected item was a
+curses-style redraw dashboard; what shipped is explicitly not that. Detailed
+plan: [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md).
+
+The preceding **v0.2.5** shipped 2026-07-22 — `WDDM` spill detection. *Resident, not committed. Episodes, not a boolean.* A `SpillTracker` that compiles on every platform (honest `is_spill_measurable()` returns `false` off-Windows) reads the `PDH` `\GPU Adapter Memory(*)` residency gauges and flags spill only when dedicated-resident saturates **and** shared-resident grows past its benign first-observation baseline — never from the `committed − dedicated` gap, per the rhyme-mdlm dogfooding report's live false-positive ([2026-07-19](docs/dogfooding-feedbacks/dogfooding-wddm-spill-detection.md)). Transient spills are first-class: an instantaneous `is_spilling()` / latched `has_spilled()` split plus an episode-based `SpillReport`. Per-process attribution rides along as additive `GpuProcessEntry::shared_used_bytes` (+ `hmn ps` SHARED column), and `hmn spill -- <command>` wraps any run `time(1)`-style (`--interval` default 100 ms, `--json`, exit-code pass-through). Two live-measured corrections to the design sketch: no `Dedicated Limit` counter exists in `PDH` (capacity comes from `DXGI` `DedicatedVideoMemory`), and the dedicated-saturation default is **85%**, not ~95% — a forced-spill fixture measured `VidMm`'s dedicated-resident ceiling at ≈ 88.6–91.3% of `DXGI` capacity, making 95% unreachable. Release-validated with a real 13.1 s spill episode (3.1 GiB peak shared) on the reference `RTX 5060 Ti`, produced by a forced-spill fixture preserved at [`tools/spillforge`](tools/spillforge/) (repo-only, `publish = false`) for future re-validation on new drivers or contributor hardware. Detailed plan: [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md).
 
 The preceding **v0.2.4** shipped 2026-06-29 — surfaces NVIDIA's driver/firmware **reserved** memory carve-out. *The same total. Now with the carve-out shown.* A new additive `GpuDeviceInfo::reserved_bytes: Option<u64>` exposes the carve-out NVML holds *within* its reported `total` (`total = reserved + free + used`) — **live-measured at 259 MiB** on the reference `RTX 5060 Ti`, byte-identical to `nvidia-smi -q -d MEMORY`'s `Reserved` line beside `Total: 16311 MiB`. It is a subset of `total_bytes`, so allocation headroom is `total_bytes − reserved_bytes` (which `free_bytes` already reflects). Sourced from NVML's v2 memory query (`nvmlDeviceGetMemoryInfo_v2`, R510+) with a graceful pre-R510 fallback to `None`; `total_bytes` is unchanged (the v1 figure = `nvidia-smi` `Total`). Driven by a [`candle-mi`](https://github.com/PCfVW/candle-mi) v0.1.16 dogfooding report — whose *inferred* 73 MiB carve-out (`DXGI nominal − NVML total`) the live v2 query revealed to be a *different* quantity (board/ECC overhead below NVML's `total`) from the true 259 MiB driver reservation. Detailed plan: [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md).
 
@@ -45,9 +85,9 @@ Items that *might* land, gated on real consumer demand:
 | **Intel Arc / Intel iGPU on Linux** | No backend in the crate; same Linux-`DRM` problem | Hardware access or contributor PR |
 | **Apple Metal on Intel Macs** (legacy `AMD` / Intel discrete GPUs) | v0.2.3's `ledger` mechanism likely works, but no Intel-Mac test hardware | Intel-Mac test machine or contributor PR |
 | **Strict-accounting `D3DKMTQueryStatistics` Windows backend** | "Reserved for system use. Do not use." per Microsoft docs; undocumented kernel-thunk surface | A real consumer who reports KB 4490156 drift biting their specific workload |
-| **`hmn watch` (TUI live-refresh)** | Shell loop `watch -n 1 hmn` is the Unix answer; `nvtop`-style work belongs elsewhere | A consumer who's tried `watch` and explained why it's insufficient |
+| ~~**`hmn watch` (TUI live-refresh)**~~ | *Resolved in v0.2.6* — but not as a TUI. The rejected item was an `nvtop`-style curses redraw dashboard; `hmn watch [PID...]` is a `time(1)`-style scrolling sampler (same discipline as `hmn spill`), un-gated by the rhyme-mdlm dogfooding report that tried the `hmn ps`-diff-by-eye workaround and explained why it was insufficient. See [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md). | — |
 | **`hmn` reading from another machine over SSH / RPC** | Out of scope; users run `ssh host hmn` | Not planned |
-| **TUI / live mode (`hmn top`)** | That's `nvtop`'s job | Not planned |
+| **TUI / live mode (`hmn top`)** | That's `nvtop`'s job — `hmn watch` (v0.2.6) is deliberately not this: no redraw, no cursor control, plain scrolling output | Not planned |
 
 `#[non_exhaustive]` keeps every one of these additive — none requires a 1.0 bump.
 
@@ -61,6 +101,7 @@ Items that *might* land, gated on real consumer demand:
 - *v0.2.3 — no separate per-release document; the [PR #1](https://github.com/PCfVW/hypomnesis/pull/1) body served as the per-release roadmap.*
 - [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md) — shipped 2026-06-29. *The same total. Now with the carve-out shown.* NVML v2 `reserved` carve-out surfaced as additive `GpuDeviceInfo::reserved_bytes`, `hmn` summary parenthetical, pre-R510 graceful fallback.
 - [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md) — shipped 2026-07-22. *Resident, not committed. Episodes, not a boolean.* `WDDM` spill detection: `PDH` `Shared Usage` residency gauges, `SpillTracker` with `is_spilling()` / `has_spilled()` split + episode-based `SpillReport`, `GpuProcessEntry::shared_used_bytes` + `hmn ps` SHARED column, `hmn spill -- <command>` wrapper with exit-code pass-through. Threshold default live-tuned to 85% via a forced-spill fixture.
+- [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md) — shipped 2026-07-25. *Not a TUI. Same tracker, a timer instead of a wrapped child.* `hmn watch [PID...]`: attach-to-a-running-PID spill triage, pure CLI addition over the unchanged `SpillTracker` / `gpu_processes()`, auto top-N PID selection, duration-string `--interval` / `--duration`, `0`/`1`/`2` exit-code contract, JSON Lines streaming, `ctrlc`-backed graceful Ctrl+C summary, best-effort PID-reuse baseline reset.
 
 Foundational documents (not per-release):
 
@@ -71,7 +112,7 @@ Foundational documents (not per-release):
 
 ## Principles
 
-1. **Every patch is informed by at least one real consumer's adoption experience.** Codified in v0.2.1's CHANGELOG intro; v0.2.2 follows it (driven by the `WDDM` `[N/A]` finding on a maintainer's RTX 5060 Ti); v0.2.3 follows it (driven by the contributor's actual macOS adoption); v0.2.4 follows it (driven by a `candle-mi` v0.1.16 dogfooding report asking for the NVML driver-reserved carve-out on the same RTX 5060 Ti); v0.2.5 follows it (driven by the maintainer's own `WDDM` spill scenario on the same RTX 5060 Ti / 16 GiB host, then course-corrected by a rhyme-mdlm dogfooding report's live commit-vs-residency false-positive before a line of code was written).
+1. **Every patch is informed by at least one real consumer's adoption experience.** Codified in v0.2.1's CHANGELOG intro; v0.2.2 follows it (driven by the `WDDM` `[N/A]` finding on a maintainer's RTX 5060 Ti); v0.2.3 follows it (driven by the contributor's actual macOS adoption); v0.2.4 follows it (driven by a `candle-mi` v0.1.16 dogfooding report asking for the NVML driver-reserved carve-out on the same RTX 5060 Ti); v0.2.5 follows it (driven by the maintainer's own `WDDM` spill scenario on the same RTX 5060 Ti / 16 GiB host, then course-corrected by a rhyme-mdlm dogfooding report's live commit-vs-residency false-positive before a line of code was written); v0.2.6 follows it (driven by a rhyme-mdlm dogfooding report's 15-hour field-validation campaign, which hit the "can't attach to an already-running PID" gap three separate times).
 2. **Additive-by-default under `#[non_exhaustive]`.** New variants and fields land in patch releases. Type-shape changes (`u64 → Option<u64>`, etc.) are minor bumps, never patches.
 3. **No new hardware backends without maintainer-accessible hardware or a contributor PR.** AMD `ROCm` and Apple Metal sat behind this gate until v0.2.3 (Apple Silicon via PR #1) un-gated half of it.
 4. **Documented limitations beat papered-over half-fixes.** R570 `u64::MAX` sentinel, `WDDM` `NVML_VALUE_NOT_AVAILABLE`, KB 4490156 PDH drift, macOS cross-user `EPERM` — each is named in the source and README rather than hidden.
@@ -80,4 +121,4 @@ Foundational documents (not per-release):
 
 ---
 
-*Living document — update as plans evolve. Last revised 2026-07-22: **v0.2.5 shipped** (`WDDM` spill detection — same-day sequence: morning scope revision correcting spill semantics to **residency, not commit** per the rhyme-mdlm dogfooding report of 2026-07-19 and adding transient-spill handling; implementation + live validation on the reference `RTX 5060 Ti` including a forced-spill fixture that tuned the dedicated-saturation default from the sketched ~95% down to the measured 85%). Previous revisions: 2026-06-29 (v0.2.4 shipped; spill detection bumped one slot to v0.2.5, scope unchanged); 2026-06-13 (spill detection promoted from Speculative to Committed). Reviewer hint: for **shipped** details, the per-release roadmap (or PR body, for v0.2.3) is the authoritative source; for **forthcoming** plans, this document is the source until a per-release roadmap is drafted.*
+*Living document — update as plans evolve. Last revised 2026-07-25: **v0.2.6 shipped** (`hmn watch [PID...]` — same-day sequence: plan-mode design session resolving the rejected "TUI live-refresh" `hmn watch` item into a non-TUI `time(1)`-style sampler per a rhyme-mdlm dogfooding report; implementation as a pure CLI addition with zero library-surface changes; a two-agent conventions-plus-adversarial-correctness pass that found and fixed one compile-breaking test gap and added a best-effort PID-reuse baseline reset; live validation against the `spillforge` fixture via both an automated end-to-end test and manual dogfooding). Previous revisions: 2026-07-22 (v0.2.5 shipped — `WDDM` spill detection, same-day sequence: morning scope revision correcting spill semantics to **residency, not commit** per the rhyme-mdlm dogfooding report of 2026-07-19 and adding transient-spill handling; implementation + live validation on the reference `RTX 5060 Ti` including a forced-spill fixture that tuned the dedicated-saturation default from the sketched ~95% down to the measured 85%); 2026-06-29 (v0.2.4 shipped; spill detection bumped one slot to v0.2.5, scope unchanged); 2026-06-13 (spill detection promoted from Speculative to Committed). Reviewer hint: for **shipped** details, the per-release roadmap (or PR body, for v0.2.3) is the authoritative source; for **forthcoming** plans, this document is the source until a per-release roadmap is drafted.*

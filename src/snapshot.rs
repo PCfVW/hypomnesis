@@ -605,6 +605,132 @@ impl GpuDeviceInfoBuilder {
     }
 }
 
+/// Builder for synthetic [`GpuProcessEntry`] values in downstream tests.
+///
+/// Available only with `features = ["test-helpers"]`. `GpuProcessEntry`
+/// is `#[non_exhaustive]`, so struct-literal construction is unavailable
+/// outside this crate — including to the `hmn` binary's own `watch`
+/// per-sample formatter tests, the first consumer of this builder (the
+/// same circumstance that produced [`crate::SpillReportBuilder`] in
+/// v0.2.5; see `ROADMAP.md`'s "add per type as downstream tests demand"
+/// clause).
+///
+/// Each setter consumes `self` and returns `Self`. Unset fields take the
+/// documented defaults: `pid = 0`, `name = None`, `used_bytes = 0`,
+/// `shared_used_bytes = 0`, `source` = [`GpuQuerySource::Pdh`].
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "test-helpers")]
+/// # {
+/// use hypomnesis::GpuProcessEntry;
+///
+/// let entry = GpuProcessEntry::builder()
+///     .pid(1234)
+///     .name(Some("python.exe".to_owned()))
+///     .used_bytes(8 * 1_024 * 1_024 * 1_024)
+///     .shared_used_bytes(256 * 1_024 * 1_024)
+///     .build();
+/// assert_eq!(entry.pid, 1234);
+/// # }
+/// ```
+#[cfg(feature = "test-helpers")]
+#[derive(Debug, Clone)]
+pub struct GpuProcessEntryBuilder {
+    /// Pending [`GpuProcessEntry::pid`] value, defaults to `0`.
+    pid: u32,
+    /// Pending [`GpuProcessEntry::name`] value, defaults to `None`.
+    name: Option<String>,
+    /// Pending [`GpuProcessEntry::used_bytes`] value, defaults to `0`.
+    used_bytes: u64,
+    /// Pending [`GpuProcessEntry::shared_used_bytes`] value, defaults to `0`.
+    shared_used_bytes: u64,
+    /// Pending [`GpuProcessEntry::source`] value, defaults to
+    /// [`GpuQuerySource::Pdh`] (the backend that populates
+    /// `shared_used_bytes`, the field most downstream tests care about).
+    source: GpuQuerySource,
+}
+
+#[cfg(feature = "test-helpers")]
+impl Default for GpuProcessEntryBuilder {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            name: None,
+            used_bytes: 0,
+            shared_used_bytes: 0,
+            source: GpuQuerySource::Pdh,
+        }
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl GpuProcessEntry {
+    /// Start a builder for constructing synthetic `GpuProcessEntry`
+    /// values in downstream tests.
+    ///
+    /// Available only with `features = ["test-helpers"]`. See
+    /// [`GpuProcessEntryBuilder`] for the full discussion.
+    #[must_use]
+    pub fn builder() -> GpuProcessEntryBuilder {
+        GpuProcessEntryBuilder::default()
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl GpuProcessEntryBuilder {
+    /// Set the OS process ID.
+    #[must_use]
+    pub const fn pid(mut self, pid: u32) -> Self {
+        self.pid = pid;
+        self
+    }
+
+    /// Set the process name (`None` to leave unset).
+    #[must_use]
+    pub fn name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Set the committed GPU memory in bytes.
+    #[must_use]
+    pub const fn used_bytes(mut self, used_bytes: u64) -> Self {
+        self.used_bytes = used_bytes;
+        self
+    }
+
+    /// Set the resident shared-system-memory bytes (the `WDDM` spill
+    /// signal).
+    #[must_use]
+    pub const fn shared_used_bytes(mut self, shared_used_bytes: u64) -> Self {
+        self.shared_used_bytes = shared_used_bytes;
+        self
+    }
+
+    /// Set the backend that produced this row.
+    #[must_use]
+    pub const fn source(mut self, source: GpuQuerySource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Consume the builder and produce the configured `GpuProcessEntry`.
+    ///
+    /// Unset fields take the documented defaults.
+    #[must_use]
+    pub fn build(self) -> GpuProcessEntry {
+        GpuProcessEntry {
+            pid: self.pid,
+            name: self.name,
+            used_bytes: self.used_bytes,
+            shared_used_bytes: self.shared_used_bytes,
+            source: self.source,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

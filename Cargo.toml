@@ -1,6 +1,6 @@
 [package]
 name = "hypomnesis"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 authors = ["Eric Jacopin"]
 description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML + PDH, Linux NVML, macOS libSystem + Metal, with nvidia-smi fallback)."
@@ -20,6 +20,11 @@ libloading = { version = "0.9", optional = true }
 
 # Optional: clap CLI parser for the `hmn` binary (cli feature only)
 clap = { version = "4", optional = true, features = ["derive"] }
+
+# Optional: Ctrl+C handling for `hmn watch`'s graceful closing summary
+# (cli feature only). Safe cross-platform API (SetConsoleCtrlHandler on
+# Windows, sigaction on Unix) — no unsafe code added to this crate.
+ctrlc = { version = "3", optional = true }
 
 # Optional: per-process VRAM on Windows via DXGI (IDXGIAdapter3::QueryVideoMemoryInfo)
 # and PDH (Performance Data Helper for `\GPU Process Memory(*)\Dedicated Usage`).
@@ -65,8 +70,9 @@ metal = ["dep:objc2-metal", "dep:objc2"]
 report = []
 debug-output = []
 # `cli` is default-off so library users don't pull `clap`; install the
-# binary with `cargo install hypomnesis --features cli`.
-cli = ["dep:clap"]
+# binary with `cargo install hypomnesis --features cli`. `ctrlc` backs
+# `hmn watch`'s graceful Ctrl+C closing summary.
+cli = ["dep:clap", "dep:ctrlc"]
 # `test-helpers` exposes a `GpuDeviceInfoBuilder` for downstream tests
 # that need synthetic fixtures of the `#[non_exhaustive]` `GpuDeviceInfo`
 # type. Default-off, additive — production code must never enable it.

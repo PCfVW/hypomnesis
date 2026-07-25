@@ -44,7 +44,7 @@
 //! | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
 //! | `debug-output` | no | Print raw values from the `NVML` / `DXGI` / `PDH` / `nvidia-smi` / spill paths to stderr (diagnostic) |
 //! | `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli` |
-//! | `test-helpers` | no | Expose `GpuDeviceInfoBuilder` and `SpillReportBuilder` for downstream tests that need synthetic fixtures. Default-off, additive — production code must never enable it. |
+//! | `test-helpers` | no | Expose `GpuDeviceInfoBuilder`, `GpuProcessEntryBuilder`, and `SpillReportBuilder` for downstream tests that need synthetic fixtures. Default-off, additive — production code must never enable it. |
 
 #![deny(unsafe_code)]
 #![allow(unknown_lints)]
@@ -68,7 +68,7 @@ pub use spill::{SpillEpisode, SpillReport, SpillTracker, is_spill_measurable};
 pub use report::MemoryReport;
 
 #[cfg(feature = "test-helpers")]
-pub use snapshot::GpuDeviceInfoBuilder;
+pub use snapshot::{GpuDeviceInfoBuilder, GpuProcessEntryBuilder};
 
 #[cfg(feature = "test-helpers")]
 pub use spill::SpillReportBuilder;

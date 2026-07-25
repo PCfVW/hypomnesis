@@ -5,6 +5,7 @@ answer is almost always *"that's measured reality"*. Each entry links back to
 the authoritative source (README limitation, rustdoc, or per-release roadmap).
 
 - [Why does `used_bytes` exceed my card's total VRAM?](#why-does-used_bytes-exceed-my-cards-total-vram)
+- [`hmn spill` or `hmn watch` — which do I use?](#hmn-spill-or-hmn-watch--which-do-i-use)
 - [Why is the SHARED column nonzero when nothing is wrong?](#why-is-the-shared-column-nonzero-when-nothing-is-wrong)
 - [How does hypomnesis decide a run is spilling?](#how-does-hypomnesis-decide-a-run-is-spilling)
 - [Why is the saturation threshold 85% and not 95% (or 100%)?](#why-is-the-saturation-threshold-85-and-not-95-or-100)
@@ -34,6 +35,33 @@ reservation headroom. A dogfooding report caught this false-positive live (a
 compute-bound run "spilling ~1.8 GiB" by the commit gap while Task Manager's
 shared column sat flat at 0); the correction shaped the whole v0.2.5 design.
 See [`docs/dogfooding-feedbacks/dogfooding-wddm-spill-detection.md`](dogfooding-feedbacks/dogfooding-wddm-spill-detection.md).
+
+## `hmn spill` or `hmn watch` — which do I use?
+
+`hmn spill -- <command>` if you're launching the run yourself — it's a
+`time(1)`-style wrapper, so it only works on a command it starts. `hmn watch
+[PID...]` if the process is **already running** and you can't restart it
+under a wrapper — the exact gap a rhyme-mdlm dogfooding report hit three
+times in one 15-hour campaign (hand-rolling "two `hmn ps` samples minutes
+apart, diff by eye" each time). See the
+[watch tutorial](tutorials/watching-a-running-job.md) for the full
+walkthrough; the two share the same `SpillTracker` core and episode
+semantics, so everything in
+[Is my run spilling?](tutorials/is-my-run-spilling.md) about reading the
+episode pattern and attributing per-process applies to both.
+
+Three things specific to `watch`:
+
+- **No PID given** auto-selects the top `--top` (default 5) processes by
+  committed VRAM from the first sample and keeps that fixed set for the run.
+- **Exit code is the point**: `0` no spill observed, `1` spill observed at
+  least once, `2` on a hard error — designed for a watchdog script to check
+  directly (`hmn watch 21844 --duration 5m; [ $? -eq 1 ] && alert`), no JSON
+  parsing needed for the common case.
+- **A `0 B` row isn't necessarily "exited."** `hmn watch` can't tell "PID
+  exited" from "PID alive, holds no GPU memory right now" apart, and doesn't
+  try to — it renders zero either way and does not auto-stop. Use `--duration`
+  or Ctrl+C.
 
 ## Why is the SHARED column nonzero when nothing is wrong?
 

@@ -10,7 +10,39 @@ The crate's *why* lives in [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md
 
 ## Current state
 
-**v0.2.6** shipped 2026-07-25 — `hmn watch [PID...]`, attach-to-a-running-PID
+**v0.2.7** shipped 2026-08-02 — `hmn watch --follow-new` and `hmn ps
+--sort`. *Follow the work, not just the machine. Sort by the question
+you're actually asking.* A candle-mi dogfooding report
+([2026-07-27, extended 2026-08-01](docs/dogfooding-feedbacks/dogfooding-watch-follow-new.md))
+ran `hmn watch` alongside candle-mi's `scripts/resurrect.ps1` oracle suite —
+19 sequential `cargo test` processes over 44 minutes — and found the
+adapter-level spill machinery flawless (three real episodes, including a
+fast 20-second Mistral-7B spike candle-mi's own wall-clock heuristic had
+never caught) while the per-PID half answered the wrong question: `watch`'s
+auto-selected set froze at the first sample, so none of the nineteen
+processes that actually caused the spills were ever attributed. `--follow-new`
+(auto-select mode only; a hard error combined with explicit PIDs) re-runs the
+top-`--top` selection every interval instead of once at attach — a PID
+entering starts fresh, a PID leaving is *finalized* into the closing
+summary's `per_pid[]` instead of rendering `0` forever, tracked via a new
+`WatchState`'s `seen_order` (first-seen, no duplicates). Re-entry after a gap
+resumes existing history; only the existing OS-PID-reuse name-change
+detector resets a row. A companion request from the same suite, filed
+separately: `hmn ps --sort <dedicated|shared|total>`, sharing a single
+`ps_row_comparator` with `hmn watch`'s auto-selection (`select_top_n_pids`,
+always pinned to `Dedicated`) so the two orderings can't drift apart — a
+deliberate, live-confirmed consequence being that `hmn watch`'s auto-selected
+top-N can now pick a different PID than pre-v0.2.7 at an exact VRAM tie.
+Both features validated the same way v0.2.6 was: two sequential real
+`spillforge` forced-spill runs under `hmn watch --follow-new --json`,
+correctly tracked as distinct entries with two separate spill episodes and
+all seven ever-seen PIDs finalized into the summary, both manually and via a
+new automated `#[ignore]`-gated end-to-end test. The repo also transferred
+to the `mi-for-the-rust-of-us` GitHub org during v0.2.7 (joining `anamnesis`
+and `candle-mi`); v0.2.7 carries the corrected crates.io metadata.
+Detailed plan: [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md).
+
+The preceding **v0.2.6** shipped 2026-07-25 — `hmn watch [PID...]`, attach-to-a-running-PID
 spill triage. *Not a TUI. Same tracker, a timer instead of a wrapped child.*
 `hmn spill -- <command>` only wraps a *new* process; a rhyme-mdlm dogfooding
 report ([2026-07-25](docs/dogfooding-feedbacks/dogfooding-spill-triage-watch-mode.md))
@@ -69,10 +101,11 @@ Items that *might* land, gated on real consumer demand:
 - **Segmented per-process VRAM API** — sibling library function `query_per_process_vram_segmented()` returning one row per `(pid, segment)` from PDH's `pid_NNNN_luid_X_phys_N` instances, plus a `hmn ps --show-segments` (or similar) CLI flag. The v0.2.2 PDH backend internally enumerates segmented data before collapsing to per-PID totals; a future patch would promote the internal helper to `pub(super)` and add a sibling dispatcher entry. Gated on either a real consumer ask or hardware exhibiting multi-segment behaviour (single-partition GPUs collapse the two paths identically, so the maintainer's `RTX 5060 Ti` can't validate the segmented path).
 - **`format_summary` / `format_free_used_total`** (deferred from v0.2.1 Wave C) — promote when a second `report`-feature consumer validates the shape.
 - **Long-lived `NVML` context** — performance work, deferred from v0.2.0 / v0.2.1, no benchmark-loop consumer asking yet.
-- **Builders for `ProcessGpuInfo`, `Snapshot`, `GpuProcessEntry` under `test-helpers`** — add per type as downstream tests demand. (Clause first exercised in v0.2.5: `SpillReportBuilder`, demanded by the `hmn` binary's own formatter tests.)
-- **`hmn spill` partial report on Ctrl+C** (deferred from v0.2.5) — a `ctrlc` handler so an interrupted run still prints what was observed. Deferred to keep v0.2.5 dependency-free; documented in the `--help` text. Un-gated by a consumer who actually loses a report they needed.
+- **Builders for `ProcessGpuInfo` and `Snapshot` under `test-helpers`** — add per type as downstream tests demand. (Clause exercised twice so far, both times demanded by the `hmn` binary's own tests: `SpillReportBuilder` in v0.2.5, `GpuProcessEntryBuilder` in v0.2.6 — so `GpuProcessEntry` has left this list. `ProcessGpuInfo` and `Snapshot` are the two still pending.)
+- **`hmn spill` partial report on Ctrl+C** (deferred from v0.2.5) — a `ctrlc` handler so an interrupted run still prints what was observed. **The original rationale has expired**: it was deferred "to keep v0.2.5 dependency-free", but v0.2.6 took `ctrlc` as a `cli`-feature dependency for `hmn watch`, so the cost is already paid and `run_spill` could reuse the same `Arc<AtomicBool>` + interruptible-sleep pattern `run_watch` already runs. What remains is the genuinely harder half, and it is a design question rather than a dependency one: Ctrl+C reaches the whole process group, so `hmn spill` must decide what it owes the *wrapped child* (has it died? should we wait? what exit code do we then pass through?) before it can report honestly. Current behaviour is documented in the `--help` text. Still un-gated by a consumer who actually loses a report they needed.
 - **`SpillTracker` auto-reopen after driver reset / `TDR`** (deferred from v0.2.5) — today a reset invalidates the long-lived `PDH` query and every later `observe()` is a skipped observation (documented). Un-gated by a real consumer whose runs survive TDRs.
-- **Per-process attribution inside `SpillTracker` / adapter `Total Committed` exposure** (deferred from v0.2.5) — the tracker's condition is deliberately adapter-scoped; per-PID shared attribution lives in `gpu_processes()`. Fold attribution into the report only if a consumer shows the two-step flow (`hmn spill` then `hmn ps`) losing the culprit in practice.
+- **Per-process attribution inside `SpillTracker` / adapter `Total Committed` exposure** (deferred from v0.2.5) — the tracker's condition is deliberately adapter-scoped; per-PID shared attribution lives in `gpu_processes()`. Fold attribution into the report only if a consumer shows the two-step flow (`hmn spill` then `hmn ps`) losing the culprit in practice. **Near-miss on that gate in v0.2.7**: the candle-mi report *did* lose the culprit — the adapter shouted SPILL for 16 minutes while the per-PID table showed only desktop tenants — but the cause was `hmn watch`'s frozen PID set, not the tracker's adapter-scoping, and `--follow-new` fixed it entirely at the CLI layer. The library-level fold stays un-gated.
+- **Harden the `hmn watch` PID-reuse reset against name-resolution races** (surfaced by the v0.2.7 report) — the reset that detects OS PID reuse fires only when *both* the previous and current sample carry a resolved process name, so a short-lived recycled PID whose name lookup loses the race silently keeps the old process's baseline. The report saw exactly this shape: a `firefox.exe` row peaking at an implausible 15.7 GB, timed with the big-model steps. Documented as best-effort in the `--help` text and the watch tutorial's Gotchas. A fix would need a second identity signal beyond the name (process start time is the obvious candidate, at the cost of a per-PID `OpenProcess`); un-gated by a consumer for whom the mis-attribution actually changes a diagnosis.
 
 ---
 
@@ -102,6 +135,7 @@ Items that *might* land, gated on real consumer demand:
 - [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md) — shipped 2026-06-29. *The same total. Now with the carve-out shown.* NVML v2 `reserved` carve-out surfaced as additive `GpuDeviceInfo::reserved_bytes`, `hmn` summary parenthetical, pre-R510 graceful fallback.
 - [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md) — shipped 2026-07-22. *Resident, not committed. Episodes, not a boolean.* `WDDM` spill detection: `PDH` `Shared Usage` residency gauges, `SpillTracker` with `is_spilling()` / `has_spilled()` split + episode-based `SpillReport`, `GpuProcessEntry::shared_used_bytes` + `hmn ps` SHARED column, `hmn spill -- <command>` wrapper with exit-code pass-through. Threshold default live-tuned to 85% via a forced-spill fixture.
 - [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md) — shipped 2026-07-25. *Not a TUI. Same tracker, a timer instead of a wrapped child.* `hmn watch [PID...]`: attach-to-a-running-PID spill triage, pure CLI addition over the unchanged `SpillTracker` / `gpu_processes()`, auto top-N PID selection, duration-string `--interval` / `--duration`, `0`/`1`/`2` exit-code contract, JSON Lines streaming, `ctrlc`-backed graceful Ctrl+C summary, best-effort PID-reuse baseline reset.
+- [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md) — shipped 2026-08-02. *Follow the work, not just the machine. Sort by the question you're actually asking.* `hmn watch --follow-new`: re-run top-N selection every interval, departed PIDs finalized into `per_pid[]` via a new `WatchState` `seen_order` roster instead of frozen at attach. `hmn ps --sort <dedicated|shared|total>`: a shared `ps_row_comparator` between `hmn ps` and `hmn watch`'s auto-selection. GitHub org transfer to `mi-for-the-rust-of-us`.
 
 Foundational documents (not per-release):
 
@@ -112,7 +146,7 @@ Foundational documents (not per-release):
 
 ## Principles
 
-1. **Every patch is informed by at least one real consumer's adoption experience.** Codified in v0.2.1's CHANGELOG intro; v0.2.2 follows it (driven by the `WDDM` `[N/A]` finding on a maintainer's RTX 5060 Ti); v0.2.3 follows it (driven by the contributor's actual macOS adoption); v0.2.4 follows it (driven by a `candle-mi` v0.1.16 dogfooding report asking for the NVML driver-reserved carve-out on the same RTX 5060 Ti); v0.2.5 follows it (driven by the maintainer's own `WDDM` spill scenario on the same RTX 5060 Ti / 16 GiB host, then course-corrected by a rhyme-mdlm dogfooding report's live commit-vs-residency false-positive before a line of code was written); v0.2.6 follows it (driven by a rhyme-mdlm dogfooding report's 15-hour field-validation campaign, which hit the "can't attach to an already-running PID" gap three separate times).
+1. **Every patch is informed by at least one real consumer's adoption experience.** Codified in v0.2.1's CHANGELOG intro; v0.2.2 follows it (driven by the `WDDM` `[N/A]` finding on a maintainer's RTX 5060 Ti); v0.2.3 follows it (driven by the contributor's actual macOS adoption); v0.2.4 follows it (driven by a `candle-mi` v0.1.16 dogfooding report asking for the NVML driver-reserved carve-out on the same RTX 5060 Ti); v0.2.5 follows it (driven by the maintainer's own `WDDM` spill scenario on the same RTX 5060 Ti / 16 GiB host, then course-corrected by a rhyme-mdlm dogfooding report's live commit-vs-residency false-positive before a line of code was written); v0.2.6 follows it (driven by a rhyme-mdlm dogfooding report's 15-hour field-validation campaign, which hit the "can't attach to an already-running PID" gap three separate times); v0.2.7 follows it (driven by a candle-mi dogfooding report running `hmn watch` against a 19-process sequential test suite, which found the per-PID auto-selection frozen at attach never saw any of the processes that caused the spills it correctly detected at the adapter level).
 2. **Additive-by-default under `#[non_exhaustive]`.** New variants and fields land in patch releases. Type-shape changes (`u64 → Option<u64>`, etc.) are minor bumps, never patches.
 3. **No new hardware backends without maintainer-accessible hardware or a contributor PR.** AMD `ROCm` and Apple Metal sat behind this gate until v0.2.3 (Apple Silicon via PR #1) un-gated half of it.
 4. **Documented limitations beat papered-over half-fixes.** R570 `u64::MAX` sentinel, `WDDM` `NVML_VALUE_NOT_AVAILABLE`, KB 4490156 PDH drift, macOS cross-user `EPERM` — each is named in the source and README rather than hidden.
@@ -121,4 +155,4 @@ Foundational documents (not per-release):
 
 ---
 
-*Living document — update as plans evolve. Last revised 2026-07-25: **v0.2.6 shipped** (`hmn watch [PID...]` — same-day sequence: plan-mode design session resolving the rejected "TUI live-refresh" `hmn watch` item into a non-TUI `time(1)`-style sampler per a rhyme-mdlm dogfooding report; implementation as a pure CLI addition with zero library-surface changes; a two-agent conventions-plus-adversarial-correctness pass that found and fixed one compile-breaking test gap and added a best-effort PID-reuse baseline reset; live validation against the `spillforge` fixture via both an automated end-to-end test and manual dogfooding). Previous revisions: 2026-07-22 (v0.2.5 shipped — `WDDM` spill detection, same-day sequence: morning scope revision correcting spill semantics to **residency, not commit** per the rhyme-mdlm dogfooding report of 2026-07-19 and adding transient-spill handling; implementation + live validation on the reference `RTX 5060 Ti` including a forced-spill fixture that tuned the dedicated-saturation default from the sketched ~95% down to the measured 85%); 2026-06-29 (v0.2.4 shipped; spill detection bumped one slot to v0.2.5, scope unchanged); 2026-06-13 (spill detection promoted from Speculative to Committed). Reviewer hint: for **shipped** details, the per-release roadmap (or PR body, for v0.2.3) is the authoritative source; for **forthcoming** plans, this document is the source until a per-release roadmap is drafted.*
+*Living document — update as plans evolve. Last revised 2026-08-02: **v0.2.7 shipped** (`hmn watch --follow-new` + `hmn ps --sort` — driven by a candle-mi dogfooding report against a 19-process sequential test suite; two independent two-agent conventions-plus-adversarial-correctness passes, one per feature, each finding and fixing a test that didn't actually discriminate the behavior it claimed to test plus several smaller issues; live validation via two sequential real `spillforge` forced-spill runs under `--follow-new`, both manually and via a new automated end-to-end test; same-release GitHub org transfer to `mi-for-the-rust-of-us`). Previous revisions: 2026-07-25 (v0.2.6 shipped — `hmn watch [PID...]`, same-day sequence: plan-mode design session resolving the rejected "TUI live-refresh" `hmn watch` item into a non-TUI `time(1)`-style sampler per a rhyme-mdlm dogfooding report; implementation as a pure CLI addition with zero library-surface changes; a two-agent conventions-plus-adversarial-correctness pass that found and fixed one compile-breaking test gap and added a best-effort PID-reuse baseline reset; live validation against the `spillforge` fixture via both an automated end-to-end test and manual dogfooding); 2026-07-22 (v0.2.5 shipped — `WDDM` spill detection, same-day sequence: morning scope revision correcting spill semantics to **residency, not commit** per the rhyme-mdlm dogfooding report of 2026-07-19 and adding transient-spill handling; implementation + live validation on the reference `RTX 5060 Ti` including a forced-spill fixture that tuned the dedicated-saturation default from the sketched ~95% down to the measured 85%); 2026-06-29 (v0.2.4 shipped; spill detection bumped one slot to v0.2.5, scope unchanged); 2026-06-13 (spill detection promoted from Speculative to Committed). Reviewer hint: for **shipped** details, the per-release roadmap (or PR body, for v0.2.3) is the authoritative source; for **forthcoming** plans, this document is the source until a per-release roadmap is drafted.*

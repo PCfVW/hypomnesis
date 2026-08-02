@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use hypomnesis::{
     GpuProcessEntry, Result, Snapshot, SpillEpisode, SpillReport, SpillTracker, device_count,
     device_info, gpu_processes,
@@ -137,12 +137,21 @@ enum Commands {
         /// by `device_count()`.
         #[arg(long, value_name = "INDEX")]
         device: Option<u32>,
+        /// Display order: `dedicated` ("who do I kill to free VRAM?",
+        /// the default), `shared` ("who is currently being paged out?"
+        /// — a symptom, not a cause; always a no-op ordering on Linux
+        /// and macOS, where `shared_used_bytes` is always 0), or
+        /// `total` (dedicated + shared, "who is the biggest GPU-memory
+        /// citizen overall?"). Tie-breaks (name ascending, then PID
+        /// ascending) are unchanged by this flag.
+        #[arg(long, value_name = "KEY", default_value = "dedicated")]
+        sort: SortKey,
         /// Emit a JSON array (one object per row) instead of the
         /// default text table. Each object has fields `pid` (number),
         /// `name` (string or null), `used_bytes` (number),
         /// `shared_used_bytes` (number — resident shared bytes, the
         /// WDDM spill signal; 0 off-Windows), `device_index` (number),
-        /// `device_name` (string or null).
+        /// `device_name` (string or null). Row order follows `--sort`.
         #[arg(long)]
         json: bool,
     },
@@ -196,11 +205,12 @@ enum Commands {
     ///
     /// With no PID given, auto-selects the top `--top` processes by
     /// committed VRAM from the first sample and keeps that fixed set for
-    /// the run. A watched PID that stops appearing in the per-process
-    /// listing (exited, or simply holds no GPU memory right now) renders
-    /// as 0 bytes each interval — `hmn watch` does not distinguish the
-    /// two; it does not auto-stop on this basis, use `--duration` or
-    /// Ctrl+C. If the OS recycles a watched PID onto a different process
+    /// the run (or re-selects every interval with `--follow-new`). A
+    /// watched PID that stops appearing in the per-process listing
+    /// (exited, or simply holds no GPU memory right now) renders as 0
+    /// bytes each interval — `hmn watch` does not distinguish the two;
+    /// it does not auto-stop on this basis, use `--duration` or Ctrl+C.
+    /// If the OS recycles a watched PID onto a different process
     /// mid-watch, a resolved-name change is used as a best-effort signal
     /// to reset that row's baseline rather than mixing two processes'
     /// readings.
@@ -208,7 +218,8 @@ enum Commands {
     /// Runs until `--duration` elapses or Ctrl+C, printing a closing
     /// summary (adapter-level `SpillReport` plus per-PID peak/baseline) and
     /// exiting `0` if spill was never observed, `1` if it was at least
-    /// once, `2` on a hard error (bad device, or nothing to auto-select).
+    /// once, `2` on a hard error (bad device, nothing to auto-select, or
+    /// `--follow-new` combined with explicit PID(s)).
     Watch {
         /// Explicit PID(s) to watch. When omitted, auto-selects the top
         /// `--top` processes by committed VRAM from the first sample.
@@ -228,6 +239,20 @@ enum Commands {
         /// PID is given. Ignored when explicit PID(s) are passed.
         #[arg(long, value_name = "N", default_value_t = 5)]
         top: usize,
+        /// Auto-select mode only: re-run the top-`--top` selection every
+        /// interval instead of once at attach. A PID entering the
+        /// followed set starts fresh (baseline = first sighting); a PID
+        /// dropping out (exited, or fell below rank `--top`) simply
+        /// stops appearing in the live rows and is finalized into the
+        /// closing summary's `per_pid[]` with its peak/baseline, instead
+        /// of rendering `0` rows forever. An empty first sample is not
+        /// an error under this flag — the watch just starts empty and
+        /// picks up work as it appears, which is the point. Combining
+        /// this with explicit PID(s) on the command line is a hard
+        /// error (exit `2`): there is no top-N to re-run against a fixed
+        /// list, and explicit PIDs are watched exactly as given.
+        #[arg(long)]
+        follow_new: bool,
         /// GPU index to watch (NVML-canonical ordering).
         #[arg(long, value_name = "INDEX", default_value_t = 0)]
         device: u32,
@@ -245,7 +270,12 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
         None => run_summary(),
-        Some(Commands::Ps { pid, device, json }) => run_ps(pid, device, json),
+        Some(Commands::Ps {
+            pid,
+            device,
+            sort,
+            json,
+        }) => run_ps(pid, device, sort, json),
         // `spill` bypasses the Ok/Err fold below: its exit code is the
         // wrapped command's, passed through — not hmn's own
         // success/failure.
@@ -262,9 +292,10 @@ fn main() -> std::process::ExitCode {
             interval,
             duration,
             top,
+            follow_new,
             device,
             json,
-        }) => return run_watch(&pids, interval, duration, top, device, json),
+        }) => return run_watch(&pids, interval, duration, top, follow_new, device, json),
     };
     match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -355,16 +386,68 @@ struct PsRow {
     device_name: Option<String>,
 }
 
+/// Display-order key for `hmn ps --sort` (and, always pinned to
+/// [`Self::Dedicated`], for [`select_top_n_pids`]'s auto-selection).
+///
+/// Binary-internal dispatch enum, not a library type — matched
+/// exhaustively by [`ps_row_comparator`], the sole place that
+/// interprets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SortKey {
+    /// `used_bytes` (`WDDM` dedicated commit) descending — "who do I
+    /// kill to free VRAM?". The default; matches `hmn ps`'s pre-v0.2.7
+    /// fixed order exactly.
+    Dedicated,
+    /// `shared_used_bytes` (resident shared-system-memory, the spill
+    /// signal) descending — "who is currently being paged out?". A
+    /// symptom, not a cause: a process high in SHARED has already lost
+    /// the fight for dedicated VRAM. Always a no-op ordering on Linux
+    /// and macOS, where `shared_used_bytes` is always `0`.
+    Shared,
+    /// `used_bytes + shared_used_bytes` descending — "who is the
+    /// biggest GPU-memory citizen overall?". Outweighs `Dedicated` for
+    /// processes that hold meaningful shared residency alongside their
+    /// dedicated commit.
+    Total,
+}
+
+/// Build the row comparator for a given [`SortKey`], shared by `hmn ps`
+/// (user-selectable via `--sort`) and [`select_top_n_pids`] (always
+/// [`SortKey::Dedicated`]) so the two orderings cannot silently drift
+/// apart. Tie-breaks (name ascending, then PID ascending — stable
+/// output across runs, and clusters duplicate-name processes like
+/// `msedgewebview2.exe`) are identical regardless of the primary key.
+const fn ps_row_comparator(key: SortKey) -> impl Fn(&PsRow, &PsRow) -> std::cmp::Ordering {
+    move |a, b| {
+        let primary = match key {
+            SortKey::Dedicated => b.used_bytes.cmp(&a.used_bytes),
+            SortKey::Shared => b.shared_used_bytes.cmp(&a.shared_used_bytes),
+            SortKey::Total => b
+                .used_bytes
+                .saturating_add(b.shared_used_bytes)
+                .cmp(&a.used_bytes.saturating_add(a.shared_used_bytes)),
+        };
+        primary
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.pid.cmp(&b.pid))
+    }
+}
+
 /// Run the `ps` subcommand: collect process rows for the selected
-/// device(s), apply the `--pid` filter, then emit either a text table
-/// or JSON.
+/// device(s), apply the `--pid` filter, sort per `--sort`, then emit
+/// either a text table or JSON.
 //
 // Returns `Result<()>` for symmetry with `run_summary` so `main` can
 // dispatch through one match arm. The body never produces an `Err` (per-device
 // failures are swallowed via `continue` so one broken device doesn't kill the
 // whole listing); the lint is allowed for that reason.
 #[allow(clippy::unnecessary_wraps)]
-fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Result<()> {
+fn run_ps(
+    pid_filter: Option<u32>,
+    device_filter: Option<u32>,
+    sort: SortKey,
+    json: bool,
+) -> Result<()> {
     // device_count returning Err here means no enumeration backend is
     // enabled / every backend failed; treat as zero NVIDIA devices and
     // let the empty Vec fall through to the formatter (which prints
@@ -402,20 +485,15 @@ fn run_ps(pid_filter: Option<u32>, device_filter: Option<u32>, json: bool) -> Re
         }
     }
 
-    // Human-facing display order: VRAM descending so the biggest
-    // consumers land at the top (the row a user asking "what's
-    // eating my GPU memory?" wants to see first), name ascending
-    // for tie-break grouping (duplicate-name processes like
-    // `msedgewebview2.exe` cluster together), then PID ascending
-    // for stable order across runs when name + bytes tie. The
-    // library's `gpu_processes()` returns rows PID-sorted; this
+    // Human-facing display order, per `--sort` (default: VRAM descending
+    // so the biggest consumers land at the top — the row a user asking
+    // "what's eating my GPU memory?" wants to see first). Tie-breaks
+    // (name ascending for grouping duplicate-name processes like
+    // `msedgewebview2.exe`, then PID ascending for stable order across
+    // runs) are identical regardless of key — see `ps_row_comparator`.
+    // The library's `gpu_processes()` returns rows PID-sorted; this
     // overrides that for display only.
-    rows.sort_by(|a, b| {
-        b.used_bytes
-            .cmp(&a.used_bytes)
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.pid.cmp(&b.pid))
-    });
+    rows.sort_by(ps_row_comparator(sort));
 
     if json {
         print!("{}", format_ps_json(&rows));
@@ -893,6 +971,57 @@ impl WatchedPidState {
     }
 }
 
+/// Accumulated per-PID watch state, plus the order PIDs were first seen
+/// in.
+///
+/// A plain `HashMap<u32, WatchedPidState>` would lose insertion order —
+/// fine when the watched PID set is fixed for the whole run (the
+/// pre-`--follow-new` case, where the closing summary iterates the
+/// original fixed list instead), but under `--follow-new` the closing
+/// summary must instead walk *every* PID ever tracked (departed or
+/// still active) in a deterministic, meaningful order. `seen_order`
+/// records that order — chronological, first sighting — without pulling
+/// in an ordered-map dependency: [`WatchState::track`] is the sole
+/// insertion point and is the only place a PID is ever appended to it,
+/// exactly once, the first time that PID is seen.
+struct WatchState {
+    /// Per-PID accumulated state, keyed by PID.
+    by_pid: HashMap<u32, WatchedPidState>,
+    /// PIDs in first-seen order. Never contains a duplicate — see
+    /// [`WatchState::track`].
+    seen_order: Vec<u32>,
+}
+
+impl WatchState {
+    /// Fresh, empty state.
+    fn new() -> Self {
+        Self {
+            by_pid: HashMap::new(),
+            seen_order: Vec::new(),
+        }
+    }
+
+    /// Get the existing entry for `pid`, or seed a fresh one from
+    /// `(used_bytes, shared_bytes)` and record `pid` in
+    /// [`Self::seen_order`] — but only on this, the *first* time `pid`
+    /// is tracked. A PID that later drops out of the followed set and
+    /// re-enters keeps its original `seen_order` position and its
+    /// existing history (no reset; see [`process_sample`]'s doc comment
+    /// for why re-entry is deliberately not treated as a new process).
+    fn track(&mut self, pid: u32, used_bytes: u64, shared_bytes: u64) -> &mut WatchedPidState {
+        // `self.seen_order` and `self.by_pid` are disjoint fields, so
+        // borrowing the former up front and capturing it in the
+        // `or_insert_with` closure below (which only runs, and so only
+        // pushes, on an actual insertion) needs no unwrap/expect/entry
+        // double-lookup to track first-seen order.
+        let seen_order = &mut self.seen_order;
+        self.by_pid.entry(pid).or_insert_with(|| {
+            seen_order.push(pid);
+            WatchedPidState::new(used_bytes, shared_bytes)
+        })
+    }
+}
+
 /// One PID's rendered row for one interval — output of [`process_sample`],
 /// consumed by the text-table and JSONL formatters.
 struct WatchSampleRow {
@@ -959,24 +1088,23 @@ fn format_delta(bytes: i64) -> String {
 
 /// `u8` exit code conveying whether spill was observed during a watch:
 /// `0` clean, `1` spill observed at least once. Hard-error paths (bad
-/// device, nothing to auto-select) return `2` directly from
-/// [`run_watch`], bypassing this mapping.
+/// device, nothing to auto-select, or `--follow-new` combined with
+/// explicit PIDs) return `2` directly from [`run_watch`], bypassing
+/// this mapping.
 const fn watch_exit_code(spilled: bool) -> u8 {
     if spilled { 1 } else { 0 }
 }
 
 /// Select the PIDs to watch when none were given explicitly: sort by
-/// committed `used_bytes` descending (same ordering `run_ps` applies for
-/// display), tie-break by PID ascending for stable output, and take the
-/// first `n`. Pure — the auto-selection policy is unit-testable without
-/// any FFI.
+/// [`ps_row_comparator`] under [`SortKey::Dedicated`] — always the
+/// dedicated-descending key, sharing `run_ps`'s exact comparator
+/// (including its name/PID tie-break chain) so the two orderings can't
+/// silently drift — and take the first `n`. Pure — the auto-selection
+/// policy is unit-testable without any FFI.
 fn select_top_n_pids(rows: &[PsRow], n: usize) -> Vec<u32> {
     let mut sorted: Vec<&PsRow> = rows.iter().collect();
-    sorted.sort_by(|a, b| {
-        b.used_bytes
-            .cmp(&a.used_bytes)
-            .then_with(|| a.pid.cmp(&b.pid))
-    });
+    let cmp = ps_row_comparator(SortKey::Dedicated);
+    sorted.sort_by(|a, b| cmp(a, b));
     sorted.into_iter().take(n).map(|r| r.pid).collect()
 }
 
@@ -1036,6 +1164,15 @@ fn sleep_interruptibly(total: Duration, interrupted: &AtomicBool) {
 /// "currently holds no GPU memory" and does not try to (see the `Watch`
 /// subcommand's doc comment).
 ///
+/// `watched` need not be the same slice across calls — under
+/// `--follow-new` it's recomputed every interval — and a PID re-entering
+/// `watched` after an absence resumes its existing [`WatchState`] entry
+/// rather than starting fresh: [`WatchState::track`] only seeds a PID
+/// once, the first time it's ever seen, by design (an OS process
+/// legitimately dipping below rank `--top` for one interval and
+/// recovering is not a new process; the name-change reset below is the
+/// intentionally narrower signal for genuine OS PID reuse).
+///
 /// Emits the one-shot `?`-row growth hint to stderr the first interval
 /// an unresolved watched PID's cumulative growth crosses
 /// [`UNRESOLVED_GROWTH_HINT_BYTES`]. Also detects a watched PID being
@@ -1045,7 +1182,7 @@ fn sleep_interruptibly(total: Duration, interrupted: &AtomicBool) {
 /// (unresolved-name churn can't be distinguished from reuse).
 fn process_sample(
     rows: &[GpuProcessEntry],
-    state: &mut HashMap<u32, WatchedPidState>,
+    state: &mut WatchState,
     watched: &[u32],
     elapsed: Duration,
     tracker: Option<&mut SpillTracker>,
@@ -1066,9 +1203,7 @@ fn process_sample(
             (r.name.clone(), r.used_bytes, r.shared_used_bytes)
         });
 
-        let entry = state
-            .entry(pid)
-            .or_insert_with(|| WatchedPidState::new(used_bytes, shared_bytes));
+        let entry = state.track(pid, used_bytes, shared_bytes);
 
         // The OS can recycle a PID mid-watch: a resolved name that
         // changes between samples is the only signal `hmn watch` has
@@ -1367,26 +1502,141 @@ fn format_watch_summary_json(report: Option<&SpillReport>, per_pid: &[WatchPidSu
     out
 }
 
+/// Resolve which PIDs to watch from one sample: `explicit` unchanged
+/// when non-empty (explicit PIDs are always watched exactly as given),
+/// otherwise the top `top` by committed VRAM from `rows` — sharing
+/// `hmn ps`'s own comparator via [`select_top_n_pids`], so the two
+/// orderings can't drift apart.
+///
+/// Called once before the watch loop always, and again every interval
+/// under `--follow-new` (cheap: `rows` numbers in the tens, and
+/// `--interval` is 5s+ apart by default).
+fn resolve_watched_pids(rows: &[GpuProcessEntry], explicit: &[u32], top: usize) -> Vec<u32> {
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+    // device_index / device_name are unused by SortKey::Dedicated's
+    // comparator (pid / used_bytes / name only) — defaulted rather than
+    // threaded through from the caller, which has no device-name
+    // context of its own to give.
+    let ps_rows: Vec<PsRow> = rows
+        .iter()
+        .map(|e| PsRow {
+            pid: e.pid,
+            // BORROW: clone — e is borrowed from `rows`.
+            name: e.name.clone(),
+            used_bytes: e.used_bytes,
+            shared_used_bytes: e.shared_used_bytes,
+            device_index: 0,
+            device_name: None,
+        })
+        .collect();
+    select_top_n_pids(&ps_rows, top)
+}
+
+/// Build the stderr breadcrumb naming PIDs that entered or left the
+/// followed set between two consecutive `--follow-new` intervals, or
+/// `None` when the set didn't change. Entered-PID names come from the
+/// current sample's `rows`; left-PID names come from `state`'s last
+/// known name for that PID (it is already absent from `rows`, by
+/// definition of having left). Purely cosmetic: doesn't affect the
+/// JSONL stream shape or the closing summary.
+///
+/// `prev_watched` must be captured *before* the caller reassigns its
+/// `watched` variable to the freshly `resolve_watched_pids`-computed
+/// set — the two arguments have to actually differ for the diff to mean
+/// anything. Call order relative to [`process_sample`] does not matter
+/// on its own: `process_sample` only touches a PID present in the
+/// `watched` slice it is given, so a departed PID's [`WatchState`] entry
+/// is untouched that interval regardless of when this function runs
+/// relative to it.
+fn format_followed_set_change(
+    prev_watched: &[u32],
+    new_watched: &[u32],
+    rows: &[GpuProcessEntry],
+    state: &WatchState,
+    elapsed: Duration,
+) -> Option<String> {
+    let entered: Vec<u32> = new_watched
+        .iter()
+        .copied()
+        .filter(|p| !prev_watched.contains(p))
+        .collect();
+    let left: Vec<u32> = prev_watched
+        .iter()
+        .copied()
+        .filter(|p| !new_watched.contains(p))
+        .collect();
+    if entered.is_empty() && left.is_empty() {
+        return None;
+    }
+
+    let name_for = |pid: u32| -> String {
+        let name = rows
+            .iter()
+            .find(|r| r.pid == pid)
+            .and_then(|r| r.name.clone())
+            .or_else(|| state.by_pid.get(&pid).and_then(|s| s.last_name.clone()));
+        name.map_or_else(|| format!("pid={pid}"), |n| format!("pid={pid} ({n})"))
+    };
+
+    let mut clauses = Vec::new();
+    if !entered.is_empty() {
+        let list = entered
+            .into_iter()
+            .map(name_for)
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("entered {list}"));
+    }
+    if !left.is_empty() {
+        let list = left
+            .into_iter()
+            .map(name_for)
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("left {list}"));
+    }
+    Some(format!(
+        "hmn watch: +{:.1}s followed set changed: {}",
+        elapsed.as_secs_f64(),
+        clauses.join("; ")
+    ))
+}
+
 /// Run the `watch` subcommand: resolve the watched PID set, sample it on
 /// a timer against [`SpillTracker`] + [`gpu_processes`] until
 /// `--duration` elapses or Ctrl+C, then print the closing summary.
 ///
-/// Returns `2` immediately on a hard error (device unreachable, or
-/// nothing to auto-select); otherwise runs to completion and returns
+/// Returns `2` immediately on a hard error (device unreachable, nothing
+/// to auto-select without `--follow-new`, or `--follow-new` combined
+/// with explicit PIDs); otherwise runs to completion and returns
 /// [`watch_exit_code`] of whether spill was ever observed.
 fn run_watch(
     pids: &[u32],
     interval: Duration,
     duration: Option<Duration>,
     top: usize,
+    follow_new: bool,
     device: u32,
     json: bool,
 ) -> std::process::ExitCode {
-    let device_name = device_info(device).ok().and_then(|d| d.name);
-
     let mut seen = std::collections::HashSet::new();
     let explicit: Vec<u32> = pids.iter().copied().filter(|p| seen.insert(*p)).collect();
     let auto_selected = explicit.is_empty();
+
+    // Checked first, before any backend call (including `device_info`
+    // below, itself a real NVML/DXGI dispatch) — argument-validation
+    // failures should fail fast without touching hardware at all.
+    if follow_new && !auto_selected {
+        eprintln!(
+            "hmn: watch --follow-new only applies to auto-selection; drop --follow-new or \
+             the explicit PID list"
+        );
+        return std::process::ExitCode::from(2);
+    }
+
+    let device_name = device_info(device).ok().and_then(|d| d.name);
 
     let first_rows = match gpu_processes(device) {
         Ok(rows) => rows,
@@ -1396,32 +1646,21 @@ fn run_watch(
         }
     };
 
-    let watched: Vec<u32> = if auto_selected {
-        let ps_rows: Vec<PsRow> = first_rows
-            .iter()
-            .map(|e| PsRow {
-                pid: e.pid,
-                // BORROW: clone — e is borrowed from first_rows, and
-                // device_name is shared across every row built here.
-                name: e.name.clone(),
-                used_bytes: e.used_bytes,
-                shared_used_bytes: e.shared_used_bytes,
-                device_index: device,
-                device_name: device_name.clone(),
-            })
-            .collect();
-        let selected = select_top_n_pids(&ps_rows, top);
-        if selected.is_empty() {
+    let mut watched = resolve_watched_pids(&first_rows, &explicit, top);
+    if watched.is_empty() {
+        if follow_new {
+            eprintln!(
+                "hmn: watch found no GPU processes on device {device} yet (top {top} by \
+                 committed); waiting for work to appear"
+            );
+        } else {
             eprintln!(
                 "hmn: watch found no GPU processes on device {device} to auto-select \
                  (top {top}); re-run with an explicit PID once a workload is running"
             );
             return std::process::ExitCode::from(2);
         }
-        selected
-    } else {
-        explicit
-    };
+    }
 
     let mut tracker = match SpillTracker::new(device) {
         Ok(t) => Some(t),
@@ -1441,24 +1680,28 @@ fn run_watch(
         }
     }
 
+    let mode_clause = if follow_new {
+        format!(
+            "following top {top} by committed (re-selected every interval), {} initially",
+            watched.len()
+        )
+    } else if auto_selected {
+        format!("watching {} PID(s) (top {top} by committed)", watched.len())
+    } else {
+        format!("watching {} PID(s)", watched.len())
+    };
     eprintln!(
-        "hmn watch: device {device}{}, interval {:.1}s, watching {} PID(s){}",
+        "hmn watch: device {device}{}, interval {:.1}s, {mode_clause}",
         device_name
             .as_deref()
             .map_or_else(String::new, |n| format!(" [{n}]")),
         interval.as_secs_f64(),
-        watched.len(),
-        if auto_selected {
-            format!(" (top {top} by committed)")
-        } else {
-            String::new()
-        }
     );
     if !json {
         print!("{}", format_watch_header_text());
     }
 
-    let mut state: HashMap<u32, WatchedPidState> = HashMap::new();
+    let mut state = WatchState::new();
     let start = std::time::Instant::now();
 
     let rows0 = process_sample(
@@ -1497,6 +1740,17 @@ fn run_watch(
                 continue 'watch;
             }
         };
+
+        if follow_new {
+            let new_watched = resolve_watched_pids(&rows, &explicit, top);
+            if let Some(msg) =
+                format_followed_set_change(&watched, &new_watched, &rows, &state, elapsed)
+            {
+                eprintln!("{msg}");
+            }
+            watched = new_watched;
+        }
+
         let sample = process_sample(&rows, &mut state, &watched, elapsed, tracker.as_mut());
         if json {
             print!("{}", format_watch_rows_json(elapsed, &sample));
@@ -1506,10 +1760,11 @@ fn run_watch(
     }
 
     let report = tracker.map(SpillTracker::into_report);
-    let per_pid: Vec<WatchPidSummary> = watched
+    let per_pid: Vec<WatchPidSummary> = state
+        .seen_order
         .iter()
         .map(|&pid| {
-            let s = state.get(&pid);
+            let s = state.by_pid.get(&pid);
             WatchPidSummary {
                 pid,
                 name: s.and_then(|s| s.last_name.clone()),
@@ -2038,6 +2293,37 @@ mod tests {
         assert_eq!(format_secs(Duration::ZERO), "0.0s");
     }
 
+    // --- ps argument parsing (--sort) ---
+
+    #[test]
+    fn ps_args_sort_defaults_to_dedicated() {
+        let cli = Cli::try_parse_from(["hmn", "ps"]).unwrap();
+        let Some(Commands::Ps { sort, .. }) = cli.command else {
+            panic!("expected Ps subcommand");
+        };
+        assert_eq!(sort, SortKey::Dedicated);
+    }
+
+    #[test]
+    fn ps_args_sort_accepts_each_key() {
+        for (flag, expected) in [
+            ("dedicated", SortKey::Dedicated),
+            ("shared", SortKey::Shared),
+            ("total", SortKey::Total),
+        ] {
+            let cli = Cli::try_parse_from(["hmn", "ps", "--sort", flag]).unwrap();
+            let Some(Commands::Ps { sort, .. }) = cli.command else {
+                panic!("expected Ps subcommand");
+            };
+            assert_eq!(sort, expected, "--sort {flag}");
+        }
+    }
+
+    #[test]
+    fn ps_args_sort_rejects_unknown_key() {
+        assert!(Cli::try_parse_from(["hmn", "ps", "--sort", "bogus"]).is_err());
+    }
+
     // --- spill argument parsing ---
 
     #[test]
@@ -2300,6 +2586,87 @@ mod tests {
         assert_eq!(watch_exit_code(true), 1);
     }
 
+    // --- ps_row_comparator / SortKey ---
+
+    /// Like [`row`] but with an explicit `shared_used_bytes`, needed to
+    /// exercise `SortKey::Shared` / `SortKey::Total`.
+    fn row_full(pid: u32, name: &str, used_bytes: u64, shared_used_bytes: u64) -> PsRow {
+        PsRow {
+            pid,
+            name: Some(name.to_owned()),
+            used_bytes,
+            shared_used_bytes,
+            device_index: 0,
+            device_name: None,
+        }
+    }
+
+    fn sorted_pids(rows: &mut [PsRow], key: SortKey) -> Vec<u32> {
+        rows.sort_by(ps_row_comparator(key));
+        rows.iter().map(|r| r.pid).collect()
+    }
+
+    #[test]
+    fn ps_row_comparator_dedicated_descending() {
+        let mut rows = vec![
+            row_full(1, "a.exe", 1_000, 9_000),
+            row_full(2, "b.exe", 5_000, 0),
+            row_full(3, "c.exe", 3_000, 0),
+        ];
+        assert_eq!(sorted_pids(&mut rows, SortKey::Dedicated), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn ps_row_comparator_shared_descending() {
+        let mut rows = vec![
+            row_full(1, "a.exe", 1_000, 9_000),
+            row_full(2, "b.exe", 5_000, 0),
+            row_full(3, "c.exe", 3_000, 2_000),
+        ];
+        assert_eq!(sorted_pids(&mut rows, SortKey::Shared), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn ps_row_comparator_total_descending_differs_from_dedicated_and_shared() {
+        // pid 1: total 10_000 (highest) but neither dedicated- nor
+        // shared-highest alone — only `total` puts it first.
+        let mut rows = vec![
+            row_full(1, "a.exe", 4_000, 6_000),
+            row_full(2, "b.exe", 8_000, 0),
+            row_full(3, "c.exe", 0, 7_000),
+        ];
+        assert_eq!(sorted_pids(&mut rows, SortKey::Total), vec![1, 2, 3]);
+        // Confirms neither single-field key would have produced this order.
+        assert_eq!(sorted_pids(&mut rows, SortKey::Dedicated), vec![2, 1, 3]);
+        assert_eq!(sorted_pids(&mut rows, SortKey::Shared), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn ps_row_comparator_tie_break_identical_across_keys() {
+        // Two rows tied on every numeric field: every key must fall
+        // through to the same name-then-PID tie-break.
+        let mut rows = vec![
+            row_full(20, "b.exe", 1_000, 1_000),
+            row_full(10, "a.exe", 1_000, 1_000),
+        ];
+        for key in [SortKey::Dedicated, SortKey::Shared, SortKey::Total] {
+            assert_eq!(sorted_pids(&mut rows, key), vec![10, 20], "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn ps_row_comparator_total_saturates_instead_of_overflowing() {
+        // Pathological but must not panic: plain `+` on two `u64::MAX`
+        // values panics in debug builds (and silently wraps in
+        // release); `saturating_add` does neither and still orders
+        // this row correctly ahead of a small, unambiguous total.
+        let mut rows = vec![
+            row_full(1, "a.exe", u64::MAX, u64::MAX),
+            row_full(2, "b.exe", 1_000, 0),
+        ];
+        assert_eq!(sorted_pids(&mut rows, SortKey::Total), vec![1, 2]);
+    }
+
     // --- select_top_n_pids ---
 
     #[test]
@@ -2330,6 +2697,22 @@ mod tests {
             row(10, Some("a.exe"), 1_000, 0, None),
         ];
         assert_eq!(select_top_n_pids(&rows, 2), vec![10, 20]);
+    }
+
+    #[test]
+    fn select_top_n_pids_ties_break_by_name_before_pid() {
+        // Shares ps_row_comparator with `hmn ps`: a tie on used_bytes
+        // breaks by name first, PID only as the final fallback. Name
+        // and PID order deliberately *disagree* here (the lower PID, 1,
+        // carries the alphabetically-later name) so this fixture can
+        // actually distinguish "name-then-PID" from the old "PID-only"
+        // rule: a PID-only tie-break would produce `[1, 99]`; the real
+        // (name-first) comparator produces `[99, 1]`.
+        let rows = vec![
+            row(1, Some("z.exe"), 1_000, 0, None),
+            row(99, Some("a.exe"), 1_000, 0, None),
+        ];
+        assert_eq!(select_top_n_pids(&rows, 2), vec![99, 1]);
     }
 
     // --- format_watch_rows_text / format_watch_header_text ---
@@ -2468,7 +2851,7 @@ mod tests {
     #[cfg(feature = "test-helpers")]
     #[test]
     fn process_sample_first_interval_zero_delta() {
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows = vec![entry(100, Some("python.exe"), 8_000, 100)];
         let out = process_sample(&rows, &mut state, &[100], Duration::ZERO, None);
         assert_eq!(out.len(), 1);
@@ -2482,7 +2865,7 @@ mod tests {
     #[cfg(feature = "test-helpers")]
     #[test]
     fn process_sample_second_interval_computes_delta() {
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
         let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
         let rows1 = vec![entry(100, Some("python.exe"), 9_500, 300)];
@@ -2495,7 +2878,7 @@ mod tests {
     #[cfg(feature = "test-helpers")]
     #[test]
     fn process_sample_missing_pid_renders_zero() {
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows: Vec<GpuProcessEntry> = vec![];
         let out = process_sample(&rows, &mut state, &[42], Duration::ZERO, None);
         assert_eq!(out.len(), 1);
@@ -2508,12 +2891,12 @@ mod tests {
     #[cfg(feature = "test-helpers")]
     #[test]
     fn process_sample_peak_tracked_across_samples() {
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
         let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
         let rows1 = vec![entry(100, Some("python.exe"), 5_000, 50)];
         let _ = process_sample(&rows1, &mut state, &[100], Duration::from_secs(5), None);
-        let s = state.get(&100).unwrap();
+        let s = state.by_pid.get(&100).unwrap();
         assert_eq!(s.peak_used_bytes, 8_000);
         assert_eq!(s.peak_shared_bytes, 100);
         assert_eq!(s.baseline_used_bytes, 8_000);
@@ -2527,7 +2910,7 @@ mod tests {
         // reassigned to an unrelated notepad.exe. The resolved-name
         // change must reset the row's baseline/peak to the new
         // process's reading rather than mixing the two.
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
         let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
         let rows1 = vec![entry(100, Some("python.exe"), 9_000, 500)];
@@ -2543,7 +2926,7 @@ mod tests {
         assert_eq!(row.used_delta, 0);
         assert_eq!(row.shared_delta, 0);
 
-        let s = state.get(&100).unwrap();
+        let s = state.by_pid.get(&100).unwrap();
         assert_eq!(s.baseline_used_bytes, 200);
         assert_eq!(s.baseline_shared_bytes, 10);
         assert_eq!(s.peak_used_bytes, 200);
@@ -2556,7 +2939,7 @@ mod tests {
         // A `?` sample between two resolved samples of the SAME name
         // must not be treated as a reuse — last_name stays sticky
         // across the None sample, so the baseline is undisturbed.
-        let mut state = HashMap::new();
+        let mut state = WatchState::new();
         let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
         let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
         let rows1 = vec![entry(100, None, 8_500, 150)];
@@ -2568,7 +2951,164 @@ mod tests {
         // sample's prev (8_500 / 150), not a fresh 0.
         assert_eq!(row.used_delta, 500);
         assert_eq!(row.shared_delta, 50);
-        assert_eq!(state.get(&100).unwrap().baseline_used_bytes, 8_000);
+        assert_eq!(state.by_pid.get(&100).unwrap().baseline_used_bytes, 8_000);
+    }
+
+    // --- WatchState::track (--follow-new seen_order bookkeeping) ---
+
+    #[test]
+    fn watch_state_track_records_first_seen_order_once() {
+        let mut state = WatchState::new();
+        state.track(100, 1_000, 0);
+        state.track(200, 2_000, 0);
+        // Re-tracking an already-seen PID must not append a second
+        // seen_order entry, nor reset its state.
+        state.track(100, 9_000, 0);
+        assert_eq!(state.seen_order, vec![100, 200]);
+        assert_eq!(state.by_pid.get(&100).unwrap().baseline_used_bytes, 1_000);
+    }
+
+    #[test]
+    fn watch_state_track_returns_mutable_existing_entry() {
+        let mut state = WatchState::new();
+        state.track(100, 1_000, 0).peak_used_bytes = 5_000;
+        // The second `track` call for the same PID must see the
+        // mutation the first call's caller made through the returned
+        // reference, not a fresh `WatchedPidState`.
+        assert_eq!(state.track(100, 1_000, 0).peak_used_bytes, 5_000);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn watch_state_seen_order_survives_pid_dropping_out_of_watched() {
+        // Simulates --follow-new: pid 100 is watched for one interval,
+        // genuinely excluded from `watched` the next (dropped below
+        // top-N, but still alive and still present in `rows` — only
+        // absent from the `watched` slice `process_sample` is given),
+        // then re-enters. seen_order must record it exactly once, at
+        // its first sighting, and its accumulated state must survive
+        // the gap untouched rather than drifting or resetting.
+        let mut state = WatchState::new();
+        let rows0 = vec![
+            entry(100, Some("a.exe"), 1_000, 0),
+            entry(200, Some("b.exe"), 500, 0),
+        ];
+        let _ = process_sample(&rows0, &mut state, &[100, 200], Duration::ZERO, None);
+
+        // pid 100 is genuinely excluded from `watched` this interval
+        // even though it's still present in `rows` at a different
+        // reading (9_000) — process_sample must not touch its state
+        // at all while it's excluded.
+        let rows1 = vec![
+            entry(100, Some("a.exe"), 9_000, 0),
+            entry(200, Some("b.exe"), 600, 0),
+        ];
+        let _ = process_sample(&rows1, &mut state, &[200], Duration::from_secs(5), None);
+        assert_eq!(
+            state.by_pid.get(&100).unwrap().peak_used_bytes,
+            1_000,
+            "excluded PID's state must be untouched while absent from `watched`"
+        );
+
+        // pid 100 re-enters `watched`; its delta is against its own
+        // pre-gap prev (1_000), not the 9_000 it drifted to while
+        // excluded — process_sample never saw that reading.
+        let rows2 = vec![
+            entry(100, Some("a.exe"), 1_200, 0),
+            entry(200, Some("b.exe"), 600, 0),
+        ];
+        let out = process_sample(
+            &rows2,
+            &mut state,
+            &[100, 200],
+            Duration::from_secs(10),
+            None,
+        );
+        let row100 = out.iter().find(|r| r.pid == 100).unwrap();
+        assert_eq!(row100.used_delta, 200); // 1_200 - 1_000, not 1_200 - 9_000
+        assert_eq!(state.by_pid.get(&100).unwrap().peak_used_bytes, 1_200);
+        assert_eq!(state.seen_order, vec![100, 200]);
+    }
+
+    // --- resolve_watched_pids ---
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn resolve_watched_pids_explicit_passthrough_ignores_rows_and_top() {
+        let rows = vec![entry(1, Some("a.exe"), 9_000, 0)];
+        assert_eq!(resolve_watched_pids(&rows, &[42, 43], 1), vec![42, 43]);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn resolve_watched_pids_auto_selects_top_n_from_rows() {
+        let rows = vec![
+            entry(1, Some("a.exe"), 1_000, 0),
+            entry(2, Some("b.exe"), 5_000, 0),
+            entry(3, Some("c.exe"), 3_000, 0),
+        ];
+        assert_eq!(resolve_watched_pids(&rows, &[], 2), vec![2, 3]);
+    }
+
+    #[test]
+    fn resolve_watched_pids_empty_rows_and_explicit_is_empty() {
+        assert!(resolve_watched_pids(&[], &[], 5).is_empty());
+    }
+
+    // --- format_followed_set_change (--follow-new stderr breadcrumb) ---
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_followed_set_change_none_when_unchanged() {
+        let rows = vec![entry(1, Some("a.exe"), 1_000, 0)];
+        let state = WatchState::new();
+        assert!(format_followed_set_change(&[1], &[1], &rows, &state, Duration::ZERO).is_none());
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_followed_set_change_reports_entered_with_name_from_rows() {
+        let rows = vec![entry(2, Some("new.exe"), 1_000, 0)];
+        let state = WatchState::new();
+        let msg = format_followed_set_change(&[1], &[1, 2], &rows, &state, Duration::from_secs(10))
+            .unwrap();
+        assert!(msg.contains("entered pid=2 (new.exe)"), "{msg}");
+        assert!(!msg.contains("left"), "{msg}");
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_followed_set_change_reports_left_with_name_from_state() {
+        // The departed PID is, by construction, absent from the current
+        // sample's `rows` — its name must come from `state`'s last
+        // known reading instead.
+        let rows: Vec<GpuProcessEntry> = vec![];
+        let mut state = WatchState::new();
+        state.track(1, 1_000, 0).last_name = Some("gone.exe".to_owned());
+        let msg =
+            format_followed_set_change(&[1], &[], &rows, &state, Duration::from_secs(10)).unwrap();
+        assert!(msg.contains("left pid=1 (gone.exe)"), "{msg}");
+        assert!(!msg.contains("entered"), "{msg}");
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_followed_set_change_unresolved_name_renders_bare_pid() {
+        let rows = vec![entry(2, None, 1_000, 0)];
+        let state = WatchState::new();
+        let msg = format_followed_set_change(&[1], &[1, 2], &rows, &state, Duration::ZERO).unwrap();
+        assert!(msg.contains("entered pid=2"), "{msg}");
+        assert!(!msg.contains("pid=2 ("), "{msg}");
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn format_followed_set_change_reports_both_entered_and_left() {
+        let rows = vec![entry(2, Some("new.exe"), 1_000, 0)];
+        let state = WatchState::new();
+        let msg = format_followed_set_change(&[1], &[2], &rows, &state, Duration::ZERO).unwrap();
+        assert!(msg.contains("entered pid=2 (new.exe)"), "{msg}");
+        assert!(msg.contains("left pid=1"), "{msg}");
     }
 
     // --- format_watch_per_pid_block / summary formatting ---
@@ -2657,6 +3197,7 @@ mod tests {
             interval,
             duration,
             top,
+            follow_new,
             device,
             json,
         }) = cli.command
@@ -2667,6 +3208,7 @@ mod tests {
         assert_eq!(interval, Duration::from_secs(5));
         assert_eq!(duration, None);
         assert_eq!(top, 5);
+        assert!(!follow_new);
         assert_eq!(device, 0);
         assert!(!json);
     }
@@ -2718,5 +3260,35 @@ mod tests {
             panic!("expected Watch subcommand");
         };
         assert_eq!(top, 10);
+    }
+
+    #[test]
+    fn watch_args_follow_new_flag() {
+        let cli = Cli::try_parse_from(["hmn", "watch", "--follow-new"]).unwrap();
+        let Some(Commands::Watch { follow_new, .. }) = cli.command else {
+            panic!("expected Watch subcommand");
+        };
+        assert!(follow_new);
+    }
+
+    #[test]
+    fn watch_args_follow_new_with_explicit_pids_parses_clean() {
+        // clap itself has no opinion on this combination — `run_watch`
+        // rejects it at runtime (exit code 2, verified live/manually,
+        // not here: it's a hard error path alongside the other early
+        // hard-error returns in `run_watch`, none of which are unit
+        // tested directly since they all require a live device query
+        // or precede one). This test only pins down that clap parsing
+        // itself doesn't reject the combination — it has to reach
+        // `run_watch` to be caught.
+        let cli = Cli::try_parse_from(["hmn", "watch", "1234", "--follow-new"]).unwrap();
+        let Some(Commands::Watch {
+            pids, follow_new, ..
+        }) = cli.command
+        else {
+            panic!("expected Watch subcommand");
+        };
+        assert_eq!(pids, [1234]);
+        assert!(follow_new);
     }
 }

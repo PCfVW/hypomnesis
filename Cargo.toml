@@ -1,12 +1,12 @@
 [package]
 name = "hypomnesis"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 authors = ["Eric Jacopin"]
 description = "External RAM and VRAM measurement for Rust processes (process RSS plus per-process and device-wide GPU memory: Windows DXGI + NVML + PDH, Linux NVML, macOS libSystem + Metal, with nvidia-smi fallback)."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/PCfVW/hypomnesis"
-homepage = "https://github.com/PCfVW/hypomnesis"
+repository = "https://github.com/mi-for-the-rust-of-us/hypomnesis"
+homepage = "https://github.com/mi-for-the-rust-of-us/hypomnesis"
 documentation = "https://docs.rs/hypomnesis"
 keywords = ["memory", "vram", "nvml", "dxgi", "gpu"]
 categories = ["os", "memory-management", "hardware-support"]

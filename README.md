@@ -1,20 +1,20 @@
 # hypomnesis
 
-[![CI](https://github.com/PCfVW/hypomnesis/actions/workflows/ci.yml/badge.svg)](https://github.com/PCfVW/hypomnesis/actions/workflows/ci.yml)
+[![CI](https://github.com/mi-for-the-rust-of-us/hypomnesis/actions/workflows/ci.yml/badge.svg)](https://github.com/mi-for-the-rust-of-us/hypomnesis/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/hypomnesis.svg)](https://crates.io/crates/hypomnesis)
 [![docs.rs](https://docs.rs/hypomnesis/badge.svg)](https://docs.rs/hypomnesis)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
-[![license](https://img.shields.io/crates/l/hypomnesis.svg)](https://github.com/PCfVW/hypomnesis#license)
+[![license](https://img.shields.io/crates/l/hypomnesis.svg)](https://github.com/mi-for-the-rust-of-us/hypomnesis#license)
 [![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(FFI_backends_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
 [![NVIDIA](https://img.shields.io/badge/NVIDIA-NVML_%2B_DXGI-76B900.svg?logo=nvidia&logoColor=white)](#capabilities)
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> 🆕 **`0.2.6` adds `hmn watch` — attach to a job that's already running.** `hmn spill` only wraps a *new* command; a rhyme-mdlm dogfooding report hit that wall three times triaging a 15-hour training campaign, hand-rolling "two `hmn ps` samples minutes apart, diff by eye" every time. `hmn watch [PID...]` (or auto-select the top `--top` by committed VRAM with no PID given) samples the same `SpillTracker` core on a timer, printing one row per watched PID per interval — committed/shared VRAM, deltas, and a live SPILL flag — until `--duration` elapses or Ctrl+C. A `time(1)`-style scrolling sampler, not a TUI, same discipline as `hmn spill`. Exit code conveys whether spill was observed (`0`/`1`/`2`) for scripts and watchdogs; `--json` streams JSON Lines. Windows-only measurement like `hmn spill` (`WDDM` is what `hmn watch` reads); other platforms still show real per-PID VRAM deltas, just no SPILL flag. Live-validated against the same forced-spill fixture that shipped v0.2.5. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md), and the [watch tutorial](docs/tutorials/watching-a-running-job.md).
+> 🆕 **`0.2.7` adds `hmn watch --follow-new` and `hmn ps --sort`.** A candle-mi dogfooding report ran `hmn watch` alongside 19 sequential `cargo test` processes — the adapter-level spill detection was flawless (three real episodes, one a fast Mistral-7B spike candle-mi's own wall-clock heuristic had missed), but the auto-selected PID set froze at attach, so none of the processes that actually caused the spills were ever attributed. `--follow-new` re-runs top-N selection every interval instead of once: a PID entering starts fresh, a PID leaving is *finalized* into the closing summary instead of rendering `0` forever. A companion request from the same suite: `hmn ps --sort <dedicated|shared|total>`, sharing one comparator with `hmn watch`'s auto-selection so the two can't drift apart. Both off by default / pre-v0.2.7-compatible; no library-surface change. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md).
+
+> 🚀 **`0.2.6` adds `hmn watch` — attach to a job that's already running.** `hmn spill` only wraps a *new* command; a rhyme-mdlm dogfooding report hit that wall three times triaging a 15-hour training campaign, hand-rolling "two `hmn ps` samples minutes apart, diff by eye" every time. `hmn watch [PID...]` (or auto-select the top `--top` by committed VRAM with no PID given) samples the same `SpillTracker` core on a timer, printing one row per watched PID per interval — committed/shared VRAM, deltas, and a live SPILL flag — until `--duration` elapses or Ctrl+C. A `time(1)`-style scrolling sampler, not a TUI, same discipline as `hmn spill`. Exit code conveys whether spill was observed (`0`/`1`/`2`) for scripts and watchdogs; `--json` streams JSON Lines. Windows-only measurement like `hmn spill` (`WDDM` is what `hmn watch` reads); other platforms still show real per-PID VRAM deltas, just no SPILL flag. Live-validated against the same forced-spill fixture that shipped v0.2.5. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md), and the [watch tutorial](docs/tutorials/watching-a-running-job.md).
 
 > 🚀 **`0.2.5` detects `WDDM` GPU spill — residency, not commitment.** A cross-platform `SpillTracker` + episode-based `SpillReport` flag the moment a workload's *resident* shared-system-memory grows while dedicated `VRAM` saturates — the state where `WDDM` silently pages GPU allocations over `PCIe` and throughput craters. Never inferred from the `committed − dedicated` gap (that's reservation headroom, and flagging it cries wolf on every big compute process — caught live by a rhyme-mdlm dogfooding report). Per-process attribution ships as additive `GpuProcessEntry::shared_used_bytes` + a `hmn ps` SHARED column, and `hmn spill -- <command>` wraps any run `time(1)`-style with exit-code pass-through. Windows-only measurement, honestly declared: `is_spill_measurable()` is `false` on Linux and macOS. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md).
-
-> 🚀 **`0.2.4` surfaces NVIDIA's driver/firmware *reserved* memory.** A new additive `GpuDeviceInfo::reserved_bytes: Option<u64>` exposes the carve-out NVML holds *within* its reported `total` (`total = reserved + free + used`) — **live-measured at 259 MiB** on an `RTX 5060 Ti`, exactly matching `nvidia-smi -q -d MEMORY`'s `Reserved` line next to `Total: 16311 MiB`. It is a subset of `total_bytes`, so allocation headroom is `total_bytes − reserved_bytes` (which `free_bytes` already reflects). Sourced from NVML's v2 memory query (`nvmlDeviceGetMemoryInfo_v2`, R510+) with a graceful pre-R510 fallback to `None`; `total_bytes` is unchanged. Driven by a [`candle-mi`](https://github.com/PCfVW/candle-mi) `v0.1.16` dogfooding report. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.4.md`](docs/roadmap-v0.2.4.md).
 
 ## Table of Contents
 
@@ -146,6 +146,18 @@ hmn watch: peak dedicated 15.0 GiB / 15.7 GiB
            peak shared    1.4 GiB (baseline 228 MiB)
            episodes       1 — total 0.0s, longest 0.0s, first +33.1s into run
                                           # exits 1 — spill was observed
+
+$ hmn watch --follow-new --interval 3s    # stand guard through TWO sequential
+                                          # spillforge runs, back to back
+hmn watch: +3.0s followed set changed: entered pid=10640 (spillforge.exe); left pid=21716 (Code.exe)
+hmn watch: +18.0s followed set changed: entered pid=13004 (SamsungMagician.exe); left pid=10640 (spillforge.exe)
+hmn watch: +21.1s followed set changed: entered pid=29452 (spillforge.exe); left pid=13004 (SamsungMagician.exe)
+hmn watch: +36.1s followed set changed: entered pid=13004 (SamsungMagician.exe); left pid=29452 (spillforge.exe)
+hmn watch: peak dedicated 15.2 GiB / 15.7 GiB
+           peak shared    551 MiB (baseline 155 MiB)
+           episodes       2 — total 24.1s, longest 12.0s, first +3.0s into run
+                                          # per_pid[] finalizes BOTH spillforge
+                                          # PIDs plus 5 desktop processes: 7 total
 ```
 
 The VRAM column is `WDDM`'s dedicated *commit* — a big process legitimately shows more than the card holds. The SHARED column is *resident* shared-system-memory: the spill signal, and the small nonzero values above are the normal benign baseline. When those two facts surprise you, that's the [FAQ](docs/FAQ.md)'s opening entries.
@@ -166,10 +178,13 @@ hmn ps                       # all GPU processes — discovery command
 hmn ps --pid 12345           # filter to one PID
 hmn ps --device 0            # filter to one GPU on multi-GPU rigs
 hmn ps --json                # scriptable output
+hmn ps --sort total           # order by dedicated + shared instead of dedicated alone
 hmn spill -- python train.py # run a command, report WDDM spill on exit
 hmn spill --interval 250 --json -- ollama serve   # slower polling, JSON report
 hmn watch 12345               # attach to an ALREADY-RUNNING PID, watch for spill
 hmn watch --top 3 --json      # no PID: auto-select top 3 by committed VRAM, JSONL
+hmn watch --follow-new --json # re-select every interval: stand guard over a machine
+                               # while arbitrary short-lived work happens
 ```
 
 Example default output (single NVIDIA dGPU, the maintainer's reference machine — Ryzen 9 5950X has no iGPU, so only one adapter surfaces):
@@ -213,6 +228,8 @@ hmn: 0 GPU processes found matching pid=99 device=0.   # with filters
 ```
 
 The stderr summary is always printed, even when the table is empty, so interactive users get an unambiguous "command worked, here's the count" line without breaking stdout's scriptability. Pipelines like `hmn ps | awk 'NR>1 {print $1}'` or `hmn ps --json | jq` work as expected. Redirect `2>/dev/null` to suppress the summary.
+
+`--sort <KEY>` (`dedicated` default, `shared`, or `total`) reorders both the text table and `--json` output — three different questions, not interchangeable: `dedicated` ("who do I kill to free VRAM?"), `shared` ("who is currently being paged out?" — a symptom, not a cause), `total` (dedicated + shared, "who is the biggest GPU-memory citizen overall?"). Tie-breaks (name ascending, then PID ascending) are identical regardless of key. `shared`/`total` are a documented no-op ordering on Linux and macOS, where `shared_used_bytes` is always `0`.
 
 **Limitations** (intrinsic to the underlying data sources, not bugs — longer-form answers to the recurring ones live in the [FAQ](docs/FAQ.md)):
 
@@ -284,6 +301,19 @@ sample renders `0 B` — `hmn watch` cannot distinguish "exited" from
 (`500ms`, `30s`, `5m`, `1h`, or a bare number of seconds) rather than raw
 milliseconds.
 
+**`--follow-new`** (auto-select mode only — a hard error combined with an
+explicit PID) re-runs the top-`--top` selection *every* interval instead of
+once at attach, for the shape a candle-mi dogfooding report hit running
+`hmn watch` alongside a 19-process sequential test suite: successive
+short-lived GPU processes that are all born *after* attach, which a frozen
+selection never sees. A PID entering starts with a fresh baseline; a PID
+leaving (exited, or dropped below rank `--top`) stops appearing in the live
+rows and is *finalized* into the closing summary's `per_pid[]` with its
+peak/baseline, instead of rendering `0` forever — so the summary becomes a
+roster of everyone who mattered during the watch, not just whoever was on
+top at `t=0`. A stderr breadcrumb reports each change
+(`entered pid=... (name); left pid=... (name)`).
+
 Runs until `--duration` elapses or Ctrl+C, then prints a closing summary
 (the same `SpillReport` shape as `hmn spill`, plus a per-PID peak/baseline
 table) and exits **`0`** if spill was never observed, **`1`** if it was at
@@ -311,6 +341,8 @@ motivated it:
 ```sh
 hmn ps --json | jq 'sort_by(-.used_bytes) | .[:5]'
 ```
+
+(`hmn ps --sort dedicated` — the default — now covers this natively for the whole table, in both text and `--json` form; the `jq` recipe stays handy for slicing to a specific top-N or sorting by a field `--sort` doesn't offer, like `pid` or `name`.)
 
 **Terminate any process holding more than 1 GiB of `VRAM`** — the JSON output composes with the platform's native kill command. Windows (PowerShell or cmd):
 
@@ -355,7 +387,7 @@ Same discipline, same answer (recorded here so it isn't re-argued in a future PR
 | Device reserved memory | `NVML` v2 (`nvmlDeviceGetMemoryInfo_v2`, R510+) | `NVML` v2 (R510+) | n/a (`None` — UMA has no carve-out) |
 | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
 | GPU-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage` + `Shared Usage`) + `OpenProcess` / `QueryFullProcessImageNameW`; `nvidia-smi` fallback | `NVML` + `/proc/<pid>/comm` (compute-only) | `proc_listpids` + per-PID `ledger` + `proc_pidpath` (same-user; `sudo` for cross-user) |
-| Spill detection (`SpillTracker`, `hmn spill`) | `PDH` `\GPU Adapter Memory(*)\Dedicated Usage` + `Shared Usage` (`WDDM 2.0`+) | n/a (`is_spill_measurable()` = `false` — normal `CUDA` OOMs rather than silently paging) | n/a (`false` — `UMA` has nothing to spill *into*) |
+| Spill detection (`SpillTracker`, `hmn spill`, `hmn watch`) | `PDH` `\GPU Adapter Memory(*)\Dedicated Usage` + `Shared Usage` (`WDDM 2.0`+) | n/a (`is_spill_measurable()` = `false` — normal `CUDA` OOMs rather than silently paging) | n/a (`false` — `UMA` has nothing to spill *into*) |
 | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 
 `hypomnesis` uses `IDXGIAdapter3` on Windows because `WDDM` means the kernel memory manager — not the NVIDIA driver — owns GPU allocations, so `NVML`'s per-process query returns `NOT_AVAILABLE` under Windows. `DXGI 1.4` is the only reliable per-process source. On Linux, `NVML`'s `nvmlDeviceGetComputeRunningProcesses_v3` returns true per-process figures. On Apple Silicon (M-series), the GPU shares system DRAM via unified memory architecture (UMA), so `hw.memsize` is both the system RAM total and the GPU memory pool.
@@ -394,7 +426,7 @@ Two consequences worth noting:
 |-----|---|
 | [FAQ](docs/FAQ.md) | Common questions — commit vs resident, `hmn spill` vs `hmn watch`, the SHARED baseline, the spill condition and its 85% threshold, per-platform zeros, `?` rows and elevation, threading, polling cost, upgrading |
 | [Tutorial: Is my run spilling?](docs/tutorials/is-my-run-spilling.md) | Walkthrough: wrap a run with `hmn spill`, read the episode pattern, attribute per-PID, wire `SpillTracker` into your own loop |
-| [Tutorial: Triage a job that's already running](docs/tutorials/watching-a-running-job.md) | Walkthrough: attach `hmn watch` to a running PID, read the live SPILL column, script the exit code |
+| [Tutorial: Triage a job that's already running](docs/tutorials/watching-a-running-job.md) | Walkthrough: attach `hmn watch` to a running PID, read the live SPILL column, script the exit code — and `--follow-new` to stand guard over a machine through a suite of short-lived jobs |
 | [ROADMAP](ROADMAP.md) | Status snapshot: shipped, committed, speculative, and deliberately-rejected ideas |
 | [Per-release roadmaps](docs/) | The detailed plan behind each release (`docs/roadmap-vX.Y.Z.md`), including live-measured deviations |
 | [The brief](docs/hypomnesis-brief.md) | Why this crate exists — Plato, the v0.1.x VRAM saga, the extraction from `candle-mi` |
@@ -402,7 +434,7 @@ Two consequences worth noting:
 
 ## Used by
 
-- [candle-mi](https://github.com/PCfVW/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove this release's `reserved_bytes` addition.
+- [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove v0.2.4's `reserved_bytes` addition. Its `scripts/resurrect.ps1` oracle suite is a load-bearing `hmn spill --json` / `hmn watch` consumer and the source of the v0.2.7 `--follow-new` / `ps --sort` dogfooding report.
 - [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
 
 ## License
@@ -411,6 +443,6 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT L
 
 ## Development
 
-- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
+- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev)
 - Git workflow managed with [Fork](https://fork.dev/)
 - All code follows [CONVENTIONS.md](CONVENTIONS.md), derived from [Amphigraphic-Strict](https://github.com/PCfVW/Amphigraphic-Strict)'s [Grit](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit) — a strict Rust subset designed to improve AI coding accuracy.

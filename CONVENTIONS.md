@@ -7,8 +7,8 @@ base, with hypomnesis-specific extensions for FFI safety and feature-gated
 backends.
 
 The trigger checklist, doc-comment, signature, and `unsafe` rules below are
-aligned with [`anamnesis/CONVENTIONS.md`](https://github.com/PCfVW/anamnesis/blob/main/CONVENTIONS.md)
-and [`candle-mi/CONVENTIONS.md`](https://github.com/PCfVW/candle-mi/blob/main/CONVENTIONS.md).
+aligned with [`anamnesis/CONVENTIONS.md`](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/CONVENTIONS.md)
+and [`candle-mi/CONVENTIONS.md`](https://github.com/mi-for-the-rust-of-us/candle-mi/blob/main/CONVENTIONS.md).
 The numeric / SIMD sections of those documents are deliberately omitted
 here: hypomnesis is a measurement crate, not a numeric pipeline. The
 [FFI patterns](#ffi-patterns) and [feature-gated backends](#feature-gated-backends)

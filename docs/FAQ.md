@@ -6,6 +6,8 @@ the authoritative source (README limitation, rustdoc, or per-release roadmap).
 
 - [Why does `used_bytes` exceed my card's total VRAM?](#why-does-used_bytes-exceed-my-cards-total-vram)
 - [`hmn spill` or `hmn watch` — which do I use?](#hmn-spill-or-hmn-watch--which-do-i-use)
+- [Why doesn't `hmn watch` show processes that start after I attach?](#why-doesnt-hmn-watch-show-processes-that-start-after-i-attach)
+- [What do the `hmn ps --sort <KEY>` keys mean, and which should I use?](#what-do-the-hmn-ps---sort-key-keys-mean-and-which-should-i-use)
 - [Why is the SHARED column nonzero when nothing is wrong?](#why-is-the-shared-column-nonzero-when-nothing-is-wrong)
 - [How does hypomnesis decide a run is spilling?](#how-does-hypomnesis-decide-a-run-is-spilling)
 - [Why is the saturation threshold 85% and not 95% (or 100%)?](#why-is-the-saturation-threshold-85-and-not-95-or-100)
@@ -53,15 +55,65 @@ episode pattern and attributing per-process applies to both.
 Three things specific to `watch`:
 
 - **No PID given** auto-selects the top `--top` (default 5) processes by
-  committed VRAM from the first sample and keeps that fixed set for the run.
+  committed VRAM from the first sample. By default this set is **frozen**
+  for the run; use **`--follow-new`** to re-select every interval, tracking
+  processes that start after attach (the `--follow-new` mode was added
+  after a candle-mi dogfooding report found the frozen set missed all 19 of
+  a suite's sequential `cargo test` processes — including the ones that
+  caused the real spills it detected).
 - **Exit code is the point**: `0` no spill observed, `1` spill observed at
-  least once, `2` on a hard error — designed for a watchdog script to check
-  directly (`hmn watch 21844 --duration 5m; [ $? -eq 1 ] && alert`), no JSON
-  parsing needed for the common case.
+  least once, `2` on a hard error (bad `--device`, nothing to auto-select,
+  or `--follow-new` combined with an explicit PID) — designed for a
+  watchdog script to check directly
+  (`hmn watch 21844 --duration 5m; [ $? -eq 1 ] && alert`), no JSON parsing
+  needed for the common case.
 - **A `0 B` row isn't necessarily "exited."** `hmn watch` can't tell "PID
   exited" from "PID alive, holds no GPU memory right now" apart, and doesn't
-  try to — it renders zero either way and does not auto-stop. Use `--duration`
-  or Ctrl+C.
+  try to — it renders zero either way and does not auto-stop. Use
+  `--duration` or Ctrl+C.
+
+## Why doesn't `hmn watch` show processes that start after I attach?
+
+By default it **doesn't** — `hmn watch` freezes its PID set at attach time:
+it auto-selects the top `--top` (default 5) processes by committed VRAM from
+the *first* sample and keeps that exact set for the run. A process born
+afterward never appears, even if it later becomes the dominant GPU consumer.
+This is intentional for the original use case (attach to a known
+long-running job).
+
+To track newly-spawned processes, add **`--follow-new`** — this makes
+`hmn watch` re-run the top-N selection every interval instead of keeping the
+frozen set from the first sample. New PIDs enter the followed set with a
+fresh baseline (first sighting), and PIDs that exit or drop below rank
+`--top` are finalized into the closing summary rather than rendering `0 B`
+forever. The closing summary's `per_pid[]` lists *everyone who mattered
+during the watch*, not the initial snapshot.
+
+This mode exists because a candle-mi dogfooding report
+([2026-07-27, extended 2026-08-01](dogfooding-feedbacks/dogfooding-watch-follow-new.md))
+ran `hmn watch --duration 80m` alongside 19 sequential `cargo test` steps —
+the adapter-level spill detector fired correctly, but the frozen PID set
+missed every single process that actually caused the spills.
+
+## What do the `hmn ps --sort <KEY>` keys mean, and which should I use?
+
+The three keys answer three **distinct diagnostic questions**:
+
+- **`dedicated`** (the default, same order as v0.2.6) — sorts by per-process
+  committed dedicated VRAM, descending. Use this to answer **who do I kill
+  to free VRAM?** — the processes at the top are holding the most GPU memory
+  you can reclaim by terminating them.
+- **`shared`** — sorts by per-process resident shared-system-memory bytes,
+  descending. Use this to answer **who is currently being paged out?** — the
+  symptom of spill, not its cause. Note this column is `0` on Linux (normal
+  OOMs, not paging) and macOS (UMA, nothing to spill into).
+- **`total`** — sorts by `dedicated + shared`, descending. Use this to
+  answer **who is the biggest GPU-memory citizen overall?** — the total
+  footprint, regardless of where it resides.
+
+All three share the same tie-break rule: name ascending, then PID ascending.
+On non-Windows platforms `shared` is always `0`, so `dedicated` and `total`
+produce identical orderings.
 
 ## Why is the SHARED column nonzero when nothing is wrong?
 

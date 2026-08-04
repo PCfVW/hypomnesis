@@ -246,7 +246,7 @@ Every `unsafe` block must be **scoped, annotated, and feature-gated**.
 | (always, on `target_os = "macos"`) | libSystem syscalls (`task_info`, `ledger`, `sysctl`, `proc_listpids`, `proc_pidpath`) in `src/ram.rs` + `src/gpu/metal.rs` |
 | `nvml` | NVML dynamic load and FFI in `src/gpu/nvml.rs` |
 | `dxgi` | DXGI COM calls in `src/gpu/dxgi.rs` (Windows-only) |
-| `pdh` | PDH counter API (`PdhOpenQueryW` / `PdhEnumObjectItemsW` / `PdhAddCounterW` / `PdhCollectQueryData` / `PdhGetFormattedCounterValue`) for the `GPU Process Memory` and `GPU Adapter Memory` counter sets, plus `OpenProcess` + `QueryFullProcessImageNameW` name lookup, in `src/gpu/pdh.rs` (Windows-only). The v0.2.5 spill module (`src/spill.rs`) contains **no** `unsafe` of its own — it delegates to this backend. |
+| `pdh` | PDH counter API (`PdhOpenQueryW` / `PdhEnumObjectItemsW` / `PdhAddCounterW` / `PdhCollectQueryData` / `PdhGetFormattedCounterValue`) for the `GPU Process Memory` and `GPU Adapter Memory` counter sets, plus `OpenProcess` + `QueryFullProcessImageNameW` name lookup and (v0.2.8) `CreateToolhelp32Snapshot` + `Process32FirstW`/`Process32NextW` as its batched fallback, in `src/gpu/pdh.rs` (Windows-only). The v0.2.5 spill module (`src/spill.rs`) contains **no** `unsafe` of its own — it delegates to this backend. |
 | `metal` | `objc2-metal` `MTLDevice` calls in `src/gpu/metal.rs` (macOS-only) |
 
 Each accepted use must satisfy all of:
@@ -382,7 +382,7 @@ Cargo feature:
 | `report` | `src/report.rs` | v0.1 | none |
 | `debug-output` | (cross-cutting) | v0.1 | none |
 | `test-helpers` | (builders in `src/snapshot.rs`, `src/spill.rs`) | v0.2.1 | none |
-| `cli` | `src/bin/hmn.rs` | v0.2.0 | `clap` |
+| `cli` | `src/bin/hmn.rs` | v0.2.0 (default-on since v0.2.8) | `clap` |
 | `rocm` (future) | `src/gpu/rocm.rs` | — | TBD |
 
 Adding a new backend (for a new GPU vendor or new measurement source) is

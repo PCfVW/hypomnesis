@@ -39,7 +39,7 @@ of two manual `hmn ps` samples and a mental diff.
 `WDDM 2.0`+, no elevation needed:
 
 ```sh
-cargo install hypomnesis --features cli
+cargo install hypomnesis
 ```
 
 On Linux/macOS `hmn watch` still attaches and shows real per-PID `VRAM`
@@ -78,7 +78,11 @@ hmn watch: per-PID  PID    NAME             BASELINE COMMIT  PEAK COMMIT  BASELI
 *(Real output, captured live on the reference RTX 5060 Ti alongside ordinary
 desktop load — no training run in this transcript, which is exactly why
 `episodes 0` is the right answer: negative deltas like `QmlRenderer.exe`'s
-`-40 MiB` are normal churn, not spill.)*
+`-40 MiB` are normal churn, not spill. Captured pre-v0.2.8: PID 2624's `?`
+predates the `Toolhelp32Snapshot` name-resolution fallback — on a current
+build, most such rows now resolve to a real name or a `[exited]`/
+`[protected]` bracket instead; see the
+[FAQ](../FAQ.md#what-does-a--in-the-name-column-mean--and-when-do-i-need-elevation).)*
 
 When you already know the PID — from `hmn ps` (try `hmn ps --sort total` to
 rank by dedicated + shared together), from your training script's own PID, or
@@ -183,7 +187,9 @@ hmn watch: per-PID  PID    NAME            BASELINE COMMIT  PEAK COMMIT  BASELIN
 
 *(Real output, reference RTX 5060 Ti. The `followed set changed` lines go to
 stderr, the rows and tables to stdout — interleaved here as a terminal shows
-them. Repetitive intervals elided at the `...` marks.)*
+them. Repetitive intervals elided at the `...` marks. Also captured
+pre-v0.2.8: PID 17600's `?` is the same pre-fallback case as the transcript
+above — see the note there.)*
 
 Four things to notice, all of them the point of the flag:
 
@@ -210,8 +216,8 @@ list. It also makes an empty first sample harmless — with no GPU work running
 yet, the watch simply starts empty and picks processes up as they appear,
 which is exactly what you want when guarding a machine before a suite starts.
 The flag landed in **v0.2.7**; on an older `hmn` it fails as an unknown
-argument (`cargo install hypomnesis --features cli --force` to upgrade — see
-the [FAQ](../FAQ.md#how-do-i-upgrade-hmn-why-does-cargo-install-keep-the-old-version)).
+argument (`cargo install hypomnesis --force` to upgrade — see the
+[FAQ](../FAQ.md#how-do-i-upgrade-hmn-why-does-cargo-install-keep-the-old-version)).
 
 ## Gotchas specific to `watch`
 
@@ -238,11 +244,14 @@ the [FAQ](../FAQ.md#how-do-i-upgrade-hmn-why-does-cargo-install-keep-the-old-ver
   bare number (seconds). Shorter intervals catch brief flicker episodes at
   the cost of more `PDH` queries per second; the default is `5s`, tuned for
   attach-and-leave-running rather than `hmn spill`'s tight 100 ms wrap.
-- **An unresolved (`?`) watched PID that grows** — committed or shared, by
-  256 MiB or more since attach — gets a one-shot stderr hint
-  (`re-run elevated to identify`), the same elevation story as `hmn ps`'s `?`
-  rows (see the
+- **An unresolved watched PID that grows** — `None`/`?`, or (Windows-only,
+  since v0.2.8) still `[protected]` after the `Toolhelp32Snapshot`
+  fallback — committed or shared, by 256 MiB or more since attach, gets a
+  one-shot stderr hint (`re-run elevated to identify`), the same elevation
+  story as `hmn ps`'s unresolved rows (see the
   [FAQ](../FAQ.md#what-does-a--in-the-name-column-mean--and-when-do-i-need-elevation)).
+  `[exited]` does not trigger this hint — a process already confirmed gone
+  cannot meaningfully "grow", and elevation cannot help identify it either.
 
 ## Where the numbers come from
 

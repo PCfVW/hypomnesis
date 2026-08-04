@@ -137,16 +137,25 @@ pub enum GpuQuerySource {
 pub struct GpuProcessEntry {
     /// OS process ID.
     pub pid: u32,
-    /// Process name. `None` when no name source is available — `PDH`
-    /// rows whose `OpenProcess` was access-denied (cross-user, protected
-    /// processes), or `NVML` rows whose `/proc/<pid>/comm` was
-    /// unreadable. Two synthetic non-`None` values are produced:
-    /// `Some("[kernel]")` for `PID 4` on the Windows `PDH` path (the
-    /// kernel pseudo-process has no executable image, but is
-    /// special-cased so it doesn't pollute the "unresolvable even
-    /// elevated" set); `Some("?")` for protected processes on the
-    /// Windows `nvidia-smi` fallback path, where `nvidia-smi` itself
-    /// writes a literal `?` rather than failing the row.
+    /// Process name. `None` when no name source is available — `NVML`
+    /// rows whose `/proc/<pid>/comm` was unreadable. On the Windows
+    /// `PDH` path, `None` from `OpenProcess`-based lookup is followed by
+    /// a `Toolhelp32Snapshot` fallback (v0.2.8) that resolves most
+    /// remaining cases — including foreign-user / `SYSTEM` processes
+    /// like `dwm.exe`/`csrss.exe` that `OpenProcess` denies even
+    /// non-elevated — so `None` essentially never reaches callers on
+    /// Windows; it is replaced by one of four outcomes: a real name
+    /// resolved via the snapshot; `Some("[kernel]")` for `PID 4` (the
+    /// kernel pseudo-process has no executable image); `Some("[exited]")`
+    /// when the process exited between `hypomnesis`'s
+    /// VRAM sample and the name lookup (elevation would not help);
+    /// `Some("[protected]")` when the snapshot itself could not be taken
+    /// at all, so "exited" vs. "still running but unresolvable" can't be
+    /// told apart. `Some("?")` is also produced on the Windows
+    /// `nvidia-smi` fallback path, where `nvidia-smi` itself writes a
+    /// literal `?` rather than failing the row. The `[exited]`/
+    /// `[protected]` distinction is Windows-only; Linux/macOS `None`
+    /// rows remain undifferentiated.
     pub name: Option<String>,
     /// GPU memory used by this process in bytes. On the Windows
     /// [`GpuQuerySource::Pdh`] path this is `VidMm`'s dedicated

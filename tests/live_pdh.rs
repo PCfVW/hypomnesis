@@ -125,6 +125,39 @@ fn gpu_processes_resolves_at_least_one_name() {
     );
 }
 
+/// v0.2.8: every row's name is either resolved, or one of the
+/// documented synthetic brackets (`[kernel]`, `[exited]`,
+/// `[protected]`) — never a bare `None`/`?`. The `Toolhelp32Snapshot`
+/// fallback in `resolve_names_via_snapshot` (wired into `gpu_processes`
+/// via `resolve_unresolved_windows_names`) runs after the
+/// `OpenProcess`-based fast path, so by the time rows reach the caller
+/// every name should be `Some`. Not asserting *which* rows resolve to
+/// real names vs. `[protected]` — that depends on what's running on the
+/// live machine (foreign-user / `SYSTEM` / `PPL` processes holding GPU
+/// memory) — only that the anonymous `?`/`None` case the pre-v0.2.8
+/// dogfooding report flagged no longer reaches this point.
+#[test]
+#[ignore = "requires Windows + WDDM 2.0+ GPU"]
+#[allow(clippy::expect_used)]
+fn gpu_processes_never_leaves_a_row_unresolved() {
+    let rows = gpu_processes(0).expect("gpu_processes(0) failed");
+    for row in &rows {
+        assert!(
+            row.name.is_some(),
+            "pid {} has name: None — Toolhelp32Snapshot fallback should have replaced this \
+             with a real name, [exited], or [protected]",
+            row.pid
+        );
+        assert_ne!(
+            row.name.as_deref(),
+            Some("?"),
+            "pid {} still resolved to the literal \"?\" placeholder — expected a real name \
+             or a synthetic bracket ([kernel]/[exited]/[protected])",
+            row.pid
+        );
+    }
+}
+
 // -----------------------------------------------------------------------
 // v0.2.5 spill-detection live tests
 // -----------------------------------------------------------------------

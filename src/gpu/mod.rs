@@ -407,6 +407,7 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
             })
             .collect();
         sort_by_pid(&mut entries);
+        resolve_unresolved_windows_names(&mut entries);
         return Ok(entries);
     }
 
@@ -452,6 +453,47 @@ pub fn gpu_processes(device_index: u32) -> Result<Vec<GpuProcessEntry>> {
 ))]
 fn sort_by_pid(entries: &mut [GpuProcessEntry]) {
     entries.sort_by_key(|e| e.pid);
+}
+
+/// Fix up `entries` whose `name` is still `None` after
+/// [`pdh::name_from_pid_windows`]'s `OpenProcess`-based fast path, using
+/// [`pdh::resolve_names_via_snapshot`]'s batched `Toolhelp32` fallback.
+///
+/// Collapses `?` rows to real names wherever the snapshot found the PID
+/// (the common case for foreign-user / `SYSTEM` processes like
+/// `dwm.exe`/`csrss.exe`), `"[exited]"` when the PID had already exited
+/// by the time of the snapshot, or `"[protected]"` when the snapshot
+/// itself could not be taken at all (so "exited" vs. "still running but
+/// unresolvable" can't be told apart). Skips the snapshot call entirely
+/// when every row already resolved via the fast path — the common case
+/// on a normal desktop, where this function costs nothing.
+#[cfg(all(windows, feature = "pdh"))]
+fn resolve_unresolved_windows_names(entries: &mut [GpuProcessEntry]) {
+    let unresolved_pids: Vec<u32> = entries
+        .iter()
+        .filter(|e| e.name.is_none())
+        .map(|e| e.pid)
+        .collect();
+    if unresolved_pids.is_empty() {
+        return;
+    }
+
+    match pdh::resolve_names_via_snapshot(&unresolved_pids) {
+        Some(resolved) => {
+            for entry in entries.iter_mut().filter(|e| e.name.is_none()) {
+                let name = resolved
+                    .iter()
+                    .find(|(pid, _)| *pid == entry.pid)
+                    .map_or_else(|| "[exited]".to_owned(), |(_, name)| name.clone());
+                entry.name = Some(name);
+            }
+        }
+        None => {
+            for entry in entries.iter_mut().filter(|e| e.name.is_none()) {
+                entry.name = Some("[protected]".to_owned());
+            }
+        }
+    }
 }
 
 /// Read `/proc/<pid>/comm` (Linux only), returning the trimmed

@@ -112,6 +112,9 @@
 use std::collections::HashMap;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Performance::{
     PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PERF_DETAIL_WIZARD,
     PdhAddCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectItemsW,
@@ -904,21 +907,26 @@ pub fn adapter_counter_set_available() -> bool {
 ///
 /// Closes the handle via [`CloseHandle`] on drop. Mirrors the
 /// `QueryGuard` pattern above for the `PDH` query handle: every
-/// successful `OpenProcess` is paired with exactly one `CloseHandle`
-/// regardless of which return path the caller takes.
+/// successful handle-returning call ([`OpenProcess`] or
+/// [`CreateToolhelp32Snapshot`]) is paired with exactly one
+/// [`CloseHandle`] regardless of which return path the caller takes —
+/// both APIs hand back an opaque kernel object closed the same way, so
+/// one guard type covers both rather than forking a near-identical copy.
 struct HandleGuard {
-    /// `Win32` handle returned by [`OpenProcess`]. Treated as an
-    /// opaque kernel-side capability; never read or modified from
-    /// userspace except through `Win32` APIs.
+    /// `Win32` handle returned by a successful [`OpenProcess`] or
+    /// [`CreateToolhelp32Snapshot`] call. Treated as an opaque
+    /// kernel-side capability; never read or modified from userspace
+    /// except through `Win32` APIs.
     handle: HANDLE,
 }
 
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was obtained from a successful
-        // OpenProcess call (constructor invariant). CloseHandle is
-        // documented as safe to call on any valid handle. The return
-        // status is intentionally discarded — cleanup is best-effort.
+        // OpenProcess or CreateToolhelp32Snapshot call (constructor
+        // invariant). CloseHandle is documented as safe to call on any
+        // valid handle regardless of its origin API. The return status
+        // is intentionally discarded — cleanup is best-effort.
         #[allow(unsafe_code)]
         unsafe {
             let _ = CloseHandle(self.handle);
@@ -990,9 +998,17 @@ const fn kernel_name_for_pid(pid: u32) -> Option<&'static str> {
 ///
 /// **Privilege model.** No admin or special privilege required for
 /// processes owned by the calling user. Foreign-user PIDs return
-/// `None` without `SeDebugPrivilege`; this is the documented Windows
-/// security gate, not a hypomnesis limitation. Callers wanting
-/// system-wide visibility should run elevated.
+/// `None` — but that is *not* the final answer for most of them: see
+/// [`resolve_names_via_snapshot`], which resolves the majority of these
+/// `None`s (including `SYSTEM`/other-session processes like `dwm.exe`,
+/// `csrss.exe`) without elevation, via a different Win32 mechanism that
+/// doesn't open a per-process handle at all. `OpenProcess` denial here
+/// is a property of *this specific lookup method*, not a hard privilege
+/// wall — confirmed live: `PROCESS_QUERY_LIMITED_INFORMATION` and the
+/// full `PROCESS_QUERY_INFORMATION` right both fail identically
+/// (`ERROR_ACCESS_DENIED`) against `dwm.exe` from a non-elevated
+/// caller, yet `Get-Process`/Task Manager name it instantly — because
+/// they use the snapshot mechanism, not `OpenProcess`.
 #[allow(unsafe_code)]
 #[must_use]
 pub(super) fn name_from_pid_windows(pid: u32) -> Option<String> {
@@ -1073,6 +1089,106 @@ fn basename_from_path(path: &str) -> String {
         .map_or_else(|| path.to_owned(), |(_, base)| base.to_owned())
 }
 
+/// Resolve process names for PIDs that [`name_from_pid_windows`] could
+/// not name via `OpenProcess`, using one `CreateToolhelp32Snapshot` scan
+/// shared across every PID in `pids`.
+///
+/// The snapshot exposes every running process's short executable name
+/// (`szExeFile`) without opening a per-process handle, so it succeeds
+/// for foreign-user / `SYSTEM` processes (`dwm.exe`, `csrss.exe`) that
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` denies even
+/// non-elevated — see [`name_from_pid_windows`]'s doc comment for the
+/// live-verified evidence that this is a lookup-method gap, not a
+/// privilege wall.
+///
+/// Returns `Some(pairs)` when the snapshot was taken successfully —
+/// `pairs` contains one `(pid, name)` entry per requested PID that was
+/// actually found in it. A requested PID *absent* from `pairs` has
+/// exited since the caller's earlier sample (the caller renders that as
+/// `"[exited]"`). Returns `None` only when
+/// [`CreateToolhelp32Snapshot`] itself fails (very rare — resource
+/// exhaustion) — the caller cannot distinguish "exited" from "unknown"
+/// in that case and falls back to `"[protected]"` for every requested
+/// PID. This `Option` split is why the return type isn't a bare `Vec`:
+/// an empty-but-successful snapshot (every requested PID had already
+/// exited) must be distinguishable from a snapshot that couldn't be
+/// taken at all.
+///
+/// One snapshot is taken regardless of `pids.len()` — the cost is a
+/// single system-wide enumeration, not one per PID. This matters
+/// because the caller ([`crate::gpu::gpu_processes`]) invokes this once
+/// per sampling pass, including every `hmn watch` interval tick; a
+/// per-PID snapshot would repeat a full process-table walk once per
+/// unresolved row per tick.
+#[allow(unsafe_code)]
+#[must_use]
+pub(super) fn resolve_names_via_snapshot(pids: &[u32]) -> Option<Vec<(u32, String)>> {
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // SAFETY: CreateToolhelp32Snapshot is a documented Win32 function.
+    // TH32CS_SNAPPROCESS requests a process-only snapshot (no thread /
+    // heap / module entries). Failure (extremely rare — resource
+    // exhaustion) surfaces as Err; the let-else below returns `None`
+    // without leaking any partially-acquired state.
+    let snapshot_result = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let Ok(raw_handle) = snapshot_result else {
+        return None;
+    };
+    let guard = HandleGuard { handle: raw_handle };
+
+    // CAST: usize → u32, size_of::<PROCESSENTRY32W>() is a small fixed
+    // struct size, fits trivially.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let entry_size = size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: entry_size,
+        ..Default::default()
+    };
+
+    let mut found = Vec::new();
+    // SAFETY: guard.handle is valid (RAII invariant). `entry` is a
+    // stack-allocated PROCESSENTRY32W with dwSize pre-set to its own
+    // size, as Process32FirstW/Process32NextW require to validate the
+    // caller's struct layout matches theirs.
+    let mut has_entry = unsafe { Process32FirstW(guard.handle, &raw mut entry) }.is_ok();
+    // EXPLICIT: Process32FirstW/Process32NextW is a C-style
+    // out-parameter cursor API with no iterator equivalent in the
+    // `windows` crate bindings; an imperative loop is the only way to
+    // drive it.
+    while has_entry {
+        if pids.contains(&entry.th32ProcessID) {
+            let name = szexefile_to_string(&entry.szExeFile);
+            if !name.is_empty() {
+                found.push((entry.th32ProcessID, name));
+            }
+        }
+        // SAFETY: same invariants as the Process32FirstW call above;
+        // `entry` is reused as the out-parameter for the next row.
+        has_entry = unsafe { Process32NextW(guard.handle, &raw mut entry) }.is_ok();
+    }
+
+    Some(found)
+}
+
+/// Decode a `Win32` `PROCESSENTRY32W.szExeFile` fixed buffer (`[u16;
+/// 260]`, `NUL`-terminated) into an owned `String`.
+///
+/// Unlike [`basename_from_path`], no path-separator stripping is
+/// needed: `Toolhelp32` always returns the bare executable file name in
+/// this field, never a full path.
+#[must_use]
+fn szexefile_to_string(buf: &[u16; 260]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    // INDEX: `len` is the position of the first NUL found via
+    // `.position()` above (or the full buffer length when
+    // unterminated), so it is always `<= buf.len()` by construction.
+    #[allow(clippy::indexing_slicing)]
+    let slice = &buf[..len];
+    String::from_utf16_lossy(slice)
+}
+
 // -----------------------------------------------------------------------
 // Inline tests (pure helpers only — FFI exercised via live tests in
 // `tests/live_pdh.rs`)
@@ -1087,8 +1203,39 @@ fn basename_from_path(path: &str) -> String {
 mod tests {
     use super::{
         basename_from_path, kernel_name_for_pid, parse_adapter_instance_name, parse_instance_name,
-        parse_multi_string,
+        parse_multi_string, szexefile_to_string,
     };
+
+    /// Build a `szExeFile`-shaped `[u16; 260]` buffer from a `&str`,
+    /// `NUL`-terminated and zero-padded, matching what
+    /// `Process32FirstW`/`Process32NextW` write into the field.
+    fn szexefile_buf(name: &str) -> [u16; 260] {
+        let mut buf = [0_u16; 260];
+        for (slot, ch) in buf.iter_mut().zip(name.encode_utf16()) {
+            *slot = ch;
+        }
+        buf
+    }
+
+    #[test]
+    fn szexefile_to_string_decodes_nul_terminated_name() {
+        assert_eq!(szexefile_to_string(&szexefile_buf("dwm.exe")), "dwm.exe");
+    }
+
+    #[test]
+    fn szexefile_to_string_empty_buffer_yields_empty_string() {
+        assert_eq!(szexefile_to_string(&[0_u16; 260]), "");
+    }
+
+    #[test]
+    fn szexefile_to_string_unterminated_buffer_uses_full_length() {
+        // Pathological but defensively covered: a buffer with no NUL at
+        // all (shouldn't happen in practice — Win32 always terminates
+        // szExeFile — but `.position()` returning `None` must not panic).
+        let buf = [u16::from(b'a'); 260];
+        let decoded = szexefile_to_string(&buf);
+        assert_eq!(decoded.chars().count(), 260);
+    }
 
     #[test]
     fn parse_instance_name_basic() {

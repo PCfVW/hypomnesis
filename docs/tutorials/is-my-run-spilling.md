@@ -32,7 +32,7 @@ across batch sizes. Spill is **residency, not commitment** — and that's what
 **Prerequisites:** Windows 10/11 with `WDDM 2.0`+ (any modern machine), and:
 
 ```sh
-cargo install hypomnesis --features cli
+cargo install hypomnesis
 ```
 
 No elevation needed — the counters are readable unprivileged. On Linux/macOS

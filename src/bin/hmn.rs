@@ -396,7 +396,13 @@ struct PsRow {
 enum SortKey {
     /// `used_bytes` (`WDDM` dedicated commit) descending — "who do I
     /// kill to free VRAM?". The default; matches `hmn ps`'s pre-v0.2.7
-    /// fixed order exactly.
+    /// fixed order exactly. Also accepts `vram` (the column header and
+    /// the word the rest of the tool's help text uses for this
+    /// quantity) and `committed` (the word `hmn watch`'s `COMMITTED`
+    /// column uses for the same quantity) as aliases — same ordering,
+    /// different vocabulary entry points, so users don't have to learn
+    /// `hmn`-internal naming to reach for the default sort.
+    #[value(alias = "vram", alias = "committed")]
     Dedicated,
     /// `shared_used_bytes` (resident shared-system-memory, the spill
     /// signal) descending — "who is currently being paged out?". A
@@ -533,20 +539,30 @@ fn run_ps(
 ///   committed on a 16 `GiB` card. Elided entirely when `count == 0`
 ///   because a zero-bytes total carries no information.
 ///
-///   When at least one row has `name: None`, the parenthetical
+///   When at least one row is genuinely unresolvable, the parenthetical
 ///   carries a **protected continuation**
-///   (`; M protected — re-run elevated for names`) joined by `; `.
-///   Surfaces the actionable hint that Administrator-level access
-///   would resolve those names — most are system services or
-///   other-user processes the calling user can't `OpenProcess`
-///   against. `PID 4` (the Windows kernel pseudo-process) is
-///   special-cased to render as `[kernel]` rather than `?` and
-///   therefore does **not** contribute to this count; the remaining
-///   count is genuinely foreign-user / `SYSTEM` / `PPL`-protected /
-///   transient-race processes that elevation can actually help with.
-///   On macOS, "protected" maps to cross-user PIDs whose `ledger`
-///   syscall returned `EPERM` — `sudo hmn ps` is the equivalent
-///   elevation.
+///   (`; M protected — re-run elevated for names`) joined by `; `. A row
+///   counts as protected when `name.is_none()` (`NVML`'s
+///   `/proc/<pid>/comm` unreadable on Linux; macOS cross-user PIDs whose
+///   `ledger` syscall returned `EPERM` — `sudo hmn ps` is the equivalent
+///   elevation there); when `name` is exactly `Some("[protected]")` (the
+///   Windows-only bracket meaning the `Toolhelp32Snapshot` fallback could
+///   not be taken at all — see `hypomnesis::gpu_processes`'s Windows
+///   path); or when `name` is the literal `Some("?")` string the
+///   pre-`WDDM 2.0` `nvidia-smi` fallback writes for a row it couldn't
+///   name itself (same "might resolve under elevation" meaning as the
+///   other two — pre-existing, but not previously counted here). `PID 4`
+///   (`[kernel]`) and `[exited]` rows deliberately
+///   do **not** contribute to this count: `[kernel]` has no executable
+///   image to resolve regardless of privilege, and `[exited]` means the
+///   process was already gone by the time of the name lookup — elevation
+///   would not have helped either case, so counting them would overstate
+///   what re-running elevated could actually buy. As of v0.2.8, most
+///   Windows `?` rows resolve to a real name via the snapshot fallback
+///   before this function ever sees them; the count that remains is
+///   genuinely foreign-user / `SYSTEM` / `PPL`-protected processes, or —
+///   on Linux/macOS, where the fallback doesn't apply — any unresolved
+///   row at all.
 ///
 /// "GPU process" / "GPU processes" (not the previous-release
 /// "compute process" / "compute processes") because on the `PDH`
@@ -558,7 +574,14 @@ fn format_ps_summary(
     device_filter: Option<u32>,
 ) -> String {
     let count = rows.len();
-    let protected = rows.iter().filter(|r| r.name.is_none()).count();
+    let protected = rows
+        .iter()
+        .filter(|r| {
+            r.name.is_none()
+                || r.name.as_deref() == Some("[protected]")
+                || r.name.as_deref() == Some("?")
+        })
+        .count();
     let committed_total: u64 = rows.iter().map(|r| r.used_bytes).sum();
 
     let noun = if count == 1 {
@@ -1157,6 +1180,18 @@ fn sleep_interruptibly(total: Duration, interrupted: &AtomicBool) {
     }
 }
 
+/// Filter out `name` values that don't represent a genuinely resolved
+/// process identity for [`process_sample`]'s PID-reuse comparison:
+/// `None` (unresolved) and the Windows-only `"[protected]"`/`"[exited]"`
+/// synthetic brackets (still unresolved, just with more detail than a
+/// bare `?`). `"[kernel]"` is deliberately *not* filtered — `PID 4` is
+/// permanently the kernel and never flickers, so it is safe to treat as
+/// a stable, comparable name.
+#[must_use]
+fn resolved_name(name: Option<&str>) -> Option<&str> {
+    name.filter(|n| *n != "[protected]" && *n != "[exited]")
+}
+
 /// Fold one sample into `state`, observe the spill tracker, and return
 /// one rendered [`WatchSampleRow`] per watched PID (in `watched`'s
 /// order). A watched PID absent from `rows` renders as `0 B` / `0 B` for
@@ -1175,10 +1210,13 @@ fn sleep_interruptibly(total: Duration, interrupted: &AtomicBool) {
 ///
 /// Emits the one-shot `?`-row growth hint to stderr the first interval
 /// an unresolved watched PID's cumulative growth crosses
-/// [`UNRESOLVED_GROWTH_HINT_BYTES`]. Also detects a watched PID being
-/// recycled by the OS mid-watch (its resolved name changes between
-/// samples) and resets that PID's baseline/peak so deltas describe the
-/// new process rather than mixing two processes' readings — best-effort
+/// [`UNRESOLVED_GROWTH_HINT_BYTES`] — "unresolved" here means `name` is
+/// `None` or (Windows-only, since v0.2.8) the `"[protected]"` bracket;
+/// `"[exited]"` does not count, since a process already confirmed gone
+/// cannot meaningfully "grow". Also detects a watched PID being recycled
+/// by the OS mid-watch (its [`resolved_name`] changes between samples)
+/// and resets that PID's baseline/peak so deltas describe the new
+/// process rather than mixing two processes' readings — best-effort
 /// (unresolved-name churn can't be distinguished from reuse).
 fn process_sample(
     rows: &[GpuProcessEntry],
@@ -1212,11 +1250,17 @@ fn process_sample(
         // baseline/peak/prev to this sample so the closing summary and
         // this row's delta describe the *new* process, not a mix of
         // both. `None` on either side (still unresolved, or a
-        // transient resolution race) is not treated as a change — see
-        // the `last_name` update below, which stays sticky across a
-        // `None` sample.
-        if let (Some(old), Some(new)) = (entry.last_name.as_deref(), name.as_deref())
-            && old != new
+        // transient resolution race) is not treated as a change — nor
+        // is the Windows-only `"[protected]"`/`"[exited]"` synthetic
+        // brackets, which can flicker in and out for one interval (e.g.
+        // a transient `Toolhelp32Snapshot` failure) without the
+        // underlying process actually changing — see `resolved_name`
+        // and the `last_name` update below, both of which stay sticky
+        // across an unresolved sample.
+        if let (Some(old), Some(new)) = (
+            resolved_name(entry.last_name.as_deref()),
+            resolved_name(name.as_deref()),
+        ) && old != new
         {
             entry.baseline_used_bytes = used_bytes;
             entry.baseline_shared_bytes = shared_bytes;
@@ -1236,9 +1280,12 @@ fn process_sample(
         entry.prev_shared_bytes = shared_bytes;
         entry.peak_used_bytes = entry.peak_used_bytes.max(used_bytes);
         entry.peak_shared_bytes = entry.peak_shared_bytes.max(shared_bytes);
-        entry.last_name = name.clone().or_else(|| entry.last_name.clone());
+        entry.last_name = resolved_name(name.as_deref())
+            .map(ToOwned::to_owned)
+            .or_else(|| entry.last_name.clone());
 
-        if !entry.growth_hint_fired && name.is_none() {
+        let still_unresolved = name.is_none() || name.as_deref() == Some("[protected]");
+        if !entry.growth_hint_fired && still_unresolved {
             let grown = used_bytes
                 .saturating_sub(entry.baseline_used_bytes)
                 .max(shared_bytes.saturating_sub(entry.baseline_shared_bytes));
@@ -2249,6 +2296,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_ps_summary_bracket_protected_string_counts_as_protected() {
+        // Windows-only `[protected]` synthetic name (the
+        // Toolhelp32Snapshot fallback itself could not be taken) counts
+        // toward the same "re-run elevated" hint as a bare `name: None`
+        // row, even though `name` is `Some` here.
+        let mut rows = unprotected_rows(2);
+        rows.push(row(3000, Some("[protected]"), 0, 0, None));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (0 MiB committed total; 1 protected — re-run elevated for names)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_nvidia_smi_question_mark_counts_as_protected() {
+        // Pre-existing (not v0.2.8-introduced) case: the pre-WDDM-2.0
+        // `nvidia-smi` fallback writes a literal `"?"` name string rather
+        // than `None` for a row it couldn't identify. This carries the
+        // same "might resolve under elevation" meaning as `None`/
+        // `[protected]` and must count toward the hint too — previously
+        // it silently didn't, understating the count exactly the way
+        // `[exited]` would have overstated it.
+        let mut rows = unprotected_rows(2);
+        rows.push(row(3002, Some("?"), 0, 0, None));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (0 MiB committed total; 1 protected — re-run elevated for names)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_bracket_exited_string_does_not_count_as_protected() {
+        // `[exited]` means the process was already gone by the time of
+        // the name lookup — elevation would not have helped, so it must
+        // NOT inflate the protected count (this is the exact
+        // overstatement the v0.2.8 dogfooding report flagged).
+        let mut rows = unprotected_rows(2);
+        rows.push(row(3001, Some("[exited]"), 0, 0, None));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (0 MiB committed total)."
+        );
+    }
+
+    #[test]
+    fn format_ps_summary_kernel_bracket_does_not_count_as_protected() {
+        // `[kernel]` (PID 4) has no executable image to resolve
+        // regardless of privilege — unchanged pre-v0.2.8 behaviour,
+        // re-asserted here alongside the new bracket-counting tests.
+        let mut rows = unprotected_rows(2);
+        rows.push(row(4, Some("[kernel]"), 0, 0, None));
+        assert_eq!(
+            format_ps_summary(&rows, None, None),
+            "3 GPU processes found (0 MiB committed total)."
+        );
+    }
+
     // --- exit_code_byte (spill exit-code pass-through) ---
 
     #[test]
@@ -2316,6 +2421,21 @@ mod tests {
                 panic!("expected Ps subcommand");
             };
             assert_eq!(sort, expected, "--sort {flag}");
+        }
+    }
+
+    #[test]
+    fn ps_args_sort_accepts_dedicated_aliases() {
+        // `vram` and `committed` are the words the rest of the tool's
+        // own vocabulary uses for this quantity (the `ps` column header
+        // and `watch`'s `COMMITTED` column, respectively) — both should
+        // resolve to the same ordering as the canonical `dedicated`.
+        for flag in ["vram", "committed"] {
+            let cli = Cli::try_parse_from(["hmn", "ps", "--sort", flag]).unwrap();
+            let Some(Commands::Ps { sort, .. }) = cli.command else {
+                panic!("expected Ps subcommand");
+            };
+            assert_eq!(sort, SortKey::Dedicated, "--sort {flag}");
         }
     }
 
@@ -2952,6 +3072,105 @@ mod tests {
         assert_eq!(row.used_delta, 500);
         assert_eq!(row.shared_delta, 50);
         assert_eq!(state.by_pid.get(&100).unwrap().baseline_used_bytes, 8_000);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn process_sample_protected_bracket_flicker_does_not_trigger_reset() {
+        // Same shape as the `None`-flicker test above, but for the
+        // Windows-only `[protected]` synthetic bracket: a transient
+        // Toolhelp32Snapshot failure on one interval must not look like
+        // "the OS recycled this PID" and reset the baseline.
+        let mut state = WatchState::new();
+        let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
+        let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
+        let rows1 = vec![entry(100, Some("[protected]"), 8_500, 150)];
+        let _ = process_sample(&rows1, &mut state, &[100], Duration::from_secs(5), None);
+        let rows2 = vec![entry(100, Some("python.exe"), 9_000, 200)];
+        let out = process_sample(&rows2, &mut state, &[100], Duration::from_secs(10), None);
+        let row = out.first().unwrap();
+        assert_eq!(row.used_delta, 500);
+        assert_eq!(row.shared_delta, 50);
+        assert_eq!(state.by_pid.get(&100).unwrap().baseline_used_bytes, 8_000);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn process_sample_reset_survives_a_protected_flicker_in_between() {
+        // A `[protected]` flicker must not mask a GENUINE later name
+        // change either: last_name should stay "python.exe" (sticky
+        // across the flicker), so the real reuse at rows2 still resets.
+        let mut state = WatchState::new();
+        let rows0 = vec![entry(100, Some("python.exe"), 8_000, 100)];
+        let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
+        let rows1 = vec![entry(100, Some("[protected]"), 8_500, 150)];
+        let _ = process_sample(&rows1, &mut state, &[100], Duration::from_secs(5), None);
+        let rows2 = vec![entry(100, Some("notepad.exe"), 200, 10)];
+        let out = process_sample(&rows2, &mut state, &[100], Duration::from_secs(10), None);
+        let row = out.first().unwrap();
+        assert_eq!(row.used_delta, 0);
+        assert_eq!(row.shared_delta, 0);
+        let s = state.by_pid.get(&100).unwrap();
+        assert_eq!(s.baseline_used_bytes, 200);
+        assert_eq!(s.baseline_shared_bytes, 10);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn process_sample_growth_hint_fires_for_protected_bracket() {
+        // The one-shot "unresolved pid grew" stderr hint must still
+        // fire for the Windows-only `[protected]` bracket, not just a
+        // bare `None` — otherwise the hint would go silent on Windows
+        // now that most `?` rows resolve via the Toolhelp32Snapshot
+        // fallback and only genuinely-protected rows stay unresolved.
+        let mut state = WatchState::new();
+        let rows0 = vec![entry(100, Some("[protected]"), 0, 0)];
+        let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
+        let grown = UNRESOLVED_GROWTH_HINT_BYTES;
+        let rows1 = vec![entry(100, Some("[protected]"), grown, 0)];
+        let _ = process_sample(&rows1, &mut state, &[100], Duration::from_secs(5), None);
+        assert!(state.by_pid.get(&100).unwrap().growth_hint_fired);
+    }
+
+    #[cfg(feature = "test-helpers")]
+    #[test]
+    fn process_sample_growth_hint_does_not_fire_for_exited_bracket() {
+        // `[exited]` means the process was already confirmed gone —
+        // "growth" on a gone process is meaningless, so the hint (whose
+        // wording promises "re-run elevated to identify") must not fire
+        // for it the way it does for `None`/`[protected]`.
+        let mut state = WatchState::new();
+        let rows0 = vec![entry(100, Some("[exited]"), 0, 0)];
+        let _ = process_sample(&rows0, &mut state, &[100], Duration::ZERO, None);
+        let grown = UNRESOLVED_GROWTH_HINT_BYTES;
+        let rows1 = vec![entry(100, Some("[exited]"), grown, 0)];
+        let _ = process_sample(&rows1, &mut state, &[100], Duration::from_secs(5), None);
+        assert!(!state.by_pid.get(&100).unwrap().growth_hint_fired);
+    }
+
+    // --- resolved_name (PID-reuse comparison filter) ---
+
+    #[test]
+    fn resolved_name_passes_through_real_names() {
+        assert_eq!(resolved_name(Some("python.exe")), Some("python.exe"));
+    }
+
+    #[test]
+    fn resolved_name_passes_through_kernel_bracket() {
+        // [kernel] (PID 4) is permanently stable and never flickers —
+        // safe to treat as a comparable name, unlike [protected]/[exited].
+        assert_eq!(resolved_name(Some("[kernel]")), Some("[kernel]"));
+    }
+
+    #[test]
+    fn resolved_name_filters_protected_and_exited_brackets() {
+        assert_eq!(resolved_name(Some("[protected]")), None);
+        assert_eq!(resolved_name(Some("[exited]")), None);
+    }
+
+    #[test]
+    fn resolved_name_filters_none() {
+        assert_eq!(resolved_name(None), None);
     }
 
     // --- WatchState::track (--follow-new seen_order bookkeeping) ---

@@ -102,7 +102,11 @@ The three keys answer three **distinct diagnostic questions**:
 - **`dedicated`** (the default, same order as v0.2.6) — sorts by per-process
   committed dedicated VRAM, descending. Use this to answer **who do I kill
   to free VRAM?** — the processes at the top are holding the most GPU memory
-  you can reclaim by terminating them.
+  you can reclaim by terminating them. Also accepts `vram` and `committed`
+  as aliases (since v0.2.8) — the words the rest of the tool's own
+  vocabulary uses for this quantity (the `ps` column header and `watch`'s
+  `COMMITTED` column, respectively), so you don't need to learn
+  `hmn`-internal naming to reach for the default sort.
 - **`shared`** — sorts by per-process resident shared-system-memory bytes,
   descending. Use this to answer **who is currently being paged out?** — the
   symptom of spill, not its cause. Note this column is `0` on Linux (normal
@@ -177,20 +181,51 @@ check `measurable` before trusting `spilled: false`.
 
 ## What does a `?` in the NAME column mean — and when do I need elevation?
 
-`?` means the calling user cannot resolve that PID's name via `OpenProcess` —
-usually a system service or another user's process. Run `hmn ps` as
-Administrator to resolve most of them (macOS equivalent: `sudo hmn ps`, which
-also un-skips cross-user PIDs the `ledger` syscall rejects with `EPERM`). The
-Windows kernel itself (PID 4) renders as `[kernel]`, not `?`, so it never
-pollutes the count.
+**On Windows (since v0.2.8), `?` is now rare.** Before v0.2.8, any PID
+`OpenProcess` couldn't resolve — including ordinary foreign-user/`SYSTEM`
+processes like `dwm.exe` and `csrss.exe` — rendered as a bare `?`, even
+though the calling user wasn't actually blocked from *knowing* the name: a
+non-elevated `Get-Process -Id <pid>` or Task Manager could name the exact
+same PID instantly. That gap is now closed: `hmn ps` falls back to a
+`CreateToolhelp32Snapshot` scan (the same mechanism `Get-Process`/Task
+Manager use) whenever `OpenProcess` fails — it reads every running
+process's name from a system-wide enumeration without opening a
+per-process handle, so it isn't subject to the same access check.
+
+What's left renders as one of two honest brackets instead of an anonymous
+`?`:
+
+- **`[exited]`** — the process exited between `hypomnesis`'s VRAM sample
+  and the name lookup. A timing race, not a permission wall; re-running
+  elevated would not help.
+- **`[protected]`** — the `Toolhelp32Snapshot` fallback itself could not
+  be taken at all (very rare — resource exhaustion), so "exited" vs.
+  "still running but unresolvable" can't be told apart. Run `hmn ps` as
+  Administrator to resolve most genuinely-protected cases.
+
+The Windows kernel itself (PID 4) renders as `[kernel]`, not `?` or
+`[protected]`, so it never pollutes the count.
+
+**This distinction is Windows-only.** On Linux, an unresolved row means
+`/proc/<pid>/comm` was unreadable — usually a genuine cross-user permission
+wall, not a false one the way Windows' old `OpenProcess`-only path was; run
+as the owning user or with `sudo` to resolve it. On macOS, `sudo hmn ps`
+similarly un-skips cross-user PIDs the `ledger` syscall rejects with
+`EPERM`. Both platforms still render an unresolved row as a bare `?` (no
+`[exited]`/`[protected]` split) — there is no equivalent false-wall to
+collapse there the way there was on Windows.
 
 The distinction is deliberately surfaced because it is security-relevant: a
-`?` row holding substantial `VRAM` that *still* doesn't resolve under
-elevation is one of — another user's process, `SYSTEM`, a `PPL`-protected
-process, or a transient race — and on a single-user desktop an unexpected one
-is worth investigating. Note that **measurement itself never needs
-elevation**: the `PDH` counters, including everything `hmn spill` reads, are
-readable unprivileged; elevation only improves *name resolution*.
+`[protected]` row (or a bare `?` on Linux/macOS) holding substantial `VRAM`
+that *still* doesn't resolve under elevation is one of — another user's
+process, `SYSTEM`, a `PPL`-protected process, or (rarely) the snapshot API
+itself failing — and on a single-user desktop an unexpected one is worth
+investigating. Note that **measurement itself never needs elevation**: the
+`PDH` counters, including everything `hmn spill` reads, are readable
+unprivileged; elevation only improves *name resolution*. The
+`(N protected — re-run elevated for names)` summary-line count reflects
+only true `[protected]`/unresolved rows — `[exited]` rows are deliberately
+excluded, since elevation cannot help a process that has already exited.
 
 ## Why is there no `hmn kill` or `hmn spill --kill`?
 
@@ -271,6 +306,10 @@ succeed, but the binary on `PATH` is unchanged. `--force` rebuilds and
 reinstalls unconditionally:
 
 ```sh
-cargo install hypomnesis --features cli --force
+cargo install hypomnesis --force
 hmn --version
 ```
+
+(`--features cli` is no longer required since v0.2.8 — `cli` is now a
+default feature. It's still accepted if you're upgrading from a build where
+you'd previously passed `--no-default-features`.)

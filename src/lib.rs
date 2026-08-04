@@ -16,7 +16,7 @@
 //! | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
 //! | Device reserved memory | `NVML` v2 (`nvmlDeviceGetMemoryInfo_v2`, R510+) | `NVML` v2 (R510+) | n/a (`None` — UMA has no carve-out) |
 //! | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
-//! | GPU-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage` + `Shared Usage`) + `OpenProcess`/`QueryFullProcessImageNameW`; `nvidia-smi --query-compute-apps` fallback (NB: Windows `PDH` is **not** compute-only — it surfaces every GPU memory holder, including the compositor and browsers) | `NVML` + `/proc/<pid>/comm` (compute-only) | `proc_listpids` + per-PID `ledger` + `proc_pidpath` (same-user PIDs only; cross-user requires `sudo`) |
+//! | GPU-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage` + `Shared Usage`) + `OpenProcess`/`QueryFullProcessImageNameW`, with a `CreateToolhelp32Snapshot` fallback (v0.2.8) for names `OpenProcess` denies even non-elevated; `nvidia-smi --query-compute-apps` fallback (NB: Windows `PDH` is **not** compute-only — it surfaces every GPU memory holder, including the compositor and browsers) | `NVML` + `/proc/<pid>/comm` (compute-only) | `proc_listpids` + per-PID `ledger` + `proc_pidpath` (same-user PIDs only; cross-user requires `sudo`) |
 //! | Spill detection (`SpillTracker`) | `PDH` `\GPU Adapter Memory(*)\Dedicated Usage` + `Shared Usage` (`WDDM 2.0`+) | n/a (`is_spill_measurable()` returns `false` — normal `CUDA` OOMs rather than silently paging) | n/a (`false` — `UMA` has nothing to spill *into*) |
 //! | Fallback | `nvidia-smi` subprocess | `nvidia-smi` subprocess | none (libSystem syscalls always succeed on Apple Silicon) |
 //!
@@ -43,7 +43,7 @@
 //! | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` / `PDH` fail or are otherwise unavailable (e.g. pre-`WDDM 2.0` Windows) |
 //! | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
 //! | `debug-output` | no | Print raw values from the `NVML` / `DXGI` / `PDH` / `nvidia-smi` / spill paths to stderr (diagnostic) |
-//! | `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 as a dep). Library users do not need this; install via `cargo install hypomnesis --features cli` |
+//! | `cli` | yes (since v0.2.8) | Build the `hmn` CLI binary (pulls `clap` 4 and `ctrlc` as deps). Library-only consumers who don't want these use `--no-default-features` and select source features explicitly |
 //! | `test-helpers` | no | Expose `GpuDeviceInfoBuilder`, `GpuProcessEntryBuilder`, and `SpillReportBuilder` for downstream tests that need synthetic fixtures. Default-off, additive — production code must never enable it. |
 
 #![deny(unsafe_code)]

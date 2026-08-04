@@ -10,11 +10,11 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> 🆕 **`0.2.7` adds `hmn watch --follow-new` and `hmn ps --sort`.** A candle-mi dogfooding report ran `hmn watch` alongside 19 sequential `cargo test` processes — the adapter-level spill detection was flawless (three real episodes, one a fast Mistral-7B spike candle-mi's own wall-clock heuristic had missed), but the auto-selected PID set froze at attach, so none of the processes that actually caused the spills were ever attributed. `--follow-new` re-runs top-N selection every interval instead of once: a PID entering starts fresh, a PID leaving is *finalized* into the closing summary instead of rendering `0` forever. A companion request from the same suite: `hmn ps --sort <dedicated|shared|total>`, sharing one comparator with `hmn watch`'s auto-selection so the two can't drift apart. Both off by default / pre-v0.2.7-compatible; no library-surface change. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md).
+> 🆕 **`0.2.8` fixes `cargo install hypomnesis` installing no binary, and collapses most Windows `?` rows.** An askesis `canvas` dogfooding report found `cli` was default-off, so a rented-GPU deploy's `cargo install hypomnesis` exited `0` and installed nothing — `cli` is now a default feature, install with a bare `cargo install hypomnesis`. The report also diagnosed most Windows `?` NAME rows as resolvable without elevation; its proposed fix (switch `OpenProcess`'s query right) turned out to already be shipping since v0.2.2 and insufficient — a live test showed both rights fail identically against `dwm.exe`/`csrss.exe`. The real fix, `CreateToolhelp32Snapshot`, reads process names from a system-wide enumeration with no per-process handle and collapses most former `?` rows to real names; what remains renders as an honest `[exited]` or `[protected]` instead of an anonymous `?`. `hmn ps --sort vram`/`committed` round out the release as aliases for `--sort dedicated`. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.8.md`](docs/roadmap-v0.2.8.md).
+
+> 🚀 **`0.2.7` adds `hmn watch --follow-new` and `hmn ps --sort`.** A candle-mi dogfooding report ran `hmn watch` alongside 19 sequential `cargo test` processes — the adapter-level spill detection was flawless (three real episodes, one a fast Mistral-7B spike candle-mi's own wall-clock heuristic had missed), but the auto-selected PID set froze at attach, so none of the processes that actually caused the spills were ever attributed. `--follow-new` re-runs top-N selection every interval instead of once: a PID entering starts fresh, a PID leaving is *finalized* into the closing summary instead of rendering `0` forever. A companion request from the same suite: `hmn ps --sort <dedicated|shared|total>`, sharing one comparator with `hmn watch`'s auto-selection so the two can't drift apart. Both off by default / pre-v0.2.7-compatible; no library-surface change. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md).
 
 > 🚀 **`0.2.6` adds `hmn watch` — attach to a job that's already running.** `hmn spill` only wraps a *new* command; a rhyme-mdlm dogfooding report hit that wall three times triaging a 15-hour training campaign, hand-rolling "two `hmn ps` samples minutes apart, diff by eye" every time. `hmn watch [PID...]` (or auto-select the top `--top` by committed VRAM with no PID given) samples the same `SpillTracker` core on a timer, printing one row per watched PID per interval — committed/shared VRAM, deltas, and a live SPILL flag — until `--duration` elapses or Ctrl+C. A `time(1)`-style scrolling sampler, not a TUI, same discipline as `hmn spill`. Exit code conveys whether spill was observed (`0`/`1`/`2`) for scripts and watchdogs; `--json` streams JSON Lines. Windows-only measurement like `hmn spill` (`WDDM` is what `hmn watch` reads); other platforms still show real per-PID VRAM deltas, just no SPILL flag. Live-validated against the same forced-spill fixture that shipped v0.2.5. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md), and the [watch tutorial](docs/tutorials/watching-a-running-job.md).
-
-> 🚀 **`0.2.5` detects `WDDM` GPU spill — residency, not commitment.** A cross-platform `SpillTracker` + episode-based `SpillReport` flag the moment a workload's *resident* shared-system-memory grows while dedicated `VRAM` saturates — the state where `WDDM` silently pages GPU allocations over `PCIe` and throughput craters. Never inferred from the `committed − dedicated` gap (that's reservation headroom, and flagging it cries wolf on every big compute process — caught live by a rhyme-mdlm dogfooding report). Per-process attribution ships as additive `GpuProcessEntry::shared_used_bytes` + a `hmn ps` SHARED column, and `hmn spill -- <command>` wraps any run `time(1)`-style with exit-code pass-through. Windows-only measurement, honestly declared: `is_spill_measurable()` is `false` on Linux and macOS. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.5.md`](docs/roadmap-v0.2.5.md).
 
 ## Table of Contents
 
@@ -46,7 +46,13 @@
 hypomnesis = "0.2"
 ```
 
-The default feature set (`nvml`, `dxgi`, `pdh`, `metal`, `nvidia-smi-fallback`) covers process RSS, per-process / device-wide GPU memory, the foreign-process GPU listing, and `WDDM` spill detection on Windows (`IDXGIAdapter3` + `PDH` + `NVML`) and Linux (`NVML`), with a `nvidia-smi` subprocess fallback — see the [Feature Flags](#feature-flags) table for the per-flag breakdown. The `windows`-crate dependency behind `dxgi` / `pdh` is target-conditional — Linux users pay nothing for it.
+The default feature set (`nvml`, `dxgi`, `pdh`, `metal`, `nvidia-smi-fallback`, `cli`) covers process RSS, per-process / device-wide GPU memory, the foreign-process GPU listing, `WDDM` spill detection on Windows (`IDXGIAdapter3` + `PDH` + `NVML`) and Linux (`NVML`), a `nvidia-smi` subprocess fallback, and (since v0.2.8) the `hmn` CLI binary itself — see the [Feature Flags](#feature-flags) table for the per-flag breakdown. The `windows`-crate dependency behind `dxgi` / `pdh` is target-conditional — Linux users pay nothing for it.
+
+Library-only consumers who don't want `clap`/`ctrlc` pulled in should pass `--no-default-features` and select source features explicitly:
+
+```toml
+hypomnesis = { version = "0.2", default-features = false, features = ["nvml", "dxgi", "pdh"] }
+```
 
 On macOS, the `metal` feature is in the default set. Process RSS and per-process GPU memory come from libSystem syscalls (`task_info`, `ledger`, `sysctl`). The device-wide "free" figure comes from `MTLDevice.recommendedMaxWorkingSetSize` via the `objc2-metal` binding (target-conditional, macOS-only) — no libSystem signal on Apple Silicon UMA approximates Apple's own kernel-projected GPU working-set budget within useful accuracy.
 
@@ -164,11 +170,13 @@ The VRAM column is `WDDM`'s dedicated *commit* — a big process legitimately sh
 
 ## Binary (`hmn`)
 
-`hypomnesis` ships a small CLI binary, `hmn`, behind the default-off `cli` feature. Install it with:
+`hypomnesis` ships a small CLI binary, `hmn`, behind the (since v0.2.8) default-on `cli` feature. Install it with:
 
 ```sh
-cargo install hypomnesis --features cli
+cargo install hypomnesis
 ```
+
+`--features cli` is still accepted but redundant on the default feature set — only needed if you've already opted out with `--no-default-features` and want the binary back.
 
 Four subcommands:
 
@@ -229,7 +237,7 @@ hmn: 0 GPU processes found matching pid=99 device=0.   # with filters
 
 The stderr summary is always printed, even when the table is empty, so interactive users get an unambiguous "command worked, here's the count" line without breaking stdout's scriptability. Pipelines like `hmn ps | awk 'NR>1 {print $1}'` or `hmn ps --json | jq` work as expected. Redirect `2>/dev/null` to suppress the summary.
 
-`--sort <KEY>` (`dedicated` default, `shared`, or `total`) reorders both the text table and `--json` output — three different questions, not interchangeable: `dedicated` ("who do I kill to free VRAM?"), `shared` ("who is currently being paged out?" — a symptom, not a cause), `total` (dedicated + shared, "who is the biggest GPU-memory citizen overall?"). Tie-breaks (name ascending, then PID ascending) are identical regardless of key. `shared`/`total` are a documented no-op ordering on Linux and macOS, where `shared_used_bytes` is always `0`.
+`--sort <KEY>` (`dedicated` default, `shared`, or `total`) reorders both the text table and `--json` output — three different questions, not interchangeable: `dedicated` ("who do I kill to free VRAM?"), `shared` ("who is currently being paged out?" — a symptom, not a cause), `total` (dedicated + shared, "who is the biggest GPU-memory citizen overall?"). `dedicated` also accepts `vram` and `committed` as aliases — the words the rest of the tool's own vocabulary uses for the same quantity (the `ps` column header and `watch`'s `COMMITTED` column, respectively). Tie-breaks (name ascending, then PID ascending) are identical regardless of key. `shared`/`total` are a documented no-op ordering on Linux and macOS, where `shared_used_bytes` is always `0`.
 
 **Limitations** (intrinsic to the underlying data sources, not bugs — longer-form answers to the recurring ones live in the [FAQ](docs/FAQ.md)):
 
@@ -239,9 +247,20 @@ The stderr summary is always printed, even when the table is empty, so interacti
 
 3. **The SHARED column (Windows / `PDH` only) shows *resident* shared-system-memory bytes — the `WDDM` spill signal.** Matches Task Manager's `Shared GPU memory` column for the same PID. A benign baseline (staging/upload heaps, tens of MiB) is normal by design; the spill signature is this number *growing* while dedicated `VRAM` saturates — which is exactly what `hmn spill` and the library's `SpillTracker` detect. Always `0` on Linux and macOS (no shared-residency counter exists there).
 
-4. **`?` in the NAME column means the calling user cannot resolve that PID's name via `OpenProcess`.** Most cases — system services, other-user processes like `dwm.exe`, `csrss.exe`, vendor services — resolve when `hmn ps` is run as Administrator. **The Windows kernel itself (`PID 4`) is rendered as `[kernel]`, not `?`** — there is no executable image to read, so it's special-cased so it does not pollute the "unresolvable" count. `PPL`-protected processes (Windows Defender, anti-cheat engines) would also remain `?` even elevated, but typically do not appear in `hmn ps` output unless they are actively holding GPU memory.
+4. **(Windows) `?` in the NAME column is now rare.** Before v0.2.8, any PID `OpenProcess` couldn't resolve — including plenty of ordinary foreign-user/`SYSTEM` processes like `dwm.exe` and `csrss.exe` — rendered as a bare `?`. As of v0.2.8, a `Toolhelp32Snapshot` fallback resolves those the same way `Get-Process`/Task Manager do (a system-wide process enumeration that reads names without opening a per-process handle, so it isn't subject to the same access check `OpenProcess` is), collapsing the vast majority of former `?` rows to real names non-elevated:
 
-   *Security note.* By construction, a `?` row that does not resolve under elevation is one of: a process owned by another user, a process running as `SYSTEM` / `LOCAL SERVICE` / `NETWORK SERVICE`, a `PPL`-protected process, or a transient race between PDH's sample and the `OpenProcess` call. None of these are intrinsically malicious — but on a single-user desktop, an *unexpected* `?` row holding substantial VRAM is worth investigating: a malicious local process (including a privileged-or-cross-user AI agent) using GPU resources would land in exactly this set. The `(N protected — re-run elevated for names)` parenthetical on the `hmn ps` summary line is intentionally surfaced because this distinction is security-relevant. `hypomnesis` is a measurement tool, not a malware scanner — but its honesty about the gap is itself a defensive primitive.
+   ```
+   PID    NAME                         VRAM      SHARED  DEVICE
+   26940  dwm.exe                      1001 MiB  4 MiB   NVIDIA GeForce RTX 5060 Ti
+   18880  csrss.exe                    39 MiB    63 MiB  NVIDIA GeForce RTX 5060 Ti
+   4      [kernel]                     4 MiB     0 MiB   NVIDIA GeForce RTX 5060 Ti
+   ```
+
+   *(real capture, non-elevated shell — both rows rendered `?` before v0.2.8)*
+
+   What remains genuinely unresolvable now renders as one of two honest brackets instead of an anonymous `?`: **`[exited]`** — the process exited between `hypomnesis`'s VRAM sample and the name lookup; elevation would not help, this is a timing race, not a permission wall. **`[protected]`** — the `Toolhelp32Snapshot` fallback itself could not be taken (very rare — resource exhaustion), so "exited" vs. "still running but unresolvable" can't be told apart. The Windows kernel itself (`PID 4`) continues to render as `[kernel]`, not `?` or `[protected]` — there is no executable image to read, so it's special-cased. This `[exited]`/`[protected]` distinction is Windows-only; Linux/macOS unresolved rows remain a bare `?` in the table (`name: None` underneath), since there is no equivalent false-wall-vs-real-wall gap to collapse there — see the [FAQ](docs/FAQ.md#what-does-a--in-the-name-column-mean--and-when-do-i-need-elevation) for the platform breakdown.
+
+   *Security note.* A `[protected]` row (or a bare `?` on Linux/macOS) that does not resolve under elevation is one of: a process owned by another user, a process running as `SYSTEM` / `LOCAL SERVICE` / `NETWORK SERVICE`, a `PPL`-protected process, or (rarely, post-v0.2.8) the snapshot API itself failing. None of these are intrinsically malicious — but on a single-user desktop, an *unexpected* unresolved row holding substantial VRAM is worth investigating: a malicious local process (including a privileged-or-cross-user AI agent) using GPU resources would land in exactly this set. The `(N protected — re-run elevated for names)` parenthetical on the `hmn ps` summary line is intentionally surfaced because this distinction is security-relevant, and (as of v0.2.8) counts `[protected]`/`None` rows and the rare pre-`WDDM 2.0` `nvidia-smi` fallback's literal `?` name (limitation 5, below) — not `[exited]`, since elevation can't help a process that's already gone. `hypomnesis` is a measurement tool, not a malware scanner — but its honesty about the gap is itself a defensive primitive.
 
 5. **Pre-`WDDM 2.0` Windows falls back to `nvidia-smi --query-compute-apps`.** Vanishingly rare in 2026 — `WDDM 2.0` shipped with Windows 10 1709 (October 2017). On the fallback path, `hmn ps` is compute-only (matching the Linux semantic) and `used_memory` may be `[N/A]` under `WDDM` (parser drops those rows). The `source` field on `GpuProcessEntry` reads `GpuQuerySource::NvidiaSmi` rather than `GpuQuerySource::Pdh` on this path.
 
@@ -417,14 +436,14 @@ Two consequences worth noting:
 | `nvidia-smi-fallback` | yes | Subprocess fallback when `NVML` / `DXGI` / `PDH` fail or are otherwise unavailable (e.g. pre-`WDDM 2.0` Windows) |
 | `report` | no | `MemoryReport` delta + `print_delta` / `print_before_after` / `ram_mb` / `vram_mb` helpers (`candle-mi` parity, candidate for `candle-mi` v0.2 migration via Cargo flag flip); `format_free` / `print_free` / `format_total` / `format_used` formatting helpers on `GpuDeviceInfo` |
 | `debug-output` | no | Print raw `NVML` / `DXGI` / `PDH` / `nvidia-smi` / spill values to stderr (diagnostic) |
-| `cli` | no | Build the `hmn` CLI binary (pulls `clap` 4 and `ctrlc` as deps — the latter backs `hmn watch`'s graceful Ctrl+C summary). Library users do not need this; install via `cargo install hypomnesis --features cli`. |
+| `cli` | yes (since v0.2.8) | Build the `hmn` CLI binary (pulls `clap` 4 and `ctrlc` as deps — the latter backs `hmn watch`'s graceful Ctrl+C summary). Library-only consumers who don't want the extra deps use `--no-default-features` and select source features explicitly. |
 | `test-helpers` | no | Expose `GpuDeviceInfoBuilder`, `GpuProcessEntryBuilder`, and `SpillReportBuilder` for downstream tests that need synthetic fixtures. Default-off, additive — production code must never enable it. |
 
 ## Documentation
 
 | Doc | |
 |-----|---|
-| [FAQ](docs/FAQ.md) | Common questions — commit vs resident, `hmn spill` vs `hmn watch`, the SHARED baseline, the spill condition and its 85% threshold, per-platform zeros, `?` rows and elevation, threading, polling cost, upgrading |
+| [FAQ](docs/FAQ.md) | Common questions — commit vs resident, `hmn spill` vs `hmn watch`, the SHARED baseline, the spill condition and its 85% threshold, per-platform zeros, `?`/`[exited]`/`[protected]` rows and elevation, threading, polling cost, upgrading |
 | [Tutorial: Is my run spilling?](docs/tutorials/is-my-run-spilling.md) | Walkthrough: wrap a run with `hmn spill`, read the episode pattern, attribute per-PID, wire `SpillTracker` into your own loop |
 | [Tutorial: Triage a job that's already running](docs/tutorials/watching-a-running-job.md) | Walkthrough: attach `hmn watch` to a running PID, read the live SPILL column, script the exit code — and `--follow-new` to stand guard over a machine through a suite of short-lived jobs |
 | [ROADMAP](ROADMAP.md) | Status snapshot: shipped, committed, speculative, and deliberately-rejected ideas |

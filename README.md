@@ -454,7 +454,7 @@ Two consequences worth noting:
 ## Used by
 
 - [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove v0.2.4's `reserved_bytes` addition. Its `scripts/resurrect.ps1` oracle suite is a load-bearing `hmn spill --json` / `hmn watch` consumer and the source of the v0.2.7 `--follow-new` / `ps --sort` dogfooding report.
-- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
+- [hf-fetch-model](https://github.com/mi-for-the-rust-of-us/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
 
 ## License
 

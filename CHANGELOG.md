@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `Used by` entry for `hf-fetch-model` pointed at the pre-transfer URL** (`README.md`). v0.2.7 corrected hypomnesis's own `repository` / `homepage` metadata on transfer to the `mi-for-the-rust-of-us` org but left this sibling link behind. Historical `CHANGELOG` and per-release roadmap entries are deliberately left as written.
+
 ## [0.2.8] - 2026-08-04
 
 > *The tool you install should install. The name you can't be shown, someone else can.*

@@ -10,9 +10,28 @@ The crate's *why* lives in [`docs/hypomnesis-brief.md`](docs/hypomnesis-brief.md
 
 ## Current state
 
-**v0.2.8** implemented and locally verified 2026-08-04; **not yet
-published**. *The tool you install should install. The name you can't be
-shown, someone else can.* An askesis `canvas` dogfooding report
+**v0.2.9** shipped 2026-08-12. *The same total. Now with the driver
+behind it.* A `candle-mi` dogfooding report
+([2026-08-12](docs/dogfooding-feedbacks/dogfooding-driver-version-provenance.md))
+asked for the NVIDIA driver version to become part of `hypomnesis`'s
+output: `candle-mi`'s `RESURRECTION.md` provenance log stamps the Rust
+toolchain per verification run but not the GPU driver, and a driver
+change can move floating-point results — not a hypothetical, since the
+report's own reference machine hit a `DPC_WATCHDOG_VIOLATION` bugcheck
+mid-run and needed a driver update (`591.86` → `610.88`) to recover.
+Ships `GpuDeviceInfo::driver_version: Option<String>`, mirroring v0.2.4's
+`reserved_bytes` addition — sourced from `NVML`
+(`nvmlSystemGetDriverVersion`) and, since `nvidia-smi` can genuinely
+supply this figure unlike `reserved_bytes`, also from the `nvidia-smi`
+fallback. Rendered on the existing `hmn` device-summary line
+(`..., driver 610.88`) and via a new `hmn --json` flag on the default
+subcommand — the report assumed a JSON summary surface already existed;
+this release adds one. Detailed plan:
+[`docs/roadmap-v0.2.9.md`](docs/roadmap-v0.2.9.md).
+
+The preceding **v0.2.8** shipped 2026-08-04. *The tool you install should
+install. The name you can't be shown, someone else can.* An askesis
+`canvas` dogfooding report
 ([2026-08-03](docs/dogfooding-feedbacks/dogfooding-install-no-binary-and-protected-names.md))
 found `cargo install hypomnesis` completing with exit `0` and installing no
 binary at all (`cli` was default-off), and diagnosed — with one detail

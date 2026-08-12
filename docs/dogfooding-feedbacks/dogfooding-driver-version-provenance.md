@@ -4,9 +4,29 @@
 **Reporter:** candle-mi (v0.1.22 release verification, `scripts/resurrect.ps1`)
 **Severity:** Enhancement, additive and non-breaking
 **Affected area:** `gpu::device_info` / `GpuDeviceInfo`, plus the `hmn` device summary
-**Status:** Open
+**Status:** ✅ **Resolved in v0.2.9** (2026-08-12)
 
 ---
+
+> ## Resolution (v0.2.9)
+>
+> Shipped as `GpuDeviceInfo::driver_version: Option<String>`, sourced from
+> `nvmlSystemGetDriverVersion` and — since `nvidia-smi` can genuinely
+> supply this figure, unlike `reserved_bytes` — also from the
+> `nvidia-smi` fallback (`--query-gpu=driver_version`, one extra CSV
+> column on the existing device-wide query). `None` on `DXGI`-alone,
+> non-NVIDIA `DXGI` adapters, and `Metal` (macOS has no NVIDIA driver).
+> Renders on the `hmn` device-summary line
+> (`..., driver 610.88`) and via a new `hmn --json` flag on the default
+> subcommand — no JSON surface existed for the bare summary before this
+> release, so one was added rather than deferred. See
+> [`CHANGELOG.md`](../../CHANGELOG.md) and
+> [`docs/roadmap-v0.2.9.md`](../roadmap-v0.2.9.md).
+>
+> **Live-validated on the reference `RTX 5060 Ti`, post-update driver.**
+> `nvmlSystemGetDriverVersion` and the `nvidia-smi` CSV column both report
+> `driver_version = Some("610.88")` — the exact post-update version from
+> this report's own near-miss story, confirming the two sources agree.
 
 ## Summary
 

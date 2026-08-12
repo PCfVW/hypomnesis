@@ -10,11 +10,11 @@
 
 **ὑπόμνησις** — *External RAM and VRAM, measured.*
 
-> 🆕 **`0.2.8` fixes `cargo install hypomnesis` installing no binary, and collapses most Windows `?` rows.** An askesis `canvas` dogfooding report found `cli` was default-off, so a rented-GPU deploy's `cargo install hypomnesis` exited `0` and installed nothing — `cli` is now a default feature, install with a bare `cargo install hypomnesis`. The report also diagnosed most Windows `?` NAME rows as resolvable without elevation; its proposed fix (switch `OpenProcess`'s query right) turned out to already be shipping since v0.2.2 and insufficient — a live test showed both rights fail identically against `dwm.exe`/`csrss.exe`. The real fix, `CreateToolhelp32Snapshot`, reads process names from a system-wide enumeration with no per-process handle and collapses most former `?` rows to real names; what remains renders as an honest `[exited]` or `[protected]` instead of an anonymous `?`. `hmn ps --sort vram`/`committed` round out the release as aliases for `--sort dedicated`. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.8.md`](docs/roadmap-v0.2.8.md).
+> 🆕 **`0.2.9` adds `GpuDeviceInfo::driver_version` and `hmn --json`.** A candle-mi dogfooding report asked for the NVIDIA driver version to become part of `hypomnesis`'s output: `candle-mi`'s `RESURRECTION.md` provenance log stamps the Rust toolchain per verification run but not the GPU driver, and a driver change can move floating-point results — not hypothetical, since the report's own reference machine hit a `DPC_WATCHDOG_VIOLATION` bugcheck mid-run and needed a driver update (`591.86` → `610.88`) to recover. `driver_version: Option<String>` mirrors v0.2.4's `reserved_bytes` addition, sourced from `NVML` (`nvmlSystemGetDriverVersion`) and — since `nvidia-smi` can genuinely supply this figure, unlike `reserved_bytes` — the `nvidia-smi` fallback too. Renders on the `hmn` device-summary line (`..., driver 610.88`) and via a new `hmn --json` flag on the default subcommand, since no JSON surface existed there before. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.9.md`](docs/roadmap-v0.2.9.md).
+
+> 🚀 **`0.2.8` fixes `cargo install hypomnesis` installing no binary, and collapses most Windows `?` rows.** An askesis `canvas` dogfooding report found `cli` was default-off, so a rented-GPU deploy's `cargo install hypomnesis` exited `0` and installed nothing — `cli` is now a default feature, install with a bare `cargo install hypomnesis`. The report also diagnosed most Windows `?` NAME rows as resolvable without elevation; its proposed fix (switch `OpenProcess`'s query right) turned out to already be shipping since v0.2.2 and insufficient — a live test showed both rights fail identically against `dwm.exe`/`csrss.exe`. The real fix, `CreateToolhelp32Snapshot`, reads process names from a system-wide enumeration with no per-process handle and collapses most former `?` rows to real names; what remains renders as an honest `[exited]` or `[protected]` instead of an anonymous `?`. `hmn ps --sort vram`/`committed` round out the release as aliases for `--sort dedicated`. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.8.md`](docs/roadmap-v0.2.8.md).
 
 > 🚀 **`0.2.7` adds `hmn watch --follow-new` and `hmn ps --sort`.** A candle-mi dogfooding report ran `hmn watch` alongside 19 sequential `cargo test` processes — the adapter-level spill detection was flawless (three real episodes, one a fast Mistral-7B spike candle-mi's own wall-clock heuristic had missed), but the auto-selected PID set froze at attach, so none of the processes that actually caused the spills were ever attributed. `--follow-new` re-runs top-N selection every interval instead of once: a PID entering starts fresh, a PID leaving is *finalized* into the closing summary instead of rendering `0` forever. A companion request from the same suite: `hmn ps --sort <dedicated|shared|total>`, sharing one comparator with `hmn watch`'s auto-selection so the two can't drift apart. Both off by default / pre-v0.2.7-compatible; no library-surface change. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/roadmap-v0.2.7.md`](docs/roadmap-v0.2.7.md).
-
-> 🚀 **`0.2.6` adds `hmn watch` — attach to a job that's already running.** `hmn spill` only wraps a *new* command; a rhyme-mdlm dogfooding report hit that wall three times triaging a 15-hour training campaign, hand-rolling "two `hmn ps` samples minutes apart, diff by eye" every time. `hmn watch [PID...]` (or auto-select the top `--top` by committed VRAM with no PID given) samples the same `SpillTracker` core on a timer, printing one row per watched PID per interval — committed/shared VRAM, deltas, and a live SPILL flag — until `--duration` elapses or Ctrl+C. A `time(1)`-style scrolling sampler, not a TUI, same discipline as `hmn spill`. Exit code conveys whether spill was observed (`0`/`1`/`2`) for scripts and watchdogs; `--json` streams JSON Lines. Windows-only measurement like `hmn spill` (`WDDM` is what `hmn watch` reads); other platforms still show real per-PID VRAM deltas, just no SPILL flag. Live-validated against the same forced-spill fixture that shipped v0.2.5. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/roadmap-v0.2.6.md`](docs/roadmap-v0.2.6.md), and the [watch tutorial](docs/tutorials/watching-a-running-job.md).
 
 ## Table of Contents
 
@@ -93,6 +93,11 @@ fn main() -> Result<(), hypomnesis::HypomnesisError> {
             let reserved_mib = reserved as f64 / (1u64 << 20) as f64;
             println!("  ({:.0} MiB reserved)", reserved_mib);
         }
+        // NVIDIA-branded driver string (e.g. "610.88") from NVML or the
+        // `nvidia-smi` fallback — not the Windows PnP driver-store form.
+        if let Some(driver) = &dev.driver_version {
+            println!("  driver {driver}");
+        }
     }
 
     if let Some(proc_gpu) = snap.gpu {
@@ -111,6 +116,7 @@ Expected output (RTX 5060 Ti, Windows, idle process):
 RAM: 142475264 bytes
 GPU 0 [NVIDIA GeForce RTX 5060 Ti]: 1.8 / 15.9 GiB used
   (259 MiB reserved)
+  driver 610.88
 This process: 119 MiB (per-process)
 ```
 
@@ -120,7 +126,10 @@ Real transcripts from the reference machine (Ryzen 9 5950X + RTX 5060 Ti 16 GiB,
 
 ```
 $ hmn                                     # what's on the card?
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved), driver 610.88
+
+$ hmn --json                              # same data, scriptable
+[{"index":0,"name":"NVIDIA GeForce RTX 5060 Ti","total_bytes":17103323136,"free_bytes":14967820288,"used_bytes":2135502848,"reserved_bytes":271581184,"driver_version":"610.88"}]
 
 $ hmn ps                                  # who's holding it? (top rows shown)
 PID    NAME                 VRAM     SHARED  DEVICE
@@ -182,6 +191,7 @@ Four subcommands:
 
 ```sh
 hmn                          # device summary (free / total per GPU)
+hmn --json                   # same data as a JSON array
 hmn ps                       # all GPU processes — discovery command
 hmn ps --pid 12345           # filter to one PID
 hmn ps --device 0            # filter to one GPU on multi-GPU rigs
@@ -198,10 +208,12 @@ hmn watch --follow-new --json # re-select every interval: stand guard over a mac
 Example default output (single NVIDIA dGPU, the maintainer's reference machine — Ryzen 9 5950X has no iGPU, so only one adapter surfaces):
 
 ```
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved), driver 610.88
 ```
 
 The `(259 MiB reserved)` parenthetical (NVML R510+) is the driver/firmware carve-out *within* the 16311 MiB total — matching `nvidia-smi -q -d MEMORY`'s `Reserved` line. It is elided on backends that don't expose it (DXGI, `nvidia-smi`, Metal, pre-R510).
+
+The `, driver 610.88` suffix is the NVIDIA-branded driver version — from NVML (`nvmlSystemGetDriverVersion`) or the `nvidia-smi` fallback (`--query-gpu=driver_version`); elided on backends that don't expose it (DXGI, Metal, non-NVIDIA adapters). This is the same version string `nvidia-smi`, release notes, and bug reports use — **not** the Windows PnP driver-store form (e.g. `32.0.16.1088`), which NVML/`nvidia-smi` don't expose.
 
 Apple Silicon, idle process (Apple M3 Pro, 36 GiB unified memory):
 
@@ -214,11 +226,11 @@ The `free` figure here is `MTLDevice.recommendedMaxWorkingSetSize` — the kerne
 Illustrative output on a *heterogeneous* machine (NVIDIA dGPU + Intel/AMD iGPU on Windows). Not yet verified end-to-end on real hardware — see [`docs/roadmap-v0.2.0.md`](docs/roadmap-v0.2.0.md) "Verification plan":
 
 ```
-GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved)
+GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 13284 MiB / 16311 MiB (259 MiB reserved), driver 610.88
 GPU 1 [Intel Iris Xe Graphics]: free 32768 MiB / 32768 MiB
 ```
 
-(The Intel iGPU line has no reserved parenthetical — `DXGI` does not expose the NVML carve-out, so `reserved_bytes` is `None` there.)
+(The Intel iGPU line has no reserved parenthetical or driver suffix — `DXGI` does not expose the NVML carve-out or an NVIDIA driver string, so `reserved_bytes` and `driver_version` are both `None` there.)
 
 `hmn ps` (illustrative — empty on machines with no active CUDA workload):
 
@@ -404,6 +416,7 @@ Same discipline, same answer (recorded here so it isn't re-argued in a future PR
 | Process RSS | `K32GetProcessMemoryInfo` | `/proc/self/status` (no `unsafe`) | `task_info(TASK_VM_INFO_PURGEABLE).phys_footprint` |
 | Device-wide GPU memory | `NVML` (`nvml.dll`) | `NVML` (`libnvidia-ml.so.1`) | `sysctl hw.memsize` (total) + `MTLDevice.recommendedMaxWorkingSetSize` (free) |
 | Device reserved memory | `NVML` v2 (`nvmlDeviceGetMemoryInfo_v2`, R510+) | `NVML` v2 (R510+) | n/a (`None` — UMA has no carve-out) |
+| Driver version | `NVML` (`nvmlSystemGetDriverVersion`) + `nvidia-smi` fallback (`--query-gpu=driver_version`) | same as Windows | n/a (`None` — no NVIDIA driver on Apple Silicon) |
 | Per-process GPU memory | `DXGI` (`IDXGIAdapter3::QueryVideoMemoryInfo`) | `NVML` (`nvmlDeviceGetComputeRunningProcesses`) | `ledger(LEDGER_ENTRY_INFO_V2).graphics_footprint` |
 | GPU-process listing (other PIDs) | `PDH` (`\GPU Process Memory(*)\Dedicated Usage` + `Shared Usage`) + `OpenProcess` / `QueryFullProcessImageNameW`; `nvidia-smi` fallback | `NVML` + `/proc/<pid>/comm` (compute-only) | `proc_listpids` + per-PID `ledger` + `proc_pidpath` (same-user; `sudo` for cross-user) |
 | Spill detection (`SpillTracker`, `hmn spill`, `hmn watch`) | `PDH` `\GPU Adapter Memory(*)\Dedicated Usage` + `Shared Usage` (`WDDM 2.0`+) | n/a (`is_spill_measurable()` = `false` — normal `CUDA` OOMs rather than silently paging) | n/a (`false` — `UMA` has nothing to spill *into*) |
@@ -453,7 +466,7 @@ Two consequences worth noting:
 
 ## Used by
 
-- [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove v0.2.4's `reserved_bytes` addition. Its `scripts/resurrect.ps1` oracle suite is a load-bearing `hmn spill --json` / `hmn watch` consumer and the source of the v0.2.7 `--follow-new` / `ps --sort` dogfooding report.
+- [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) — mechanistic-interpretability toolkit for `candle`. As of **v0.1.16** it deletes its in-tree measurement FFI and delegates `src/memory.rs` to `hypomnesis` (lean feature set: `nvml`, `dxgi`, `nvidia-smi-fallback`, `metal`), flattening a `hypomnesis::Snapshot` into its own `MemorySnapshot`. Its v0.1.16 dogfooding report — live-validated on an `RTX 5060 Ti` (16 GiB, Windows / `WDDM`) — drove v0.2.4's `reserved_bytes` addition. Its `resurrect.ps1` verification pipeline's live-caught `DPC_WATCHDOG_VIOLATION` bugcheck drove v0.2.9's `driver_version` addition, so the pipeline's provenance record can stamp the GPU driver alongside the Rust toolchain. Its `scripts/resurrect.ps1` oracle suite is a load-bearing `hmn spill --json` / `hmn watch` consumer and the source of the v0.2.7 `--follow-new` / `ps --sort` dogfooding report.
 - [hf-fetch-model](https://github.com/mi-for-the-rust-of-us/hf-fetch-model) — Hugging Face model weights and metadata fetcher (uses `device_info` for `inspect --check-gpu`)
 
 ## License

@@ -183,6 +183,7 @@ mod tests {
                 free_bytes: total.saturating_sub(vram_used.unwrap_or(0)),
                 used_bytes: vram_used.unwrap_or(0),
                 reserved_bytes: None,
+                driver_version: None,
             }),
         }
     }

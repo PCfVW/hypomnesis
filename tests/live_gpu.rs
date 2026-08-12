@@ -81,6 +81,23 @@ fn device_info_reserved_bytes_is_plausible_when_present() {
 #[test]
 #[ignore = "requires NVIDIA GPU + driver"]
 #[allow(clippy::expect_used)]
+fn device_info_driver_version_is_plausible_when_present() {
+    let info = device_info(0).expect("device_info(0) requires NVIDIA GPU + driver");
+    // `driver_version` is `Some` on the NVML and nvidia-smi paths. When
+    // present, it's the NVIDIA-branded version string (e.g. "591.86"),
+    // never empty and always containing at least one digit.
+    if let Some(version) = info.driver_version {
+        assert!(!version.is_empty(), "driver_version was Some(\"\")");
+        assert!(
+            version.chars().any(|c| c.is_ascii_digit()),
+            "driver_version={version:?} (expected at least one digit)"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + driver"]
+#[allow(clippy::expect_used)]
 fn snapshot_now_returns_ram_and_gpu_device() {
     let snap = Snapshot::now(0).expect("Snapshot::now failed");
     assert!(snap.ram_bytes > 0);

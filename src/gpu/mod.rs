@@ -114,6 +114,8 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
                 .saturating_sub(d.recommended_max_working_set),
             // Apple UMA exposes no driver/firmware carve-out figure.
             reserved_bytes: None,
+            // macOS has no NVIDIA driver.
+            driver_version: None,
         });
     }
 
@@ -134,6 +136,8 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             // total/free/used above stay the v1, `nvidia-smi`-consistent
             // figures regardless.
             reserved_bytes: snap.reserved_bytes,
+            // From nvmlSystemGetDriverVersion, read in the same NVML session.
+            driver_version: snap.driver_version,
         });
     }
 
@@ -149,6 +153,8 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             used_bytes: d.current_usage,
             // DXGI does not expose the NVML driver/firmware reservation.
             reserved_bytes: None,
+            // DXGI exposes no NVIDIA-branded driver version string.
+            driver_version: None,
         });
     }
 
@@ -164,6 +170,9 @@ pub fn device_info(index: u32) -> Result<GpuDeviceInfo> {
             // `nvidia-smi --query-gpu=memory.total` already reports the
             // usable figure; it has no separate reserved column.
             reserved_bytes: None,
+            // Unlike reserved_bytes, nvidia-smi CAN supply this (a
+            // `driver_version` column on the same --query-gpu call).
+            driver_version: result.driver_version,
         });
     }
 
@@ -274,6 +283,8 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
                     used_bytes,
                     // Non-NVIDIA DXGI adapters have no NVML reserved figure.
                     reserved_bytes: None,
+                    // Not an NVIDIA adapter — no NVIDIA driver version.
+                    driver_version: None,
                 },
                 ProcessGpuInfo {
                     used_bytes,

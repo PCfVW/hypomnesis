@@ -7,9 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-08-12
+
+> *The same total. Now with the driver behind it.*
+
+Adds `GpuDeviceInfo::driver_version: Option<String>` — the NVIDIA-branded
+driver string (e.g. `"610.88"`), mirroring v0.2.4's `reserved_bytes`
+addition. Driven by a `candle-mi` dogfooding report: its provenance log
+stamps the Rust toolchain per verification run but not the GPU driver, and
+a driver change can move floating-point results.
+
 ### Fixed
 
 - **The `Used by` entry for `hf-fetch-model` pointed at the pre-transfer URL** (`README.md`). v0.2.7 corrected hypomnesis's own `repository` / `homepage` metadata on transfer to the `mi-for-the-rust-of-us` org but left this sibling link behind. Historical `CHANGELOG` and per-release roadmap entries are deliberately left as written.
+
+### Added
+
+- **`GpuDeviceInfo::driver_version: Option<String>`** (`src/snapshot.rs`) — new field on the `#[non_exhaustive]` struct. `Some` on the `NVML` and `nvidia-smi` paths; `None` on `DXGI`-alone, non-NVIDIA `DXGI` adapters, and `Metal` (macOS has no NVIDIA driver).
+- **`nvmlSystemGetDriverVersion` query** (`src/gpu/nvml.rs`) — new `read_driver_version` helper, read once per `query()` session from the already-open `NVML` library (system-level, not device-scoped — the same driver serves every device index). Best-effort: symbol-lookup or call failure maps to `None`, same policy as `reserved_bytes`.
+- **`nvidia-smi` fallback also supplies `driver_version`** (`src/gpu/nvidia_smi.rs`) — unlike `reserved_bytes`, `nvidia-smi` genuinely has this figure (`--query-gpu=memory.used,memory.total,driver_version`, one extra CSV column on the existing device-wide query, no second subprocess). CSV parsing extracted into a testable `parse_query_line` function.
+- **`GpuDeviceInfoBuilder::driver_version`** setter (`src/snapshot.rs`, `test-helpers` feature) — defaults to `None`, mirroring the other optional setters.
+- **`hmn` device summary renders the driver version** — `GPU 0 [NVIDIA GeForce RTX 5060 Ti]: free 14274 MiB / 16311 MiB (259 MiB reserved), driver 610.88`. Elided on backends that report `None`, so the line is unchanged where no driver string exists.
+- **`hmn --json`** (new flag on the default, no-subcommand device summary) — emits the same per-GPU data as a JSON array instead of text: `{"index":N,"name":<string|null>,"total_bytes":N,"free_bytes":N,"used_bytes":N,"reserved_bytes":<number|null>,"driver_version":<string|null>}`. The dogfooding report assumed this surface already existed for the summary subcommand; it didn't, so this release adds it. Combining it with a subcommand (`hmn --json ps`) is a hard error (exit `2`) rather than silently applying to the summary or being dropped — each subcommand has its own `--json`.
+- **`tests/live_gpu.rs::device_info_driver_version_is_plausible_when_present`** — live integration test asserting the driver string is non-empty and contains at least one digit when present. `#[ignore]`-gated like the other live-GPU tests.
 
 ## [0.2.8] - 2026-08-04
 

@@ -26,21 +26,28 @@ pub(super) struct NvidiaSmiResult {
     pub used_bytes: u64,
     /// Total dedicated memory on the device in bytes.
     pub total_bytes: u64,
+    /// NVIDIA driver version string, in the NVIDIA-branded form (e.g.
+    /// `"610.88"`), from the `driver_version` query field. `None` when
+    /// the field is empty after trimming.
+    pub driver_version: Option<String>,
 }
 
-/// Query `nvidia-smi` for device-wide memory at adapter index `idx`.
+/// Query `nvidia-smi` for device-wide memory (and driver version) at
+/// adapter index `idx`.
 ///
 /// Returns `Some(NvidiaSmiResult)` on success; `None` if `nvidia-smi`
 /// could not be spawned, exited non-zero, or produced unparseable
 /// output.
 ///
-/// `nvidia-smi` reports in `MiB`; values are converted to bytes via
-/// saturating multiplication (overflow at the `u64` ceiling is
-/// physically unreachable but defended against anyway).
+/// `nvidia-smi` reports memory in `MiB`; values are converted to bytes
+/// via saturating multiplication (overflow at the `u64` ceiling is
+/// physically unreachable but defended against anyway). `driver_version`
+/// rides along on the same `--query-gpu=` call — one extra CSV column,
+/// no second subprocess spawn.
 pub(super) fn query(idx: u32) -> Option<NvidiaSmiResult> {
     let cmd_result = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=memory.used,memory.total",
+            "--query-gpu=memory.used,memory.total,driver_version",
             "--format=csv,noheader,nounits",
         ])
         .arg(format!("--id={idx}"))
@@ -88,11 +95,27 @@ pub(super) fn query(idx: u32) -> Option<NvidiaSmiResult> {
         eprintln!("[nvidia-smi debug] empty stdout for idx={idx}");
         return None;
     };
+
+    parse_query_line(line_raw, idx)
+}
+
+/// Parse one `--query-gpu=memory.used,memory.total,driver_version` CSV
+/// line into a [`NvidiaSmiResult`].
+///
+/// `used`/`total` are mandatory — a parse failure on either fails the
+/// whole result, same as before this field was added. `driver_version`
+/// is non-fatal: missing or empty after trimming maps to `None` rather
+/// than failing the query (an unexpectedly old `nvidia-smi` that omits
+/// the third field still yields a usable memory reading). Extracted for
+/// unit-testability, mirroring [`parse_compute_app_line`] below.
+#[cfg_attr(not(feature = "debug-output"), allow(unused_variables))]
+fn parse_query_line(line_raw: &str, idx: u32) -> Option<NvidiaSmiResult> {
     let line = line_raw.trim();
 
     let mut parts = line.split(',');
     let used_str = parts.next().map(str::trim)?;
     let total_str = parts.next().map(str::trim)?;
+    let driver_str = parts.next().map(str::trim);
 
     let used_mb: u64 = match used_str.parse() {
         Ok(v) => v,
@@ -119,15 +142,21 @@ pub(super) fn query(idx: u32) -> Option<NvidiaSmiResult> {
     let used_bytes = used_mb.saturating_mul(1_048_576);
     let total_bytes = total_mb.saturating_mul(1_048_576);
 
+    // BORROW: explicit to_owned — driver_str borrows from `line_raw`
+    // (itself borrowed from the caller's stdout buffer); the returned
+    // result must own its driver string.
+    let driver_version = driver_str.filter(|s| !s.is_empty()).map(str::to_owned);
+
     #[cfg(feature = "debug-output")]
     eprintln!(
         "[nvidia-smi debug] idx={idx}: used={used_mb}MiB total={total_mb}MiB \
-         ({used_bytes} / {total_bytes} bytes)"
+         ({used_bytes} / {total_bytes} bytes) driver={driver_version:?}"
     );
 
     Some(NvidiaSmiResult {
         used_bytes,
         total_bytes,
+        driver_version,
     })
 }
 
@@ -302,6 +331,45 @@ fn parse_compute_app_line(line_raw: &str, idx: u32) -> Option<ComputeApp> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_query_line_basic() {
+        let r = parse_query_line("1024, 16384, 610.88", 0).unwrap();
+        assert_eq!(r.used_bytes, 1024 * 1_048_576);
+        assert_eq!(r.total_bytes, 16384 * 1_048_576);
+        assert_eq!(r.driver_version.as_deref(), Some("610.88"));
+    }
+
+    #[test]
+    fn parse_query_line_empty_driver() {
+        // An unexpectedly old `nvidia-smi` that echoes an empty third
+        // field degrades to None rather than failing the whole result.
+        let r = parse_query_line("1024, 16384, ", 0).unwrap();
+        assert_eq!(r.used_bytes, 1024 * 1_048_576);
+        assert_eq!(r.total_bytes, 16384 * 1_048_576);
+        assert_eq!(r.driver_version, None);
+    }
+
+    #[test]
+    fn parse_query_line_missing_driver_field() {
+        // Only two fields present (as if driver_version weren't
+        // requested at all): used/total still parse; driver_version is
+        // None rather than failing the whole result.
+        let r = parse_query_line("1024, 16384", 0).unwrap();
+        assert_eq!(r.used_bytes, 1024 * 1_048_576);
+        assert_eq!(r.total_bytes, 16384 * 1_048_576);
+        assert_eq!(r.driver_version, None);
+    }
+
+    #[test]
+    fn parse_query_line_unparseable_used() {
+        assert!(parse_query_line("notanumber, 16384, 610.88", 0).is_none());
+    }
+
+    #[test]
+    fn parse_query_line_unparseable_total() {
+        assert!(parse_query_line("1024, notanumber, 610.88", 0).is_none());
+    }
 
     #[test]
     fn parse_compute_app_basic() {

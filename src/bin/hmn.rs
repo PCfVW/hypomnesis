@@ -8,7 +8,8 @@
 //! - `hmn` (default) — one line per visible GPU with free / total `VRAM`.
 //!   Uses [`hypomnesis::Snapshot::all`], so on Windows the AMD / Intel
 //!   `iGPU` surfaces alongside the NVIDIA dGPU(s); on macOS the Apple
-//!   Silicon `SoC` surfaces as a single `UMA` device.
+//!   Silicon `SoC` surfaces as a single `UMA` device. `--json` emits the
+//!   same data as a JSON array instead of text.
 //! - `hmn ps` — list processes holding GPU memory across one or all
 //!   visible devices. On Linux (`NVML`) the list is compute-only; on
 //!   Windows (`PDH`, `WDDM 2.0`+) the list includes every GPU memory
@@ -53,7 +54,9 @@ use hypomnesis::{
     about = "GPU memory CLI: device summary (default) + GPU-process listing (`hmn ps`).",
     long_about = "GPU memory CLI for hypomnesis.\n\
                   \n\
-                  Default subcommand: prints one line per visible GPU with free / total VRAM.\n\
+                  Default subcommand: prints one line per visible GPU with free / total VRAM. \
+                  `--json` emits the same data as a JSON array instead (fields: index, name, \
+                  total_bytes, free_bytes, used_bytes, reserved_bytes, driver_version).\n\
                   \n\
                   `hmn ps`: lists processes holding GPU memory.\n\
                   \n\
@@ -118,6 +121,16 @@ struct Cli {
     /// Subcommand. Omitted for the default device-summary view.
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Emit the default device-summary view as a JSON array instead of
+    /// text. Only meaningful with no subcommand — each subcommand
+    /// (`ps`/`spill`/`watch`) already has its own `--json`, and combining
+    /// this with one (e.g. `hmn --json ps`) is a hard error (exit `2`)
+    /// rather than being silently ignored. One object per visible GPU:
+    /// `index` (number), `name` (string or null),
+    /// `total_bytes`/`free_bytes`/`used_bytes` (numbers), `reserved_bytes`
+    /// (number or null), `driver_version` (string or null).
+    #[arg(long)]
+    json: bool,
 }
 
 /// Subcommand tree for `hmn`.
@@ -268,8 +281,22 @@ enum Commands {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    // `--json` before a subcommand parses cleanly (clap has no opinion on
+    // the combination) but would otherwise be silently dropped: only the
+    // `None` arm below reads `cli.json`, so `hmn --json ps` would print
+    // plain text with no warning — a script relying on `--json` landing
+    // wherever it's typed would silently get prose instead of JSON.
+    // Reject the combination loudly instead, same "hard error, exit 2"
+    // convention as `watch --follow-new` + explicit PIDs below.
+    if cli.json && cli.command.is_some() {
+        eprintln!(
+            "hmn: --json before a subcommand is ignored, not applied — each subcommand has \
+             its own --json (e.g. `hmn ps --json`, not `hmn --json ps`)"
+        );
+        return std::process::ExitCode::from(2);
+    }
     let outcome = match cli.command {
-        None => run_summary(),
+        None => run_summary(cli.json),
         Some(Commands::Ps {
             pid,
             device,
@@ -310,9 +337,18 @@ fn main() -> std::process::ExitCode {
 // Summary subcommand
 // -----------------------------------------------------------------------------
 
-/// Run the default subcommand: print one line per visible GPU.
-fn run_summary() -> Result<()> {
+/// Run the default subcommand: print one line per visible GPU (or, with
+/// `--json`, a JSON array).
+fn run_summary(json: bool) -> Result<()> {
     let snaps = Snapshot::all()?;
+    if json {
+        // Unlike the text path below, the empty case still emits `[]\n`
+        // rather than a friendly message — machine-readable output stays
+        // machine-readable regardless of device count, matching
+        // `format_ps_json`'s empty-input behavior.
+        print!("{}", format_summary_json(&snaps));
+        return Ok(());
+    }
     if snaps.is_empty() {
         println!("hmn: no visible GPUs.");
         return Ok(());
@@ -349,15 +385,62 @@ fn format_summary(snaps: &[Snapshot]) -> String {
         let reserved_suffix = dev.reserved_bytes.map_or(String::new(), |r| {
             format!(" ({} MiB reserved)", bytes_to_mib(r))
         });
+        // NVIDIA driver version (NVML or nvidia-smi fallback). Elided on
+        // backends that don't expose an NVIDIA driver string (DXGI,
+        // Metal, non-NVIDIA adapters).
+        let driver_suffix = dev
+            .driver_version
+            .as_deref()
+            .map_or(String::new(), |v| format!(", driver {v}"));
         // `writeln!` into a String never fails — the writes-to-String
         // impl returns Ok(()). Same for every other write!/writeln! in
         // this file.
         let _ = writeln!(
             out,
-            "GPU {}{name_suffix}: free {free_mib} MiB / {total_mib} MiB{reserved_suffix}",
+            "GPU {}{name_suffix}: free {free_mib} MiB / {total_mib} MiB{reserved_suffix}{driver_suffix}",
             dev.index,
         );
     }
+    out
+}
+
+/// Format the device summary as a JSON array, one object per snapshot
+/// that has a populated `gpu_device` (mirrors [`format_summary`]'s
+/// skip rule for snapshots without one). Hand-rolled (no `serde` dep —
+/// same policy as [`format_ps_json`]). Each object:
+/// `{"index":N,"name":<string|null>,"total_bytes":N,"free_bytes":N,"used_bytes":N,"reserved_bytes":<number|null>,"driver_version":<string|null>}`.
+/// String values are JSON-escaped via [`json_escape`].
+#[allow(clippy::missing_panics_doc)] // writes to a String; cannot fail in practice
+fn format_summary_json(snaps: &[Snapshot]) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for snap in snaps {
+        let Some(dev) = &snap.gpu_device else {
+            continue;
+        };
+        if first {
+            first = false;
+        } else {
+            out.push(',');
+        }
+        let name_json = dev.name.as_deref().map_or_else(
+            || String::from("null"),
+            |n| format!("\"{}\"", json_escape(n)),
+        );
+        let reserved_json = dev
+            .reserved_bytes
+            .map_or_else(|| "null".to_owned(), |r| r.to_string());
+        let driver_json = dev.driver_version.as_deref().map_or_else(
+            || String::from("null"),
+            |v| format!("\"{}\"", json_escape(v)),
+        );
+        let _ = write!(
+            out,
+            r#"{{"index":{},"name":{name_json},"total_bytes":{},"free_bytes":{},"used_bytes":{},"reserved_bytes":{reserved_json},"driver_version":{driver_json}}}"#,
+            dev.index, dev.total_bytes, dev.free_bytes, dev.used_bytes,
+        );
+    }
+    out.push_str("]\n");
     out
 }
 
@@ -2140,6 +2223,28 @@ mod tests {
     #[test]
     fn format_summary_empty_input() {
         assert_eq!(format_summary(&[]), "");
+    }
+
+    #[test]
+    fn format_summary_json_empty_input() {
+        // Unlike format_summary's "" on empty input, the JSON formatter
+        // always emits a parseable array — mirrors format_ps_json's
+        // empty-input behavior ("[]\n").
+        assert_eq!(format_summary_json(&[]), "[]\n");
+    }
+
+    #[test]
+    fn top_level_json_before_subcommand_parses_clean() {
+        // clap itself has no opinion on this combination — `main` rejects
+        // it at runtime (exit code 2, verified live/manually, not here:
+        // it's a hard-error path before dispatch, same shape as
+        // `watch_args_follow_new_with_explicit_pids_parses_clean` above).
+        // This test only pins down that clap parsing itself doesn't
+        // reject `hmn --json ps` — it has to reach `main`'s dispatch to
+        // be caught.
+        let cli = Cli::try_parse_from(["hmn", "--json", "ps"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Commands::Ps { .. })));
     }
 
     // --- format_ps_summary (stderr count line) ---

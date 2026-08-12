@@ -71,6 +71,10 @@ const NVML_MAX_PROCESSES: usize = 64;
 /// Buffer size for `nvmlDeviceGetName`, per NVIDIA's `NVML_DEVICE_NAME_V2_BUFFER_SIZE`.
 const NVML_DEVICE_NAME_BUFFER_SIZE: usize = 96;
 
+/// Buffer size for `nvmlSystemGetDriverVersion`, per NVIDIA's
+/// `NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE`.
+const NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE: usize = 80;
+
 /// Per-process GPU memory info returned by `NVML`.
 ///
 /// Matches the C struct `nvmlProcessInfo_v2_t` (24 bytes) used by
@@ -185,6 +189,13 @@ type NvmlDeviceGetCountFn = unsafe extern "C" fn(*mut u32) -> u32;
 /// Function signature: `nvmlDeviceGetName(device, *name, length)`.
 type NvmlDeviceGetNameFn = unsafe extern "C" fn(NvmlDevice, *mut std::ffi::c_char, u32) -> u32;
 
+/// Function signature: `nvmlSystemGetDriverVersion(*version, length)`.
+///
+/// System-level, unlike every other function alias above: no device
+/// handle parameter. The same driver serves every GPU index on the
+/// machine.
+type NvmlSystemGetDriverVersionFn = unsafe extern "C" fn(*mut std::ffi::c_char, u32) -> u32;
+
 /// Combined result of a single `NVML` query for a given device index.
 ///
 /// Returned by [`query`].
@@ -213,6 +224,11 @@ pub(super) struct NvmlQueryResult {
     /// e.g. `"NVIDIA GeForce RTX 5060 Ti"`.
     /// `None` when the name query fails.
     pub device_name: Option<String>,
+    /// NVIDIA driver version string, in the NVIDIA-branded form (e.g.
+    /// `"610.88"`), from `nvmlSystemGetDriverVersion`. System-level, not
+    /// device-scoped — the same value regardless of `idx`.
+    /// `None` when the query fails.
+    pub driver_version: Option<String>,
 }
 
 /// Run a single `NVML` query session for the given device index.
@@ -297,6 +313,10 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
     // stay `nvidia-smi`-consistent regardless.
     let reserved_bytes = read_device_reserved(&lib, device);
 
+    // Driver version (best-effort, additive, system-level). Read from the
+    // already-open `lib`; independent of the device handle.
+    let driver_version = read_driver_version(&lib);
+
     // Per-process query (best-effort; can fail under WDDM as NVML_VALUE_NOT_AVAILABLE).
     let process_used_bytes = read_process_used(&get_processes, device, mem_info.total);
 
@@ -305,13 +325,15 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
 
     #[cfg(feature = "debug-output")]
     eprintln!(
-        "[NVML debug] device {idx}: total={} free={} used={} reserved={:?} per_process={:?} name={:?}",
+        "[NVML debug] device {idx}: total={} free={} used={} reserved={:?} per_process={:?} \
+         name={:?} driver={:?}",
         mem_info.total,
         mem_info.free,
         mem_info.used,
         reserved_bytes,
         process_used_bytes,
-        device_name
+        device_name,
+        driver_version
     );
 
     Some(NvmlQueryResult {
@@ -321,6 +343,7 @@ pub(super) fn query(idx: u32) -> Option<NvmlQueryResult> {
         device_used: mem_info.used,
         reserved_bytes,
         device_name,
+        driver_version,
     })
 }
 
@@ -410,6 +433,50 @@ fn read_device_reserved(lib: &libloading::Library, device: NvmlDevice) -> Option
     }
 
     Some(mem_v2.reserved)
+}
+
+/// Read the NVIDIA driver version via `nvmlSystemGetDriverVersion`.
+///
+/// System-level (not device-scoped) — the same driver serves every
+/// device index on the machine, so this is read once per [`query`]
+/// session from the already-open `lib`, independent of any device
+/// handle. Returns `None` on symbol-lookup failure, call failure, or an
+/// empty string. Caller must already hold an initialized `NVML`.
+#[allow(unsafe_code)]
+fn read_driver_version(lib: &libloading::Library) -> Option<String> {
+    // SAFETY: symbol lookup for nvmlSystemGetDriverVersion. The name
+    // matches the documented NVML C API and the signature alias matches
+    // the header (buffer + length, no device handle). Absence of the
+    // symbol (unexpected — this call predates NVML versioning) is
+    // mapped to None via `.ok()?`, same policy as read_device_reserved.
+    let get_driver_version: libloading::Symbol<'_, NvmlSystemGetDriverVersionFn> =
+        unsafe { lib.get(b"nvmlSystemGetDriverVersion\0") }.ok()?;
+
+    let mut version_buf = [0_u8; NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
+    // CAST: usize → u32, NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE = 80 fits in u32
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let len = NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE as u32;
+    // SAFETY: nvmlSystemGetDriverVersion writes a null-terminated UTF-8 C
+    // string into version_buf, up to `len` bytes. The buffer is
+    // stack-allocated and sized per NVIDIA's
+    // NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE.
+    let ret =
+        unsafe { get_driver_version(version_buf.as_mut_ptr().cast::<std::ffi::c_char>(), len) };
+    if ret != NVML_SUCCESS {
+        #[cfg(feature = "debug-output")]
+        eprintln!("[NVML debug] nvmlSystemGetDriverVersion returned {ret}");
+        return None;
+    }
+    let nul_pos = version_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(version_buf.len());
+    // BORROW: explicit String::from_utf8_lossy + into_owned — version_buf
+    // is stack-local; we need an owned String to return.
+    version_buf
+        .get(..nul_pos)
+        .map(|slice| String::from_utf8_lossy(slice).into_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Read this process's per-process VRAM via

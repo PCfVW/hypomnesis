@@ -264,15 +264,21 @@ const _: fn() = || {
 /// Returns `None` if `MTLCreateSystemDefaultDevice` returns `nil`. The
 /// caller (in [`query`]) falls back to the total physical DRAM in that
 /// case — that's the conservative upper bound on what the GPU can hold.
+///
+/// `redundant_closure` is a false positive on the `get_or_init` call
+/// below: `MTLCreateSystemDefaultDevice` is declared `extern "C-unwind"`,
+/// which does not implement `FnOnce()` — passing the bare function item
+/// (clippy's suggested simplification) fails to compile with E0277
+/// ("expected a `FnOnce()` closure, found `extern "C-unwind" fn()...`"),
+/// confirmed live against the real `aarch64-apple-darwin` target. The
+/// closure is required, not redundant.
+#[allow(clippy::redundant_closure)]
 fn recommended_max_working_set_size() -> Option<u64> {
     // objc2-metal's bindings expose this property as a safe method; no
     // `unsafe` block is required at the call site. The trait import is
     // necessary because the method is a trait method, not an inherent.
     use objc2_metal::MTLDevice;
     METAL_DEVICE
-        // `MTLCreateSystemDefaultDevice` is declared `extern "C-unwind"`
-        // and doesn't coerce to a closure type; wrap in `||` so
-        // `get_or_init` accepts it.
         .get_or_init(|| objc2_metal::MTLCreateSystemDefaultDevice())
         .as_ref()
         .map(|d| d.recommendedMaxWorkingSetSize())

@@ -2,7 +2,7 @@
 
 > *Audited, not assumed.*
 
-**Status: implemented and locally verified 2026-08-17; not yet published.**
+**Status: shipped 2026-08-17.**
 
 ---
 

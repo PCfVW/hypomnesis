@@ -10,15 +10,16 @@ env:
 
 jobs:
   check:
-    # Cross-platform matrix: hypomnesis has Windows-only `dxgi` and
-    # cross-platform `nvml` / `nvidia-smi-fallback` paths; both OSes
-    # must build clean on MSRV (1.88) and stable.
+    # Cross-platform matrix: hypomnesis has Windows-only `dxgi`/`pdh`,
+    # macOS-only `metal`, and cross-platform `nvml` /
+    # `nvidia-smi-fallback` paths; all three OSes must build clean on
+    # MSRV (1.88) and stable.
     name: ${{ matrix.os }} / ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         toolchain: ["1.88", "stable"]
     steps:
       - uses: actions/checkout@v5
@@ -32,6 +33,15 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      # README documents two non-default configurations (bare RSS-only,
+      # and a library-only set with no `clap`/`ctrlc`); check both here
+      # so they can't silently drift from what's advertised.
+      - name: Check (no default features)
+        run: cargo check --no-default-features
+
+      - name: Check (library-only feature set)
+        run: cargo check --no-default-features --features nvml,dxgi,pdh
 
       - name: Clippy (defaults)
         run: cargo clippy --all-targets -- -D warnings

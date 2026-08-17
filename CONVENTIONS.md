@@ -382,7 +382,7 @@ Cargo feature:
 | `report` | `src/report.rs` | v0.1 | none |
 | `debug-output` | (cross-cutting) | v0.1 | none |
 | `test-helpers` | (builders in `src/snapshot.rs`, `src/spill.rs`) | v0.2.1 | none |
-| `cli` | `src/bin/hmn.rs` | v0.2.0 (default-on since v0.2.8) | `clap` |
+| `cli` | `src/bin/hmn.rs` | v0.2.0 (default-on since v0.2.8) | `clap`, `ctrlc` |
 | `rocm` (future) | `src/gpu/rocm.rs` | — | TBD |
 
 Adding a new backend (for a new GPU vendor or new measurement source) is
@@ -399,7 +399,8 @@ a five-step recipe:
 5. Add a new variant to `GpuQuerySource` (the enum is `#[non_exhaustive]`,
    so this is non-breaking) and update the smoke tests.
 
-Default features (`nvml`, `nvidia-smi-fallback`, `dxgi`) cover the
-ecosystem's most common case (NVIDIA on Windows or Linux). Disabling
-defaults yields a nearly empty crate that compiles to almost nothing —
-useful for callers that only want process RSS.
+Default features (`nvml`, `nvidia-smi-fallback`, `dxgi`, `pdh`, `metal`,
+`cli`) cover the ecosystem's most common case (NVIDIA on Windows or
+Linux, Apple Silicon on macOS, plus the `hmn` CLI binary itself).
+Disabling defaults yields a nearly empty crate that compiles to almost
+nothing — useful for callers that only want process RSS.

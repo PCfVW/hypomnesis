@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-08-17
+
+> *Audited, not assumed.*
+
+A full-codebase self-audit — read as a dogfooding report in its own right
+(Principle 1: every patch traces to a real adoption experience, and
+auditing the crate against its own documented conventions is exactly
+that, conducted first-party) — found three gaps sharing one shape:
+silence. `hmn ps` capping silently at 64 processes, a malformed `DXGI`
+adapter silently truncating enumeration, and a partially-broken driver
+stack making `hmn` print nothing (or an indistinguishable `[]`) instead
+of saying so. All three are now honest about what happened; a further
+pass of independent adversarial review closed four more issues in the
+fixes themselves before this release. Full findings:
+[`docs/audits/2026-08-17-codebase-documentation-audit.md`](docs/audits/2026-08-17-codebase-documentation-audit.md).
+
+### Fixed
+
+- **NVML process-listing cap silently truncated `hmn ps` on busy multi-tenant devices** (`src/gpu/nvml.rs`) — `list_compute_processes` now retries with a heap-allocated buffer sized to NVML's own `NVML_ERROR_INSUFFICIENT_SIZE`-reported count when more than 64 compute processes exist, instead of silently keeping only the first 64. The fast-path 64-slot stack buffer is unchanged for the common case (fewer than 64 processes); the retry buffer is defensively capped at 65536 entries against a corrupted/malicious count report. `read_process_used` (the single calling-process lookup inside `query()`) is unaffected — this fix is scoped to the enumeration path `hmn ps` and the library's `gpu_processes()` use. The shared per-row sentinel/sanity filtering was extracted into a new pure `filter_process_rows` helper, gaining unit test coverage for the first time.
+- **`hmn` (no subcommand) could print nothing — or an indistinguishable `[]` — on a partially-broken driver stack** (`src/bin/hmn.rs`) — if `Snapshot::all()` enumerated devices but every `device_info` call failed for them, text mode printed an empty string (indistinguishable from a working, silent success) and `--json` printed a bare `[]` (indistinguishable from genuine zero-device enumeration — `format_summary_json` skips the same unreadable entries `format_summary` does). Text mode now prints `hmn: N GPU(s) enumerated but none readable.`; `--json` prints the same line to stderr (mirroring `hmn ps`'s always-on stderr summary) while keeping the documented `[]` JSON shape on stdout unchanged.
+- **`DXGI` non-NVIDIA adapter enumeration aborted the whole walk on one bad adapter** (`src/gpu/dxgi.rs`) — `enumerate_non_nvidia` and `device_count` now skip past an adapter whose `IDXGIAdapter` cast or `GetDesc` call fails and keep walking, instead of treating it as end-of-enumeration and silently dropping every adapter after it. `EnumAdapters1` failing remains the only true end-of-walk signal.
+
+### Changed
+
+- **CI matrix gains macOS** (`.github/workflows/ci.yml`) — `macos-latest` × `{1.88, stable}` joins the existing Ubuntu/Windows legs; macOS has been a first-class supported platform (`src/gpu/metal.rs`, `tests/macos_smoke.rs`) since v0.2.3 but never compiled in CI before.
+- **CI checks the documented non-default feature combinations** (`.github/workflows/ci.yml`) — `--no-default-features` (bare RSS-only) and the README's documented library-only set (`nvml,dxgi,pdh`, no `cli`) are now compiled on every matrix leg, not just the default and `--all-features` sets.
+- **`publish.yml` verifies the pushed tag matches `Cargo.toml`'s version** before running the release gates, failing fast on a mismatched tag instead of publishing (or confusingly failing) with an unverified version.
+
+### Documentation
+
+- **`hmn --help` and its module doc** (`src/bin/hmn.rs`) — the `?`/elevation Limitations bullets and the `cli`-feature install line still described pre-v0.2.8 behavior (`OpenProcess`-only name resolution, default-off `cli`); rewritten to match shipped v0.2.8 behavior (`Toolhelp32Snapshot` fallback, `[exited]`/`[protected]`/`[kernel]` brackets, `cli` default-on install command).
+- **`hypomnesis::gpu_processes` rustdoc** (`src/gpu/mod.rs`) — the Limitations section still promised `name: None` reaches callers on the Windows `PDH` path; rewritten to match the `GpuProcessEntry::name` field doc's already-correct v0.2.8 contract.
+- **`ROADMAP.md` / `docs/roadmap-v0.2.8.md`** — corrected stale "not yet published" status for v0.2.8 (published 2026-08-04, with v0.2.9 shipped on top of it 2026-08-12); added the missing `docs/roadmap-v0.2.9.md` per-release index row.
+- **`CONVENTIONS.md`** — the closing default-feature-set paragraph and the `cli` backend table row were last updated before `pdh`/`metal`/`cli` joined the default set and before `ctrlc` was added as a `cli` dependency; both corrected.
+- **`HypomnesisError::Io`** (`src/error.rs`) — doc comment now states plainly that this crate never currently constructs it (reserved for a possible future I/O-based backend), instead of silently implying a live error path that doesn't exist.
+
 ## [0.2.9] - 2026-08-12
 
 > *The same total. Now with the driver behind it.*

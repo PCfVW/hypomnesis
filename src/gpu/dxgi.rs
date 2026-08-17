@@ -346,11 +346,25 @@ pub(super) fn enumerate_non_nvidia() -> Vec<DxgiAdapterEntry> {
             break;
         };
         let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
-            break;
+            // A single malformed/unexpected adapter must not abort the
+            // whole walk — skip it and keep enumerating. EnumAdapters1
+            // failing above is the only legitimate end-of-walk signal;
+            // raw_idx must still advance here, or this would spin
+            // forever re-probing the same failing index.
+            #[cfg(feature = "debug-output")]
+            eprintln!(
+                "[DXGI debug] non-nvidia adapter[raw#{raw_idx}]: IDXGIAdapter cast failed, skipping"
+            );
+            raw_idx += 1;
+            continue;
         };
         // SAFETY: GetDesc fills DXGI_ADAPTER_DESC; adapter handle valid.
         let Ok(desc) = (unsafe { adapter.GetDesc() }) else {
-            break;
+            // Same reasoning as the cast failure above: skip, don't abort.
+            #[cfg(feature = "debug-output")]
+            eprintln!("[DXGI debug] non-nvidia adapter[raw#{raw_idx}]: GetDesc failed, skipping");
+            raw_idx += 1;
+            continue;
         };
 
         // CAST: usize → u64, DedicatedVideoMemory and SharedSystemMemory
@@ -439,11 +453,27 @@ pub(super) fn device_count() -> Option<u32> {
             break;
         };
         let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
-            break;
+            // A single malformed/unexpected adapter must not abort the
+            // whole walk — skip it and keep counting. EnumAdapters1
+            // failing above is the only legitimate end-of-walk signal;
+            // raw_idx must still advance here, or this would spin
+            // forever re-probing the same failing index.
+            #[cfg(feature = "debug-output")]
+            eprintln!(
+                "[DXGI debug] device_count: adapter[raw#{raw_idx}]: IDXGIAdapter cast failed, skipping"
+            );
+            raw_idx += 1;
+            continue;
         };
         // SAFETY: GetDesc fills DXGI_ADAPTER_DESC. Adapter handle valid.
         let Ok(desc) = (unsafe { adapter.GetDesc() }) else {
-            break;
+            // Same reasoning as the cast failure above: skip, don't abort.
+            #[cfg(feature = "debug-output")]
+            eprintln!(
+                "[DXGI debug] device_count: adapter[raw#{raw_idx}]: GetDesc failed, skipping"
+            );
+            raw_idx += 1;
+            continue;
         };
         if desc.VendorId == NVIDIA_VENDOR_ID && desc.DedicatedVideoMemory > 0 {
             count += 1;

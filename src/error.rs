@@ -79,7 +79,15 @@ pub enum HypomnesisError {
     )]
     NoGpuSource,
 
-    /// I/O error (e.g., reading `/proc/self/status` on Linux).
+    /// Generic I/O error.
+    ///
+    /// Reserved for a possible future I/O-based backend — this crate
+    /// does not currently construct this variant itself: the one
+    /// existing filesystem read (`/proc/self/status` on Linux) is
+    /// deliberately wrapped into [`Self::Ram`] instead (see
+    /// [`crate::Snapshot::now`]'s `# Errors` section), so downstream
+    /// code should not expect to observe `Io` from this crate's public
+    /// API today.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

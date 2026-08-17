@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `hmn` — GPU memory CLI for `hypomnesis` (built only when the
-//! default-off `cli` feature is enabled).
+//! `hmn` — GPU memory CLI for `hypomnesis`, built via the (since v0.2.8)
+//! default-on `cli` feature.
 //!
 //! Subcommands:
 //!
@@ -32,7 +32,9 @@
 //!   not a TUI, same discipline as `hmn spill`. Exit code conveys whether
 //!   spill was observed during the watch, for scripts/watchdogs.
 //!
-//! Install with `cargo install hypomnesis --features cli`.
+//! Install with `cargo install hypomnesis` (the `cli` feature is
+//! default-on since v0.2.8; `--features cli` is still accepted but
+//! redundant).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -88,21 +90,27 @@ use hypomnesis::{
                   column. A benign baseline (staging/upload heaps) is normal; growth while \
                   dedicated VRAM saturates is spill. Always 0 on Linux and macOS (no \
                   shared-residency counter exists there).\n\
-                  - `?` in the NAME column on Windows means the calling user cannot resolve \
-                  the process's name via `OpenProcess`. Most cases (system services, \
-                  other-user processes like `dwm.exe`, `csrss.exe`) resolve when `hmn ps` \
-                  is run as Administrator. The Windows kernel itself (PID 4) is rendered \
-                  as `[kernel]`, not `?`, so it does not pollute the suspicious-`?` set. \
-                  PPL-protected processes (Windows Defender, anti-cheat engines) would \
-                  remain `?` even elevated, but typically do not appear in `hmn ps` output \
-                  unless they are actively holding GPU memory.\n\
-                  - Security note: a `?` row holding substantial VRAM that does not resolve \
-                  under elevation is worth investigating — by construction it is either a \
-                  process owned by another user / running as SYSTEM, a PPL-protected process, \
-                  or a transient race. None of these are intrinsically malicious, but on a \
-                  single-user desktop none of them should hold large amounts of GPU memory \
-                  unexpectedly. The protected-count parenthetical on the summary line is \
-                  intentionally surfaced because this distinction matters.\n\
+                  - On Windows, `?` in the NAME column is now rare (since v0.2.8): a \
+                  `CreateToolhelp32Snapshot` fallback (the same mechanism `Get-Process`/Task \
+                  Manager use) resolves most PIDs `OpenProcess` can't, including ordinary \
+                  foreign-user/SYSTEM processes like `dwm.exe`/`csrss.exe`, non-elevated. \
+                  What remains renders as `[exited]` (the process exited between the VRAM \
+                  sample and the name lookup — elevation would not help) or `[protected]` \
+                  (the snapshot fallback itself could not be taken — very rare; re-run \
+                  elevated). The Windows kernel itself (PID 4) renders as `[kernel]`, not \
+                  `?` or `[protected]`. This distinction is Windows-only; Linux/macOS \
+                  unresolved rows remain a bare `?`/absent name — run as the owning user \
+                  or with `sudo` there.\n\
+                  - Security note: a `[protected]` row (or a bare `?` on Linux/macOS) that \
+                  does not resolve under elevation is worth investigating — by construction \
+                  it is either a process owned by another user, a process running as \
+                  SYSTEM/LOCAL SERVICE/NETWORK SERVICE, a PPL-protected process, or (rarely) \
+                  the snapshot API itself failing. None of these are intrinsically \
+                  malicious, but on a single-user desktop an unexpected one holding \
+                  substantial VRAM is worth investigating. The summary line's protected-count \
+                  parenthetical counts `[protected]`/absent-name/the rare nvidia-smi-fallback \
+                  literal `?` — not `[exited]`, since elevation can't help a process that's \
+                  already gone.\n\
                   - Pre-WDDM-2.0 Windows falls back to `nvidia-smi --query-compute-apps`, \
                   which is compute-only and may show `[N/A]` memory under consumer WDDM \
                   (parser drops those rows).\n\
@@ -337,20 +345,47 @@ fn main() -> std::process::ExitCode {
 // Summary subcommand
 // -----------------------------------------------------------------------------
 
+/// Whether `snaps` is non-empty but every entry's `gpu_device` is
+/// `None` — devices enumerated, but `device_info` failed for each (e.g.
+/// a partial driver install). Shared by both [`run_summary`] paths:
+/// [`format_summary`] and [`format_summary_json`] both silently skip
+/// exactly these entries, so `[]`/no-output is otherwise indistinguishable
+/// from genuine zero-device enumeration.
+fn all_gpu_devices_unreadable(snaps: &[Snapshot]) -> bool {
+    !snaps.is_empty() && snaps.iter().all(|s| s.gpu_device.is_none())
+}
+
+/// The "devices enumerated but none readable" diagnostic line, shared by
+/// both [`run_summary`] call sites (stdout in text mode, stderr in
+/// `--json` mode) so the wording can't drift between the two.
+fn format_none_readable_message(count: usize) -> String {
+    format!("hmn: {count} GPU(s) enumerated but none readable.")
+}
+
 /// Run the default subcommand: print one line per visible GPU (or, with
 /// `--json`, a JSON array).
 fn run_summary(json: bool) -> Result<()> {
     let snaps = Snapshot::all()?;
     if json {
-        // Unlike the text path below, the empty case still emits `[]\n`
-        // rather than a friendly message — machine-readable output stays
-        // machine-readable regardless of device count, matching
-        // `format_ps_json`'s empty-input behavior.
+        // The `[]` shape is identical whether zero devices were visible
+        // or every visible device failed to read — distinguish the two
+        // on stderr (mirrors `hmn ps`'s always-on stderr summary line)
+        // without changing the documented JSON array shape on stdout.
+        if all_gpu_devices_unreadable(&snaps) {
+            eprintln!("{}", format_none_readable_message(snaps.len()));
+        }
         print!("{}", format_summary_json(&snaps));
         return Ok(());
     }
     if snaps.is_empty() {
         println!("hmn: no visible GPUs.");
+        return Ok(());
+    }
+    if all_gpu_devices_unreadable(&snaps) {
+        // Printing nothing here would exit `0` with empty stdout,
+        // indistinguishable from a working "nothing to show" success —
+        // say so explicitly instead.
+        println!("{}", format_none_readable_message(snaps.len()));
         return Ok(());
     }
     print!("{}", format_summary(&snaps));

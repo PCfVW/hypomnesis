@@ -341,15 +341,19 @@ pub(crate) fn dxgi_non_nvidia_devices(starting_index: u32) -> Vec<(GpuDeviceInfo
 /// compute-only — they surface every GPU user. Callers comparing
 /// across platforms should check `source` before assuming.
 ///
-/// **Windows process names may be `None` (`PDH` path) or `Some("?")`
-/// (`nvidia-smi` fallback path).** On the `PDH` path, names are
-/// resolved via `OpenProcess` + `QueryFullProcessImageNameW`;
-/// access-denied for cross-user or protected processes yields
-/// `name: None` (mirroring the Linux `/proc/<pid>/comm`-unreadable
-/// case). On the `nvidia-smi` fallback path, `nvidia-smi` writes a
-/// literal `?` for protected processes, preserved as `Some("?")`.
-/// Calling user's own processes always have names available on either
-/// path.
+/// **Windows process names are resolved via a two-stage fallback (`PDH`
+/// path).** `OpenProcess` + `QueryFullProcessImageNameW` is tried
+/// first; PIDs it can't resolve (foreign-user, `SYSTEM`,
+/// `PPL`-protected) fall through to a `CreateToolhelp32Snapshot` scan
+/// (v0.2.8) that resolves most of them non-elevated — so `name: None`
+/// essentially never reaches callers on the `PDH` path. What remains
+/// renders as `Some("[kernel]")` (`PID 4`), `Some("[exited]")` (the
+/// process exited between the `VRAM` sample and the name lookup —
+/// elevation would not help), or `Some("[protected]")` (the snapshot
+/// itself could not be taken — very rare). On the `nvidia-smi` fallback
+/// path, a literal `Some("?")` is produced for protected processes
+/// instead (no snapshot fallback exists there). Calling user's own
+/// processes always have names available on either path.
 ///
 /// # Errors
 ///

@@ -15,7 +15,15 @@
 //! Each entry point performs its own `nvmlInit_v2` / `nvmlShutdown` pair.
 //! Per the v0.1 design, this trades a few milliseconds of init overhead
 //! per call for simpler lifecycle management; a long-lived `NVML` context
-//! is a candidate for v0.2.
+//! is a candidate for a later release (see `ROADMAP.md`).
+//!
+//! [`list_compute_processes`]'s per-process buffer starts at the fixed
+//! [`NVML_MAX_PROCESSES`] stack size and retries once with a
+//! heap-allocated buffer sized to NVML's own reported process count when
+//! the device holds more than that — see its doc comment. [`query`]'s
+//! single-PID lookup ([`read_process_used`]) does not retry; the fixed
+//! buffer is sufficient there because it only needs to find the calling
+//! process's own row.
 //!
 //! # `WDDM` caveat
 //!
@@ -57,15 +65,25 @@ const NVML_SUCCESS: u32 = 0;
 
 /// `NVML` return code: caller-provided buffer too small.
 ///
-/// We never retry with a larger buffer — for `nvmlDeviceGetComputeRunningProcesses_v3`
-/// with a 64-slot buffer this is a soft success (we still got the first
-/// 64 entries, which is enough to locate our PID on any sane system).
+/// [`read_process_used`] never retries with a larger buffer — a 64-slot
+/// buffer returning `NVML_ERROR_INSUFFICIENT_SIZE` is still a soft
+/// success there (we still got the first 64 entries, enough to locate
+/// our own PID on any sane system). [`list_compute_processes`] *does*
+/// retry once, with a buffer sized to the true count NVML reports back
+/// on this code — see its doc comment for the documented NVML contract
+/// this relies on.
 const NVML_ERROR_INSUFFICIENT_SIZE: u32 = 7;
 
-/// Maximum number of processes we ask `NVML` to report per call.
+/// Maximum number of processes the fast path asks `NVML` to report per
+/// call, via a fixed stack buffer.
 ///
-/// 64 is generous — most machines have fewer than 10 GPU processes;
-/// the buffer lives on the stack so the cost is small.
+/// 64 is generous — most machines have fewer than 10 GPU processes; the
+/// buffer lives on the stack so the cost is small. This is a *fast-path*
+/// size, not a hard ceiling: [`list_compute_processes`] retries with a
+/// larger heap buffer when a device genuinely holds more than 64
+/// compute processes (busy multi-tenant hosts). [`read_process_used`]
+/// has no retry and stays capped at this size — sufficient there since
+/// it only needs to locate one specific PID, not enumerate every row.
 const NVML_MAX_PROCESSES: usize = 64;
 
 /// Buffer size for `nvmlDeviceGetName`, per NVIDIA's `NVML_DEVICE_NAME_V2_BUFFER_SIZE`.
@@ -548,6 +566,56 @@ fn read_process_used(
     }
 }
 
+/// Hard ceiling on [`list_compute_processes`]'s retry buffer size — a
+/// defensive bound against a corrupted or malicious `NVML` report
+/// claiming an implausible process count via
+/// `NVML_ERROR_INSUFFICIENT_SIZE`'s count out-parameter. Real systems
+/// never come close — holding an active `CUDA` context is expensive
+/// enough (driver + device memory per context) that no real GPU has
+/// ever hosted anywhere near 65536 concurrent compute processes, on
+/// even the largest multi-tenant clusters — so this never clamps in
+/// practice; it exists purely so a bogus reported count can't drive an
+/// attempted multi-gigabyte heap allocation.
+#[cfg(target_os = "linux")]
+const NVML_RETRY_MAX_PROCESSES: usize = 65_536;
+
+/// Filter raw `NVML` process rows for the `R570` `u64::MAX` sentinel and
+/// per-row `used_gpu_memory > device_total` corruption.
+///
+/// Mirrors [`read_process_used`]'s per-row policy (same two checks,
+/// applied to every row instead of just the one matching our own PID).
+/// Extracted as a pure, `unsafe`-free function so [`list_compute_processes`]'s
+/// two buffer-sizing paths (the fixed stack fast path and the sized
+/// heap retry) apply identical filtering without duplicating it, and so
+/// the filtering logic itself is directly unit-testable without FFI.
+#[cfg(target_os = "linux")]
+fn filter_process_rows(infos: &[NvmlProcessInfo], device_total: u64) -> Vec<(u32, u64)> {
+    infos
+        .iter()
+        .filter_map(|info| {
+            if info.used_gpu_memory == u64::MAX {
+                #[cfg(feature = "debug-output")]
+                eprintln!(
+                    "[NVML debug] list_compute_processes: pid {} used_gpu_memory == u64::MAX \
+                     (R570 sentinel); dropping row",
+                    info.pid
+                );
+                None
+            } else if info.used_gpu_memory > device_total {
+                #[cfg(feature = "debug-output")]
+                eprintln!(
+                    "[NVML debug] list_compute_processes: pid {} used_gpu_memory ({}) > \
+                     device total ({device_total}); dropping row",
+                    info.pid, info.used_gpu_memory
+                );
+                None
+            } else {
+                Some((info.pid, info.used_gpu_memory))
+            }
+        })
+        .collect()
+}
+
 /// Enumerate every compute process on the given device, returning
 /// `(pid, used_bytes)` for each row that survives the sentinel and
 /// sanity checks.
@@ -559,22 +627,38 @@ fn read_process_used(
 ///
 /// Returns `None` when `NVML` cannot be loaded, `nvmlInit_v2` /
 /// `nvmlDeviceGetHandleByIndex_v2` / `nvmlDeviceGetMemoryInfo` fail, or
-/// `nvmlDeviceGetComputeRunningProcesses_v3` returns an error other than
-/// `NVML_ERROR_INSUFFICIENT_SIZE` (which we treat as a soft success and
-/// keep the first 64 entries — see [`NVML_MAX_PROCESSES`]).
+/// the final `nvmlDeviceGetComputeRunningProcesses_v3` attempt (see
+/// below) returns an error other than `NVML_SUCCESS` or
+/// `NVML_ERROR_INSUFFICIENT_SIZE`.
 ///
-/// Per-row filtering matches [`read_process_used`]:
+/// Per-row filtering via [`filter_process_rows`], mirroring
+/// [`read_process_used`]'s policy:
 /// - `used_gpu_memory == u64::MAX` (R570 sentinel) → row dropped.
 /// - `used_gpu_memory > device_total` → row dropped (impossible under
 ///   normal conditions; assumed garbage).
 ///
-/// Caps at 64 processes per device — the existing `NVML_MAX_PROCESSES`
-/// stack-buffer size. Documented limit; sufficient for any realistic
-/// machine.
+/// # Buffer sizing: fast path, then a sized retry
+///
+/// The first attempt uses the fixed [`NVML_MAX_PROCESSES`]-slot stack
+/// buffer — zero heap cost, sufficient for the overwhelming majority of
+/// real systems. If that call reports `NVML_ERROR_INSUFFICIENT_SIZE`,
+/// `NVML` has written the *true* required process count back into the
+/// count out-parameter — the documented contract of the versioned
+/// `nvmlDeviceGet*RunningProcesses` family ("if the supplied buffer is
+/// not large enough to hold the process count, the function returns
+/// `NVML_ERROR_INSUFFICIENT_SIZE` and the required size is returned in
+/// this argument") — so a single retry with a heap `Vec` sized to that
+/// count (capped at [`NVML_RETRY_MAX_PROCESSES`] against a corrupted
+/// report) is sufficient on a stable process table. This removes the
+/// silent 64-process truncation a busy multi-tenant device could
+/// previously hit on this path; [`read_process_used`] (the narrower
+/// single-calling-process lookup used by [`query`]) is unaffected and
+/// keeps the fixed-buffer-only fast path, since it only needs to find
+/// one specific PID, not enumerate every row for display.
 ///
 /// Gated `cfg(target_os = "linux")` to match its sole call site in
 /// [`crate::gpu::gpu_processes`]. On Windows under `WDDM`, `NVML`'s
-/// per-process query returns 64 rows with `used_gpu_memory ==
+/// per-process query returns rows with `used_gpu_memory ==
 /// u64::MAX` (the `R570`-driver-class sentinel) for every entry; the
 /// dispatcher uses the [`crate::gpu::pdh`] backend instead, so this
 /// helper is dead code on Windows.
@@ -638,77 +722,128 @@ pub(super) fn list_compute_processes(idx: u32) -> Option<Vec<(u32, u64)>> {
     }
     let device_total = mem_info.total;
 
+    // ---- First attempt: fixed stack buffer (the common case) --------------
     // CAST: usize → u32, NVML_MAX_PROCESSES = 64 fits in u32
     #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
     let mut count = NVML_MAX_PROCESSES as u32;
-    let mut infos = [NvmlProcessInfo {
+    let mut stack_infos = [NvmlProcessInfo {
         pid: 0,
         used_gpu_memory: 0,
         gpu_instance_id: 0,
         compute_instance_id: 0,
     }; NVML_MAX_PROCESSES];
 
-    // SAFETY: nvmlDeviceGetComputeRunningProcesses_v3 fills `infos` with
-    // up to `count` entries and updates `count` to the actual number
-    // written. On NVML_ERROR_INSUFFICIENT_SIZE we still have the first
-    // 64 entries and treat that as a soft success.
-    let ret = unsafe { get_processes(device, &raw mut count, infos.as_mut_ptr()) };
+    // SAFETY: nvmlDeviceGetComputeRunningProcesses_v3 fills `stack_infos`
+    // with up to `count` entries and updates `count` to the actual
+    // number written — or, on NVML_ERROR_INSUFFICIENT_SIZE, the true
+    // required count (see the function doc comment's cited NVML
+    // contract). The buffer is stack-allocated with NVML_MAX_PROCESSES
+    // slots, matching the `count` we pass in.
+    let ret = unsafe { get_processes(device, &raw mut count, stack_infos.as_mut_ptr()) };
 
-    // SAFETY: nvmlShutdown balances the matched nvmlInit_v2.
+    // ---- Second attempt: heap buffer sized to NVML's reported count -------
+    // Only taken when the fast path was too small. `shutdown()` is
+    // deferred until after this retry — the device/session handle must
+    // stay valid for it, unlike the pre-fix code which shut down NVML
+    // immediately after the single attempt.
+    //
+    // Three-way split (retry / fast-path-hard-error / fast-path-success)
+    // rather than a two-way one: a hard error on *either* attempt takes
+    // an empty-`Vec` branch that skips the `.to_vec()` row-extraction
+    // entirely, matching the pre-fix code's discipline of not doing that
+    // work on a path that's about to be discarded by the `final_ret`
+    // check below. `nvml_reported_count` threads through every branch
+    // (unused on the two hard-error branches beyond the trailing debug
+    // trace's reach, since those `return None` first) purely so the
+    // final debug line can report what NVML said even when a soft
+    // `NVML_ERROR_INSUFFICIENT_SIZE` truncated the retry itself (a
+    // process count that grew again between the two calls).
+    // `nvml_reported_count` is read only by the `debug-output`-gated
+    // eprintln! below; without that feature it's otherwise unused.
+    #[cfg_attr(not(feature = "debug-output"), allow(unused_variables))]
+    let (owned_infos, final_ret, nvml_reported_count): (Vec<NvmlProcessInfo>, u32, u32) =
+        if ret == NVML_ERROR_INSUFFICIENT_SIZE {
+            // CAST: u32 → usize, NVML-reported required count; clamped below
+            // against a corrupted/malicious report before use.
+            #[allow(clippy::as_conversions)]
+            let needed = (count as usize).min(NVML_RETRY_MAX_PROCESSES);
+            let mut heap_infos = vec![
+                NvmlProcessInfo {
+                    pid: 0,
+                    used_gpu_memory: 0,
+                    gpu_instance_id: 0,
+                    compute_instance_id: 0,
+                };
+                needed
+            ];
+            // CAST: usize → u32, `needed` is clamped to NVML_RETRY_MAX_PROCESSES
+            // (65536); fits trivially in u32.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            let mut retry_count = needed as u32;
+            // SAFETY: same contract as the first get_processes call above.
+            // `heap_infos` is sized to `needed` entries — the count NVML
+            // itself just reported as required (or the defensive clamp) —
+            // so on a stable process table this call cannot return
+            // NVML_ERROR_INSUFFICIENT_SIZE again; a process count that grew
+            // between the two calls is handled the same as any other
+            // insufficient-size result below (fewer rows than currently
+            // exist, not a crash or an unbounded retry loop).
+            let retry_ret =
+                unsafe { get_processes(device, &raw mut retry_count, heap_infos.as_mut_ptr()) };
+            if retry_ret != NVML_SUCCESS && retry_ret != NVML_ERROR_INSUFFICIENT_SIZE {
+                // Hard error on the retry — skip the .to_vec() below;
+                // `final_ret`'s check will discard this immediately.
+                (Vec::new(), retry_ret, retry_count)
+            } else {
+                // CAST: u32 → usize, bounded by `needed` (the buffer's own size).
+                #[allow(clippy::as_conversions)]
+                let retry_actual = (retry_count as usize).min(needed);
+                // BORROW: explicit .to_vec() — unifies this branch's owned
+                // row set with the fast-path branch's, so both feed the
+                // same `filter_process_rows` call below regardless of
+                // which buffer (stack or heap) actually produced the data.
+                let rows = heap_infos
+                    .get(..retry_actual)
+                    .map_or_else(Vec::new, <[NvmlProcessInfo]>::to_vec);
+                (rows, retry_ret, retry_count)
+            }
+        } else if ret != NVML_SUCCESS {
+            // Hard error on the fast path (e.g. a genuine driver/permission
+            // failure) — same short-circuit as the retry's hard-error arm.
+            (Vec::new(), ret, count)
+        } else {
+            // CAST: u32 → usize, NVML count is bounded by buffer size; usize >= 32 bits everywhere
+            #[allow(clippy::as_conversions)]
+            let actual_count = (count as usize).min(NVML_MAX_PROCESSES);
+            // BORROW: explicit .to_vec() — same unification as the retry
+            // branch above.
+            let rows = stack_infos
+                .get(..actual_count)
+                .map_or_else(Vec::new, <[NvmlProcessInfo]>::to_vec);
+            (rows, ret, count)
+        };
+
+    // SAFETY: nvmlShutdown balances the matched nvmlInit_v2 — deferred
+    // until every get_processes attempt (including the retry) is done.
     unsafe { shutdown() };
 
-    if ret != NVML_SUCCESS && ret != NVML_ERROR_INSUFFICIENT_SIZE {
+    if final_ret != NVML_SUCCESS && final_ret != NVML_ERROR_INSUFFICIENT_SIZE {
         #[cfg(feature = "debug-output")]
         eprintln!(
-            "[NVML debug] nvmlDeviceGetComputeRunningProcesses_v3 returned {ret} \
-             in list_compute_processes (likely WDDM NVML_VALUE_NOT_AVAILABLE)"
+            "[NVML debug] nvmlDeviceGetComputeRunningProcesses_v3 returned {final_ret} \
+             in list_compute_processes"
         );
         return None;
     }
 
-    // CAST: u32 → usize, NVML count is bounded by buffer size; usize >= 32 bits everywhere
-    #[allow(clippy::as_conversions)]
-    let actual_count = (count as usize).min(NVML_MAX_PROCESSES);
-
-    // BORROW: explicit slice + filter_map — bypasses the R570 u64::MAX
-    // sentinel and the used > device_total sanity check on a per-row
-    // basis, matching `read_process_used`'s policy.
-    let rows: Vec<(u32, u64)> = infos
-        .get(..actual_count)
-        .map(|s| {
-            s.iter()
-                .filter_map(|info| {
-                    if info.used_gpu_memory == u64::MAX {
-                        #[cfg(feature = "debug-output")]
-                        eprintln!(
-                            "[NVML debug] list_compute_processes: pid {} used_gpu_memory == u64::MAX \
-                             (R570 sentinel); dropping row",
-                            info.pid
-                        );
-                        None
-                    } else if info.used_gpu_memory > device_total {
-                        #[cfg(feature = "debug-output")]
-                        eprintln!(
-                            "[NVML debug] list_compute_processes: pid {} used_gpu_memory ({}) > \
-                             device total ({device_total}); dropping row",
-                            info.pid, info.used_gpu_memory
-                        );
-                        None
-                    } else {
-                        Some((info.pid, info.used_gpu_memory))
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let rows = filter_process_rows(&owned_infos, device_total);
 
     #[cfg(feature = "debug-output")]
     eprintln!(
         "[NVML debug] list_compute_processes(idx={idx}): {} row(s) after filtering \
-         ({} reported by NVML, {} buffer cap)",
+         ({} raw entries captured, NVML last reported count={nvml_reported_count})",
         rows.len(),
-        count,
-        NVML_MAX_PROCESSES
+        owned_infos.len()
     );
 
     Some(rows)
@@ -754,5 +889,74 @@ pub(super) fn device_count() -> Option<u32> {
         #[cfg(feature = "debug-output")]
         eprintln!("[NVML debug] nvmlDeviceGetCount_v2 returned {ret}");
         None
+    }
+}
+
+// -----------------------------------------------------------------------
+// Tests (pure filtering core — no FFI, Linux-gated to match
+// `filter_process_rows`'s sole caller, `list_compute_processes`)
+// -----------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_docs_in_private_items
+)]
+mod tests {
+    use super::*;
+
+    /// Build an `NvmlProcessInfo` for tests; `gpu_instance_id` /
+    /// `compute_instance_id` are irrelevant to filtering and left at 0.
+    const fn info(pid: u32, used_gpu_memory: u64) -> NvmlProcessInfo {
+        NvmlProcessInfo {
+            pid,
+            used_gpu_memory,
+            gpu_instance_id: 0,
+            compute_instance_id: 0,
+        }
+    }
+
+    const DEVICE_TOTAL: u64 = 16 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn filter_process_rows_keeps_normal_rows() {
+        let infos = [info(100, 1024), info(200, 2048)];
+        let rows = filter_process_rows(&infos, DEVICE_TOTAL);
+        assert_eq!(rows, vec![(100, 1024), (200, 2048)]);
+    }
+
+    #[test]
+    fn filter_process_rows_drops_r570_sentinel() {
+        let infos = [info(100, 1024), info(200, u64::MAX), info(300, 4096)];
+        let rows = filter_process_rows(&infos, DEVICE_TOTAL);
+        assert_eq!(rows, vec![(100, 1024), (300, 4096)]);
+    }
+
+    #[test]
+    fn filter_process_rows_drops_used_greater_than_total() {
+        let infos = [info(100, 1024), info(200, DEVICE_TOTAL + 1)];
+        let rows = filter_process_rows(&infos, DEVICE_TOTAL);
+        assert_eq!(rows, vec![(100, 1024)]);
+    }
+
+    #[test]
+    fn filter_process_rows_used_exactly_total_is_kept() {
+        // Boundary: `used == total` is not `>` total, so it survives —
+        // a fully-saturated device is not corruption.
+        let infos = [info(100, DEVICE_TOTAL)];
+        let rows = filter_process_rows(&infos, DEVICE_TOTAL);
+        assert_eq!(rows, vec![(100, DEVICE_TOTAL)]);
+    }
+
+    #[test]
+    fn filter_process_rows_empty_input_empty_output() {
+        assert!(filter_process_rows(&[], DEVICE_TOTAL).is_empty());
+    }
+
+    #[test]
+    fn filter_process_rows_all_rows_dropped_when_all_garbage() {
+        let infos = [info(1, u64::MAX), info(2, DEVICE_TOTAL + 1)];
+        assert!(filter_process_rows(&infos, DEVICE_TOTAL).is_empty());
     }
 }

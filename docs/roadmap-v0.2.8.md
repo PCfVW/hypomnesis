@@ -2,7 +2,7 @@
 
 > *The tool you install should install. The name you can't be shown, someone else can.*
 
-**Status: implemented and locally verified 2026-08-04; not yet published.**
+**Status: shipped 2026-08-04.**
 
 ---
 

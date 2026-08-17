@@ -129,6 +129,20 @@ reality.
 - `hmn --help`'s rendered output was read end-to-end post-fix to confirm
   the rewritten Limitations text reads correctly in context, not just
   in isolation.
+- The real push to `origin/main` — the first time this exact diff ran on
+  actual GitHub-hosted runners, not just local dry-runs — immediately
+  caught a genuine `-D warnings` clippy failure on `macos-latest` (both
+  toolchains): a three-release-old `dead_code` bug in
+  `src/gpu/metal.rs` (`MetalQueryResult::current_usage` computed via a
+  real syscall on every `device_info()` call, then never read). Fixed
+  and re-verified via a real cross-compiled `cargo check --target
+  aarch64-apple-darwin --all-features` (clean, zero warnings) before
+  re-pushing, since no local macOS hardware was available. A separate,
+  unrelated `windows-latest` job failure in the same run
+  (`429`/`503` errors downloading the `dtolnay/rust-toolchain` and
+  `Swatinem/rust-cache` actions from `codeload.github.com`) was
+  confirmed to be transient GitHub infrastructure flakiness, not a code
+  issue.
 
 ---
 
@@ -136,7 +150,11 @@ reality.
 
 The macOS CI leg closes a three-release-old blind spot: `src/gpu/metal.rs`
 and `tests/macos_smoke.rs` have existed since v0.2.3 with zero CI
-coverage. The `publish.yml` tag guard closes the failure mode where a
-mistyped tag either fails confusingly or — worse — publishes a version
-whose tag doesn't match its content. Neither required a bug to already
-exist in the wild to be worth closing.
+coverage — and, as it turned out, that gap was not hypothetical: the
+leg's first real run caught a genuine bug within seconds of existing
+(see Verification, above). The `publish.yml` tag guard closes a
+different failure mode, one that hasn't happened yet — a mistyped tag
+either failing confusingly or, worse, publishing a version whose tag
+doesn't match its content. It didn't need to catch something live to be
+worth adding; the macOS leg is proof the same reasoning already pays
+off in practice, not just in theory.

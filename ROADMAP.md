@@ -21,7 +21,10 @@ compute processes on busy multi-tenant devices; a single malformed
 partially-broken driver install could make `hmn` print nothing — or, in
 `--json` mode, emit an indistinguishable `[]` — instead of saying so.
 All three now say so. Also closes a three-release-old CI gap (macOS
-never compiled in CI despite being first-class since v0.2.3) and adds a
+never compiled in CI despite being first-class since v0.2.3) — not a
+theoretical fix: the new leg's first real run on `origin/main`
+immediately caught a genuine `-D warnings` failure in `src/gpu/metal.rs`
+(a `dead_code` bug three releases old, fixed the same day) — and adds a
 `publish.yml` guard against a mistyped release tag. A second adversarial
 review pass on the fixes themselves found and closed four further issues
 before this release. Full audit:

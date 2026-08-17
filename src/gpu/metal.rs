@@ -113,7 +113,12 @@ mod libsystem_ffi {
 /// `LEDGER_INFO` command — query the per-PID ledger metadata
 /// (`li_entries` = number of entries, `li_name` = task name).
 ///
-/// Value from XNU `osfmk/kern/ledger.h`.
+/// Value from XNU `osfmk/kern/ledger.h`. Not currently issued by this
+/// module (only [`LEDGER_TEMPLATE_INFO`] and [`LEDGER_ENTRY_INFO_V2`]
+/// are) — kept as a zero-cost `const` documenting the complete 3-command
+/// family this FFI surface is built against, so a future reader sees the
+/// full picture rather than two commands with no visible sibling.
+#[allow(dead_code)]
 const LEDGER_INFO: i32 = 0;
 
 /// `LEDGER_TEMPLATE_INFO` command — fetch the array of
@@ -189,14 +194,13 @@ struct LedgerEntryInfo {
 
 /// Combined result of a single Metal device-wide query.
 ///
-/// Shape mirrors [`super::dxgi::DxgiQueryResult`] in spirit: the
-/// per-process current usage, the device total, and the adapter name.
+/// Shape mirrors [`super::dxgi::DxgiQueryResult`] in spirit: the device
+/// total, the device-wide working-set budget, and the adapter name.
+/// Unlike `DxgiQueryResult`, there is no per-process figure here — the
+/// per-process path is [`process_gpu_info`], which reads
+/// `graphics_footprint` independently rather than through this struct.
 /// Returned by [`query`].
 pub(super) struct MetalQueryResult {
-    /// Per-process GPU memory usage in bytes — `graphics_footprint`
-    /// ledger balance for the calling PID. This is the macOS analogue
-    /// of DXGI's `CurrentUsage` and NVML's `process.used`.
-    pub current_usage: u64,
     /// Total physical memory in bytes — `sysctl hw.memsize`. On UMA
     /// this is the system DRAM size, which is also the GPU's address
     /// space ceiling.
@@ -515,15 +519,14 @@ fn read_graphics_footprint(pid: i32) -> Option<u64> {
 ///
 /// On Apple Silicon there is a single integrated GPU; this returns
 /// `None` for any `idx != 0`. The non-zero case yields a
-/// [`MetalQueryResult`] populated from `ledger(graphics_footprint)`
-/// for the calling PID, `sysctl hw.memsize` for the total, and
-/// `sysctl machdep.cpu.brand_string` for the name.
+/// [`MetalQueryResult`] populated from `sysctl hw.memsize` for the
+/// total and `sysctl machdep.cpu.brand_string` for the name. (Per-process
+/// usage is not part of this device-wide query — see [`process_gpu_info`],
+/// which reads `graphics_footprint` independently.)
 pub(super) fn query(idx: u32) -> Option<MetalQueryResult> {
     if idx != 0 {
         return None;
     }
-    let self_pid = process_self_pid();
-    let current_usage = read_graphics_footprint(self_pid).unwrap_or(0);
     let dedicated_video_memory = read_sysctl_u64(b"hw.memsize\0")?;
     let adapter_name =
         read_sysctl_string(b"machdep.cpu.brand_string\0").unwrap_or_else(|| "Apple GPU".into());
@@ -534,7 +537,6 @@ pub(super) fn query(idx: u32) -> Option<MetalQueryResult> {
     let recommended_max_working_set =
         recommended_max_working_set_size().unwrap_or(dedicated_video_memory);
     Some(MetalQueryResult {
-        current_usage,
         dedicated_video_memory,
         recommended_max_working_set,
         adapter_name,
